@@ -29,6 +29,24 @@ fn write_personality(
     Ok(())
 }
 
+async fn request_personalities_list(
+    mcp: &mut McpProcess,
+    cwd: &std::path::Path,
+) -> Result<PersonalitiesListResponse> {
+    let request_id = mcp
+        .send_personalities_list_request(PersonalitiesListParams {
+            cwds: Some(vec![cwd.to_path_buf().try_into()?]),
+        })
+        .await?;
+
+    let response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    to_response(response)
+}
+
 #[tokio::test]
 async fn personalities_list_returns_builtin_and_file_backed_personalities() -> Result<()> {
     let codex_home = TempDir::new()?;
@@ -62,18 +80,8 @@ async fn personalities_list_returns_builtin_and_file_backed_personalities() -> R
     let mut mcp = McpProcess::new(codex_home.path()).await?;
     timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
 
-    let request_id = mcp
-        .send_personalities_list_request(PersonalitiesListParams {
-            cwds: Some(vec![repo.path().to_path_buf().try_into()?]),
-        })
-        .await?;
-
-    let response: JSONRPCResponse = timeout(
-        DEFAULT_TIMEOUT,
-        mcp.read_stream_until_response_message(RequestId::Integer(request_id)),
-    )
-    .await??;
-    let PersonalitiesListResponse { data } = to_response(response)?;
+    let PersonalitiesListResponse { data } =
+        request_personalities_list(&mut mcp, repo.path()).await?;
 
     assert_eq!(data.len(), 1);
     assert_eq!(data[0].cwd, repo.path().to_path_buf());
@@ -131,5 +139,61 @@ async fn personalities_list_returns_builtin_and_file_backed_personalities() -> R
             .count(),
         1
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn personalities_list_uses_cached_catalog_for_repeated_requests() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let repo = TempDir::new()?;
+    let repo_personalities = repo.path().join(".codex/personalities");
+
+    write_personality(
+        &repo_personalities,
+        "night-owl",
+        "Original personality",
+        "Original instructions",
+    )?;
+
+    let mut mcp = McpProcess::new(codex_home.path()).await?;
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+
+    let first = request_personalities_list(&mut mcp, repo.path()).await?;
+    let first_entry = &first.data[0];
+    let first_night_owl = first_entry
+        .personalities
+        .iter()
+        .find(|personality| personality.name == "night-owl")
+        .ok_or_else(|| anyhow!("night-owl personality missing on first request"))?;
+    assert_eq!(first_night_owl.description, "Original personality");
+
+    write_personality(
+        &repo_personalities,
+        "night-owl",
+        "Updated personality",
+        "Updated instructions",
+    )?;
+    write_personality(
+        &repo_personalities,
+        "fresh-file",
+        "New personality",
+        "New instructions",
+    )?;
+
+    let second = request_personalities_list(&mut mcp, repo.path()).await?;
+    let second_entry = &second.data[0];
+    let second_night_owl = second_entry
+        .personalities
+        .iter()
+        .find(|personality| personality.name == "night-owl")
+        .ok_or_else(|| anyhow!("night-owl personality missing on second request"))?;
+    assert_eq!(second_night_owl.description, "Original personality");
+    assert!(
+        second_entry
+            .personalities
+            .iter()
+            .all(|personality| personality.name != "fresh-file")
+    );
+
     Ok(())
 }

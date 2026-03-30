@@ -417,6 +417,8 @@ pub(crate) struct CodexMessageProcessor {
     command_exec_manager: CommandExecManager,
     pending_fuzzy_searches: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     fuzzy_search_sessions: Arc<Mutex<HashMap<String, FuzzyFileSearchSession>>>,
+    personality_catalogs:
+        Arc<Mutex<HashMap<PathBuf, codex_core::personalities::PersonalityCatalog>>>,
     background_tasks: TaskTracker,
     feedback: CodexFeedback,
     log_db: Option<LogDbLayer>,
@@ -529,6 +531,10 @@ impl CodexMessageProcessor {
             feedback,
             log_db,
         } = args;
+        let personality_catalogs = HashMap::from([(
+            config.cwd.to_path_buf(),
+            codex_core::personalities::catalog_for_config(config.as_ref()),
+        )]);
         Self {
             auth_manager,
             thread_manager,
@@ -545,6 +551,7 @@ impl CodexMessageProcessor {
             command_exec_manager: CommandExecManager::default(),
             pending_fuzzy_searches: Arc::new(Mutex::new(HashMap::new())),
             fuzzy_search_sessions: Arc::new(Mutex::new(HashMap::new())),
+            personality_catalogs: Arc::new(Mutex::new(personality_catalogs)),
             background_tasks: TaskTracker::new(),
             feedback,
             log_db,
@@ -593,6 +600,39 @@ impl CodexMessageProcessor {
             .read()
             .map(|guard| guard.clone())
             .unwrap_or_default()
+    }
+
+    async fn personality_catalog_for_cwd(
+        &self,
+        cwd: &AbsolutePathBuf,
+        cli_overrides: &[(String, TomlValue)],
+    ) -> Result<codex_core::personalities::PersonalityCatalog, JSONRPCErrorError> {
+        if let Some(catalog) = self
+            .personality_catalogs
+            .lock()
+            .await
+            .get(cwd.as_path())
+            .cloned()
+        {
+            return Ok(catalog);
+        }
+
+        let config_layer_stack = load_config_layers_state(
+            &self.config.codex_home,
+            Some(cwd.clone()),
+            cli_overrides,
+            LoaderOverrides::default(),
+            CloudRequirementsLoader::default(),
+        )
+        .await
+        .map_err(|err| config_load_error(&err))?;
+        let catalog = codex_core::personalities::catalog_from_layer_stack(&config_layer_stack);
+
+        let mut personality_catalogs = self.personality_catalogs.lock().await;
+        Ok(personality_catalogs
+            .entry(cwd.to_path_buf())
+            .or_insert_with(|| catalog.clone())
+            .clone())
     }
 
     /// If a client sends `developer_instructions: null` during a mode switch,
@@ -5780,24 +5820,16 @@ impl CodexMessageProcessor {
                     return;
                 }
             };
-            let config_layer_stack = match load_config_layers_state(
-                &self.config.codex_home,
-                Some(cwd_abs),
-                &cli_overrides,
-                LoaderOverrides::default(),
-                CloudRequirementsLoader::default(),
-            )
-            .await
+            let catalog = match self
+                .personality_catalog_for_cwd(&cwd_abs, &cli_overrides)
+                .await
             {
-                Ok(config_layer_stack) => config_layer_stack,
+                Ok(catalog) => catalog,
                 Err(err) => {
-                    self.outgoing
-                        .send_error(request_id, config_load_error(&err))
-                        .await;
+                    self.outgoing.send_error(request_id, err).await;
                     return;
                 }
             };
-            let catalog = codex_core::personalities::catalog_from_layer_stack(&config_layer_stack);
             data.push(codex_app_server_protocol::PersonalitiesListEntry {
                 cwd,
                 personalities: personalities_to_info(catalog.personalities()),
