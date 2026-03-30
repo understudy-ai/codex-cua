@@ -10,8 +10,8 @@ use tempfile::TempDir;
 
 use codex_core::CodexThread;
 use codex_core::config::Config;
+use codex_core::config::ConfigBuilder;
 use codex_core::config::ConfigOverrides;
-use codex_core::config_loader::ConfigLayerStack;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use regex_lite::Regex;
 use std::path::Path;
@@ -183,23 +183,17 @@ pub fn fetch_dotslash_file(
 /// temporary directory. Using a per-test directory keeps tests hermetic and
 /// avoids clobbering a developer’s real `~/.codex`.
 pub async fn load_default_config_for_test(codex_home: &TempDir) -> Config {
-    let mut config =
-        Config::load_default_with_cli_overrides(Vec::new()).expect("default config should load");
     let codex_home_path = codex_home.path().to_path_buf();
-    config.config_layer_stack = ConfigLayerStack::default();
-    config.startup_warnings.clear();
-    config.user_instructions = None;
-    config.cwd = codex_home_path.abs();
-    config.codex_home = codex_home_path.clone();
-    config.sqlite_home = codex_home_path.clone();
-    config.log_dir = codex_home_path.join("log");
-
-    let overrides = default_test_overrides();
-    if let Some(codex_linux_sandbox_exe) = overrides.codex_linux_sandbox_exe {
-        config.codex_linux_sandbox_exe = Some(codex_linux_sandbox_exe);
-    }
-
-    config
+    let overrides = ConfigOverrides {
+        cwd: Some(codex_home_path.clone()),
+        ..default_test_overrides()
+    };
+    ConfigBuilder::default()
+        .codex_home(codex_home_path)
+        .harness_overrides(overrides)
+        .build()
+        .await
+        .expect("defaults for test should always succeed")
 }
 
 #[cfg(target_os = "linux")]
