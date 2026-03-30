@@ -116,6 +116,7 @@ impl Visit for TagCollectorVisitor {
 
 #[derive(Clone)]
 struct TagCollectorLayer {
+    target: &'static str,
     tags: Arc<Mutex<BTreeMap<String, String>>>,
 }
 
@@ -124,7 +125,7 @@ where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-        if event.metadata().target() != "feedback_tags" {
+        if event.metadata().target() != self.target {
             return;
         }
         let mut visitor = TagCollectorVisitor::default();
@@ -590,7 +591,10 @@ async fn refresh_available_models_skips_network_without_chatgpt_auth() {
 fn models_request_telemetry_emits_auth_env_feedback_tags_on_failure() {
     let tags = Arc::new(Mutex::new(BTreeMap::new()));
     let _guard = tracing_subscriber::registry()
-        .with(TagCollectorLayer { tags: tags.clone() })
+        .with(TagCollectorLayer {
+            target: "feedback_tags",
+            tags: tags.clone(),
+        })
         .set_default();
 
     let telemetry = ModelsRequestTelemetry {
@@ -681,6 +685,79 @@ fn models_request_telemetry_emits_auth_env_feedback_tags_on_failure() {
         tags.get("auth_env_refresh_token_url_override_present")
             .map(String::as_str),
         Some("false")
+    );
+}
+
+#[test]
+fn models_request_telemetry_emits_sentry_auth_failure_event_on_401() {
+    let tags = Arc::new(Mutex::new(BTreeMap::new()));
+    let _guard = tracing_subscriber::registry()
+        .with(TagCollectorLayer {
+            target: crate::util::SENTRY_AUTH_FAILURES_TARGET,
+            tags: tags.clone(),
+        })
+        .set_default();
+
+    let telemetry = ModelsRequestTelemetry {
+        auth_mode: Some(TelemetryAuthMode::Chatgpt.to_string()),
+        auth_header_attached: true,
+        auth_header_name: Some("authorization"),
+        auth_env: crate::auth_env_telemetry::AuthEnvTelemetry {
+            openai_api_key_env_present: false,
+            codex_api_key_env_present: false,
+            codex_api_key_env_enabled: false,
+            provider_env_key_name: Some("configured".to_string()),
+            provider_env_key_present: Some(false),
+            refresh_token_url_override_present: false,
+        },
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert("x-request-id", "req-models-401".parse().unwrap());
+    headers.insert("cf-ray", "ray-models-401".parse().unwrap());
+    headers.insert(
+        "x-openai-authorization-error",
+        "missing_authorization_header".parse().unwrap(),
+    );
+    headers.insert(
+        "x-error-json",
+        base64::engine::general_purpose::STANDARD
+            .encode(r#"{"error":{"code":"token_expired"}}"#)
+            .parse()
+            .unwrap(),
+    );
+    telemetry.on_request(
+        1,
+        Some(StatusCode::UNAUTHORIZED),
+        Some(&TransportError::Http {
+            status: StatusCode::UNAUTHORIZED,
+            url: Some("https://example.test/models".to_string()),
+            headers: Some(headers),
+            body: Some("plain text error".to_string()),
+        }),
+        Duration::from_millis(17),
+    );
+
+    let tags = tags.lock().unwrap().clone();
+    assert_eq!(
+        tags.get("report_kind").map(String::as_str),
+        Some("auth_failure_auto")
+    );
+    assert_eq!(tags.get("endpoint").map(String::as_str), Some("/models"));
+    assert_eq!(
+        tags.get("auth_header_attached").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        tags.get("auth_header_name").map(String::as_str),
+        Some("authorization")
+    );
+    assert_eq!(
+        tags.get("auth_request_id").map(String::as_str),
+        Some("req-models-401")
+    );
+    assert_eq!(
+        tags.get("auth_cf_ray").map(String::as_str),
+        Some("ray-models-401")
     );
 }
 

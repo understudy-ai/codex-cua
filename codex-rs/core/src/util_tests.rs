@@ -44,6 +44,7 @@ impl Visit for TagCollectorVisitor {
 
 #[derive(Clone)]
 struct TagCollectorLayer {
+    target: &'static str,
     tags: Arc<Mutex<BTreeMap<String, String>>>,
     event_count: Arc<Mutex<usize>>,
 }
@@ -53,7 +54,7 @@ where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-        if event.metadata().target() != "feedback_tags" {
+        if event.metadata().target() != self.target {
             return;
         }
         let mut visitor = TagCollectorVisitor::default();
@@ -69,6 +70,7 @@ fn emit_feedback_request_tags_records_sentry_feedback_fields() {
     let event_count = Arc::new(Mutex::new(0));
     let _guard = tracing_subscriber::registry()
         .with(TagCollectorLayer {
+            target: "feedback_tags",
             tags: tags.clone(),
             event_count: event_count.clone(),
         })
@@ -172,6 +174,7 @@ fn emit_feedback_auth_recovery_tags_preserves_401_specific_fields() {
     let event_count = Arc::new(Mutex::new(0));
     let _guard = tracing_subscriber::registry()
         .with(TagCollectorLayer {
+            target: "feedback_tags",
             tags: tags.clone(),
             event_count: event_count.clone(),
         })
@@ -213,6 +216,7 @@ fn emit_feedback_auth_recovery_tags_clears_stale_401_fields() {
     let event_count = Arc::new(Mutex::new(0));
     let _guard = tracing_subscriber::registry()
         .with(TagCollectorLayer {
+            target: "feedback_tags",
             tags: tags.clone(),
             event_count: event_count.clone(),
         })
@@ -260,6 +264,7 @@ fn emit_feedback_request_tags_preserves_latest_auth_fields_after_unauthorized() 
     let event_count = Arc::new(Mutex::new(0));
     let _guard = tracing_subscriber::registry()
         .with(TagCollectorLayer {
+            target: "feedback_tags",
             tags: tags.clone(),
             event_count: event_count.clone(),
         })
@@ -308,11 +313,75 @@ fn emit_feedback_request_tags_preserves_latest_auth_fields_after_unauthorized() 
 }
 
 #[test]
+fn emit_sentry_auth_failure_event_records_non_feedback_fields() {
+    let tags = Arc::new(Mutex::new(BTreeMap::new()));
+    let event_count = Arc::new(Mutex::new(0));
+    let _guard = tracing_subscriber::registry()
+        .with(TagCollectorLayer {
+            target: SENTRY_AUTH_FAILURES_TARGET,
+            tags: tags.clone(),
+            event_count: event_count.clone(),
+        })
+        .set_default();
+
+    let auth_env = AuthEnvTelemetry {
+        openai_api_key_env_present: true,
+        codex_api_key_env_present: false,
+        codex_api_key_env_enabled: true,
+        provider_env_key_name: Some("configured".to_string()),
+        provider_env_key_present: Some(true),
+        refresh_token_url_override_present: true,
+    };
+
+    emit_sentry_auth_failure_event_with_auth_env(
+        &FeedbackRequestTags {
+            endpoint: "/responses",
+            auth_header_attached: true,
+            auth_header_name: Some("authorization"),
+            auth_mode: Some("chatgpt"),
+            auth_retry_after_unauthorized: Some(false),
+            auth_recovery_mode: Some("managed"),
+            auth_recovery_phase: Some("reload"),
+            auth_connection_reused: Some(false),
+            auth_request_id: Some("req-123"),
+            auth_cf_ray: Some("ray-123"),
+            auth_error: Some("missing_authorization_header"),
+            auth_error_code: Some("token_expired"),
+            auth_recovery_followup_success: None,
+            auth_recovery_followup_status: None,
+        },
+        &auth_env,
+    );
+
+    let tags = tags.lock().unwrap().clone();
+    assert_eq!(
+        tags.get("report_kind").map(String::as_str),
+        Some("auth_failure_auto")
+    );
+    assert_eq!(tags.get("endpoint").map(String::as_str), Some("/responses"));
+    assert_eq!(
+        tags.get("auth_header_attached").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        tags.get("auth_header_name").map(String::as_str),
+        Some("authorization")
+    );
+    assert_eq!(
+        tags.get("auth_request_id").map(String::as_str),
+        Some("req-123")
+    );
+    assert_eq!(tags.get("auth_cf_ray").map(String::as_str), Some("ray-123"));
+    assert_eq!(*event_count.lock().unwrap(), 1);
+}
+
+#[test]
 fn emit_feedback_request_tags_preserves_auth_env_fields_for_legacy_emitters() {
     let tags = Arc::new(Mutex::new(BTreeMap::new()));
     let event_count = Arc::new(Mutex::new(0));
     let _guard = tracing_subscriber::registry()
         .with(TagCollectorLayer {
+            target: "feedback_tags",
             tags: tags.clone(),
             event_count: event_count.clone(),
         })

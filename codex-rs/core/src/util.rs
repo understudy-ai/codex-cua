@@ -11,6 +11,7 @@ use crate::parse_command::shlex_join;
 
 const INITIAL_DELAY_MS: u64 = 200;
 const BACKOFF_FACTOR: f64 = 2.0;
+pub(crate) const SENTRY_AUTH_FAILURES_TARGET: &str = "sentry_auth_failures";
 
 /// Emit structured feedback metadata as key/value pairs.
 ///
@@ -198,6 +199,44 @@ pub(crate) fn emit_feedback_auth_recovery_tags(
         auth_401_cf_ray = auth_401.cf_ray,
         auth_401_error = auth_401.error,
         auth_401_error_code = auth_401.error_code
+    );
+}
+
+pub(crate) fn emit_sentry_auth_failure_event_with_auth_env(
+    tags: &FeedbackRequestTags<'_>,
+    auth_env: &AuthEnvTelemetry,
+) {
+    tracing::event!(
+        target: SENTRY_AUTH_FAILURES_TARGET,
+        tracing::Level::ERROR,
+        report_kind = "auth_failure_auto",
+        endpoint = tags.endpoint,
+        auth_header_attached = tags.auth_header_attached,
+        auth_header_name = tags.auth_header_name.unwrap_or(""),
+        auth_mode = tags.auth_mode.unwrap_or(""),
+        auth_retry_after_unauthorized = tags
+            .auth_retry_after_unauthorized
+            .unwrap_or(false),
+        auth_recovery_mode = tags.auth_recovery_mode.unwrap_or(""),
+        auth_recovery_phase = tags.auth_recovery_phase.unwrap_or(""),
+        auth_connection_reused = tags.auth_connection_reused.unwrap_or(false),
+        auth_request_id = tags.auth_request_id.unwrap_or(""),
+        auth_cf_ray = tags.auth_cf_ray.unwrap_or(""),
+        auth_error = tags.auth_error.unwrap_or(""),
+        auth_error_code = tags.auth_error_code.unwrap_or(""),
+        auth_recovery_followup_success = tags
+            .auth_recovery_followup_success
+            .unwrap_or(false),
+        auth_recovery_followup_status = tags
+            .auth_recovery_followup_status
+            .unwrap_or_default(),
+        auth_env_openai_api_key_present = auth_env.openai_api_key_env_present,
+        auth_env_codex_api_key_present = auth_env.codex_api_key_env_present,
+        auth_env_codex_api_key_enabled = auth_env.codex_api_key_env_enabled,
+        auth_env_provider_key_name = auth_env.provider_env_key_name.as_deref().unwrap_or(""),
+        auth_env_provider_key_present = auth_env.provider_env_key_present.unwrap_or(false),
+        auth_env_refresh_token_url_override_present = auth_env.refresh_token_url_override_present,
+        cli_version = env!("CARGO_PKG_VERSION"),
     );
 }
 

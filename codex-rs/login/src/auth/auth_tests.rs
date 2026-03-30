@@ -9,10 +9,19 @@ use codex_protocol::account::PlanType as AccountPlanType;
 use base64::Engine;
 use codex_protocol::config_types::ForcedLoginMethod;
 use pretty_assertions::assert_eq;
+use reqwest::header::HeaderMap;
+use reqwest::header::HeaderValue;
 use serde::Serialize;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use tempfile::tempdir;
+use wiremock::Mock;
+use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 #[tokio::test]
 async fn refresh_without_id_token() {
@@ -496,4 +505,128 @@ fn missing_plan_type_maps_to_unknown() {
         .expect("auth available");
 
     pretty_assertions::assert_eq!(auth.account_plan_type(), Some(AccountPlanType::Unknown));
+}
+
+#[test]
+fn refresh_token_reused_builds_sentry_auth_failure_fields() {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-request-id", HeaderValue::from_static("req_refresh_123"));
+    headers.insert("cf-ray", HeaderValue::from_static("abc123-SJC"));
+
+    assert_eq!(
+        refresh_failure_sentry_auth_fields(
+            &headers,
+            r#"{"error":{"code":"refresh_token_reused","message":"refresh token already used"}}"#
+        ),
+        BTreeMap::from([
+            ("report_kind".to_string(), "auth_failure_auto".to_string()),
+            ("endpoint".to_string(), "/oauth/token".to_string()),
+            ("auth_header_attached".to_string(), "true".to_string()),
+            ("auth_header_name".to_string(), "authorization".to_string()),
+            ("auth_mode".to_string(), "Chatgpt".to_string()),
+            ("auth_request_id".to_string(), "req_refresh_123".to_string()),
+            ("auth_cf_ray".to_string(), "abc123-SJC".to_string()),
+            (
+                "auth_error".to_string(),
+                "refresh token already used".to_string()
+            ),
+            (
+                "auth_error_code".to_string(),
+                "refresh_token_reused".to_string()
+            ),
+            (
+                "cli_version".to_string(),
+                env!("CARGO_PKG_VERSION").to_string()
+            ),
+        ])
+    );
+}
+
+#[tokio::test]
+#[serial(codex_api_key)]
+async fn refresh_token_reused_reports_fields_through_auth_failure_reporter() {
+    let codex_home = tempdir().unwrap();
+    write_auth_file(
+        AuthFileParams {
+            openai_api_key: None,
+            chatgpt_plan_type: Some("pro".to_string()),
+            chatgpt_account_id: Some("org_mine".to_string()),
+        },
+        codex_home.path(),
+    )
+    .expect("failed to write auth file");
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oauth/token"))
+        .respond_with(
+            ResponseTemplate::new(401)
+                .insert_header("x-request-id", "req_refresh_123")
+                .insert_header("cf-ray", "abc123-SJC")
+                .set_body_json(json!({
+                    "error": {
+                        "code": "refresh_token_reused",
+                        "message": "refresh token already used"
+                    }
+                })),
+        )
+        .mount(&server)
+        .await;
+    let _refresh_url = EnvVarGuard::set(
+        REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR,
+        &format!("{}/oauth/token", server.uri()),
+    );
+
+    let reported = Arc::new(Mutex::new(Vec::new()));
+    let _reporter_guard = set_auth_failure_reporter({
+        let reported = Arc::clone(&reported);
+        Arc::new(move |fields| {
+            reported
+                .lock()
+                .expect("report collector poisoned")
+                .push(fields);
+        })
+    });
+
+    let manager = AuthManager::shared(
+        codex_home.path().to_path_buf(),
+        false,
+        AuthCredentialsStoreMode::File,
+    );
+
+    let err = manager
+        .refresh_token_from_authority()
+        .await
+        .expect_err("refresh should fail permanently");
+    assert_eq!(
+        err.failed_reason(),
+        Some(RefreshTokenFailedReason::Exhausted)
+    );
+
+    let reported = reported.lock().expect("report collector poisoned");
+    assert_eq!(reported.len(), 1);
+    assert_eq!(
+        reported[0],
+        BTreeMap::from([
+            ("report_kind".to_string(), "auth_failure_auto".to_string()),
+            ("endpoint".to_string(), "/oauth/token".to_string()),
+            ("auth_header_attached".to_string(), "true".to_string()),
+            ("auth_header_name".to_string(), "authorization".to_string()),
+            ("auth_mode".to_string(), "Chatgpt".to_string()),
+            ("auth_request_id".to_string(), "req_refresh_123".to_string()),
+            ("auth_cf_ray".to_string(), "abc123-SJC".to_string()),
+            (
+                "auth_error".to_string(),
+                "refresh token already used".to_string()
+            ),
+            (
+                "auth_error_code".to_string(),
+                "refresh_token_reused".to_string()
+            ),
+            (
+                "cli_version".to_string(),
+                env!("CARGO_PKG_VERSION").to_string()
+            ),
+        ])
+    );
 }

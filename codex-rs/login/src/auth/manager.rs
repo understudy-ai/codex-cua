@@ -1,10 +1,13 @@
 use async_trait::async_trait;
 use chrono::Utc;
+use once_cell::sync::Lazy;
 use reqwest::StatusCode;
+use reqwest::header::HeaderMap;
 use serde::Deserialize;
 use serde::Serialize;
 #[cfg(test)]
 use serial_test::serial;
+use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Debug;
 use std::path::Path;
@@ -81,6 +84,10 @@ const REFRESH_TOKEN_UNKNOWN_MESSAGE: &str =
 const REFRESH_TOKEN_ACCOUNT_MISMATCH_MESSAGE: &str = "Your access token could not be refreshed because you have since logged out or signed in to another account. Please sign in again.";
 const REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 pub const REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
+const SENTRY_AUTH_FAILURES_TARGET: &str = "sentry_auth_failures";
+static AUTH_FAILURE_REPORTER: Lazy<
+    RwLock<Option<Arc<dyn Fn(BTreeMap<String, String>) + Send + Sync + 'static>>>,
+> = Lazy::new(|| RwLock::new(None));
 
 #[derive(Debug, Error)]
 pub enum RefreshTokenError {
@@ -88,6 +95,25 @@ pub enum RefreshTokenError {
     Permanent(#[from] RefreshTokenFailedError),
     #[error(transparent)]
     Transient(#[from] std::io::Error),
+}
+
+pub struct AuthFailureReporterGuard;
+
+impl Drop for AuthFailureReporterGuard {
+    fn drop(&mut self) {
+        if let Ok(mut reporter) = AUTH_FAILURE_REPORTER.write() {
+            *reporter = None;
+        }
+    }
+}
+
+pub fn set_auth_failure_reporter(
+    reporter: Arc<dyn Fn(BTreeMap<String, String>) + Send + Sync + 'static>,
+) -> AuthFailureReporterGuard {
+    if let Ok(mut current) = AUTH_FAILURE_REPORTER.write() {
+        *current = Some(reporter);
+    }
+    AuthFailureReporterGuard
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -639,9 +665,11 @@ async fn request_chatgpt_token_refresh(
             .map_err(|err| RefreshTokenError::Transient(std::io::Error::other(err)))?;
         Ok(refresh_response)
     } else {
+        let headers = response.headers().clone();
         let body = response.text().await.unwrap_or_default();
         tracing::error!("Failed to refresh token: {status}: {body}");
         if status == StatusCode::UNAUTHORIZED {
+            emit_sentry_auth_failure_event_for_refresh_failure(&headers, &body);
             let failed = classify_refresh_token_failure(&body);
             Err(RefreshTokenError::Permanent(failed))
         } else {
@@ -651,6 +679,62 @@ async fn request_chatgpt_token_refresh(
             )))
         }
     }
+}
+
+fn emit_sentry_auth_failure_event_for_refresh_failure(headers: &HeaderMap, body: &str) {
+    let fields = refresh_failure_sentry_auth_fields(headers, body);
+    if let Ok(reporter) = AUTH_FAILURE_REPORTER.read()
+        && let Some(reporter) = reporter.as_ref()
+    {
+        reporter(fields);
+        return;
+    }
+
+    tracing::event!(
+        target: SENTRY_AUTH_FAILURES_TARGET,
+        tracing::Level::ERROR,
+        report_kind = fields.get("report_kind").map(String::as_str).unwrap_or(""),
+        endpoint = fields.get("endpoint").map(String::as_str).unwrap_or(""),
+        auth_header_attached = fields
+            .get("auth_header_attached")
+            .is_some_and(|value| value == "true"),
+        auth_header_name = fields.get("auth_header_name").map(String::as_str).unwrap_or(""),
+        auth_mode = fields.get("auth_mode").map(String::as_str).unwrap_or(""),
+        auth_request_id = fields.get("auth_request_id").map(String::as_str).unwrap_or(""),
+        auth_cf_ray = fields.get("auth_cf_ray").map(String::as_str).unwrap_or(""),
+        auth_error = fields.get("auth_error").map(String::as_str).unwrap_or(""),
+        auth_error_code = fields.get("auth_error_code").map(String::as_str).unwrap_or(""),
+        cli_version = fields.get("cli_version").map(String::as_str).unwrap_or(""),
+    );
+}
+
+fn refresh_failure_sentry_auth_fields(headers: &HeaderMap, body: &str) -> BTreeMap<String, String> {
+    let auth_request_id = headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let auth_cf_ray = headers
+        .get("cf-ray")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    let auth_error_code = extract_refresh_token_error_code(body).unwrap_or_default();
+    let auth_error = try_parse_error_message(body);
+
+    BTreeMap::from([
+        ("report_kind".to_string(), "auth_failure_auto".to_string()),
+        ("endpoint".to_string(), "/oauth/token".to_string()),
+        ("auth_header_attached".to_string(), "true".to_string()),
+        ("auth_header_name".to_string(), "authorization".to_string()),
+        ("auth_mode".to_string(), "Chatgpt".to_string()),
+        ("auth_request_id".to_string(), auth_request_id.to_string()),
+        ("auth_cf_ray".to_string(), auth_cf_ray.to_string()),
+        ("auth_error".to_string(), auth_error),
+        ("auth_error_code".to_string(), auth_error_code),
+        (
+            "cli_version".to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        ),
+    ])
 }
 
 fn classify_refresh_token_failure(body: &str) -> RefreshTokenFailedError {

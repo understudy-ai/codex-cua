@@ -28,8 +28,11 @@ pub mod feedback_diagnostics;
 const DEFAULT_MAX_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
 const SENTRY_DSN: &str =
     "https://ae32ed50620d7a7792c1ce5df38b3e3e@o33249.ingest.us.sentry.io/4510195390611458";
+const SENTRY_DSN_OVERRIDE_ENV_VAR: &str = "CODEX_SENTRY_DSN_OVERRIDE";
 const UPLOAD_TIMEOUT_SECS: u64 = 10;
 const FEEDBACK_TAGS_TARGET: &str = "feedback_tags";
+const SENTRY_AUTH_FAILURES_TARGET: &str = "sentry_auth_failures";
+const AUTH_FAILURE_REPORT_KIND: &str = "auth_failure_auto";
 const MAX_FEEDBACK_TAGS: usize = 64;
 
 #[derive(Clone)]
@@ -91,6 +94,18 @@ impl CodexFeedback {
             inner: self.inner.clone(),
         }
         .with_filter(Targets::new().with_target(FEEDBACK_TAGS_TARGET, Level::TRACE))
+    }
+
+    /// Returns a [`tracing_subscriber`] layer that uploads lightweight auth-failure Sentry events.
+    ///
+    /// Events with `target: "sentry_auth_failures"` are converted into searchable Sentry issues
+    /// without relying on a manual `/feedback` upload.
+    pub fn auth_event_layer<S>(&self) -> impl Layer<S> + Send + Sync + 'static
+    where
+        S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    {
+        AuthFailureSentryLayer
+            .with_filter(Targets::new().with_target(SENTRY_AUTH_FAILURES_TARGET, Level::TRACE))
     }
 
     pub fn snapshot(&self, session_id: Option<ThreadId>) -> FeedbackSnapshot {
@@ -252,25 +267,13 @@ impl FeedbackSnapshot {
         session_source: Option<SessionSource>,
         logs_override: Option<Vec<u8>>,
     ) -> Result<()> {
-        use std::collections::BTreeMap;
-        use std::str::FromStr;
-        use std::sync::Arc;
-
-        use sentry::Client;
-        use sentry::ClientOptions;
         use sentry::protocol::Envelope;
         use sentry::protocol::EnvelopeItem;
         use sentry::protocol::Event;
         use sentry::protocol::Level;
-        use sentry::transports::DefaultTransportFactory;
-        use sentry::types::Dsn;
+        use std::collections::BTreeMap;
 
-        // Build Sentry client
-        let client = Client::from_config(ClientOptions {
-            dsn: Some(Dsn::from_str(SENTRY_DSN).map_err(|e| anyhow!("invalid DSN: {e}"))?),
-            transport: Some(Arc::new(DefaultTransportFactory {})),
-            ..Default::default()
-        });
+        let client = build_sentry_client()?;
 
         let cli_version = env!("CARGO_PKG_VERSION");
         let mut tags = BTreeMap::from([
@@ -398,6 +401,29 @@ impl FeedbackSnapshot {
     }
 }
 
+fn build_sentry_client() -> Result<sentry::Client> {
+    build_sentry_client_with_dsn_override(
+        std::env::var(SENTRY_DSN_OVERRIDE_ENV_VAR).ok().as_deref(),
+    )
+}
+
+fn build_sentry_client_with_dsn_override(dsn_override: Option<&str>) -> Result<sentry::Client> {
+    use std::str::FromStr;
+    use std::sync::Arc;
+
+    use sentry::Client;
+    use sentry::ClientOptions;
+    use sentry::transports::DefaultTransportFactory;
+    use sentry::types::Dsn;
+
+    let dsn = dsn_override.unwrap_or(SENTRY_DSN);
+    Ok(Client::from_config(ClientOptions {
+        dsn: Some(Dsn::from_str(dsn).map_err(|e| anyhow!("invalid DSN: {e}"))?),
+        transport: Some(Arc::new(DefaultTransportFactory {})),
+        ..Default::default()
+    }))
+}
+
 fn display_classification(classification: &str) -> String {
     match classification {
         "bug" => "Bug".to_string(),
@@ -440,6 +466,30 @@ where
     }
 }
 
+#[derive(Clone, Copy)]
+struct AuthFailureSentryLayer;
+
+impl<S> Layer<S> for AuthFailureSentryLayer
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        if event.metadata().target() != SENTRY_AUTH_FAILURES_TARGET {
+            return;
+        }
+
+        let mut visitor = FeedbackTagsVisitor::default();
+        event.record(&mut visitor);
+        if visitor.tags.is_empty() {
+            return;
+        }
+
+        if let Err(err) = upload_auth_failure_event_tags(visitor.tags) {
+            tracing::warn!(error = %err, "failed to upload auth failure event");
+        }
+    }
+}
+
 #[derive(Default)]
 struct FeedbackTagsVisitor {
     tags: BTreeMap<String, String>,
@@ -477,10 +527,94 @@ impl Visit for FeedbackTagsVisitor {
     }
 }
 
+fn finalize_auth_failure_tags(mut tags: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    tags.retain(|_, value| !value.is_empty());
+    tags.insert(
+        String::from("report_kind"),
+        AUTH_FAILURE_REPORT_KIND.to_string(),
+    );
+    tags
+}
+
+fn auth_failure_grouping_key(tags: &BTreeMap<String, String>) -> Vec<String> {
+    let endpoint = tags
+        .get("endpoint")
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+    let error_code = tags
+        .get("auth_error_code")
+        .filter(|value| !value.is_empty())
+        .or_else(|| tags.get("auth_error").filter(|value| !value.is_empty()))
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+    let auth_header_attached = tags
+        .get("auth_header_attached")
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+    vec![
+        "codex".to_string(),
+        AUTH_FAILURE_REPORT_KIND.to_string(),
+        endpoint,
+        error_code,
+        auth_header_attached,
+    ]
+}
+
+fn build_auth_failure_event(tags: BTreeMap<String, String>) -> sentry::protocol::Event<'static> {
+    use std::borrow::Cow;
+
+    use sentry::protocol::Event;
+    use sentry::protocol::Level;
+
+    let endpoint = tags
+        .get("endpoint")
+        .cloned()
+        .unwrap_or_else(|| "unknown".to_string());
+    let fingerprint = auth_failure_grouping_key(&tags)
+        .into_iter()
+        .map(Cow::Owned)
+        .collect::<Vec<Cow<'static, str>>>();
+    Event {
+        level: Level::Error,
+        message: Some(format!("Codex client auth failure on {endpoint}")),
+        fingerprint: fingerprint.into(),
+        tags,
+        ..Default::default()
+    }
+}
+
+pub fn upload_auth_failure_event_tags(tags: BTreeMap<String, String>) -> Result<()> {
+    upload_auth_failure_event_with_dsn_override(
+        finalize_auth_failure_tags(tags),
+        std::env::var(SENTRY_DSN_OVERRIDE_ENV_VAR).ok().as_deref(),
+    )
+}
+
+fn upload_auth_failure_event_with_dsn_override(
+    tags: BTreeMap<String, String>,
+    dsn_override: Option<&str>,
+) -> Result<()> {
+    use sentry::protocol::Envelope;
+    use sentry::protocol::EnvelopeItem;
+
+    let client = build_sentry_client_with_dsn_override(dsn_override)?;
+    let mut envelope = Envelope::new();
+    envelope.add_item(EnvelopeItem::Event(build_auth_failure_event(tags)));
+    client.send_envelope(envelope);
+    client.flush(Some(Duration::from_secs(UPLOAD_TIMEOUT_SECS)));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
     use std::fs;
+    use std::io::Read;
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration as StdDuration;
 
     use super::*;
     use feedback_diagnostics::FeedbackDiagnostic;
@@ -513,6 +647,138 @@ mod tests {
         let snap = fb.snapshot(None);
         pretty_assertions::assert_eq!(snap.tags.get("model").map(String::as_str), Some("gpt-5"));
         pretty_assertions::assert_eq!(snap.tags.get("cached").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn finalize_auth_failure_tags_adds_report_kind_and_drops_empty_values() {
+        let tags = finalize_auth_failure_tags(BTreeMap::from([
+            (String::from("endpoint"), String::from("/responses")),
+            (String::from("auth_request_id"), String::new()),
+        ]));
+
+        assert_eq!(
+            tags.get("report_kind").map(String::as_str),
+            Some(AUTH_FAILURE_REPORT_KIND)
+        );
+        assert_eq!(tags.get("endpoint").map(String::as_str), Some("/responses"));
+        assert!(!tags.contains_key("auth_request_id"));
+    }
+
+    #[test]
+    fn auth_failure_grouping_key_uses_endpoint_code_and_header_state() {
+        let grouping_key = auth_failure_grouping_key(&BTreeMap::from([
+            (String::from("endpoint"), String::from("/responses")),
+            (
+                String::from("auth_error_code"),
+                String::from("token_expired"),
+            ),
+            (String::from("auth_header_attached"), String::from("true")),
+        ]));
+
+        assert_eq!(
+            grouping_key,
+            vec![
+                "codex".to_string(),
+                AUTH_FAILURE_REPORT_KIND.to_string(),
+                "/responses".to_string(),
+                "token_expired".to_string(),
+                "true".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_auth_failure_event_sets_stable_message_and_tags() {
+        let event = build_auth_failure_event(BTreeMap::from([
+            (
+                String::from("report_kind"),
+                AUTH_FAILURE_REPORT_KIND.to_string(),
+            ),
+            (String::from("endpoint"), String::from("/responses")),
+            (String::from("auth_header_attached"), String::from("true")),
+        ]));
+
+        assert_eq!(
+            event.message.as_deref(),
+            Some("Codex client auth failure on /responses")
+        );
+        assert_eq!(
+            event.tags.get("report_kind").map(String::as_str),
+            Some(AUTH_FAILURE_REPORT_KIND)
+        );
+        assert_eq!(
+            event.tags.get("auth_header_attached").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[test]
+    fn auth_failure_upload_posts_envelope_to_overridden_dsn() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local listener");
+        listener
+            .set_nonblocking(false)
+            .expect("listener should stay blocking");
+        let addr = listener.local_addr().expect("local addr");
+        let (tx, rx) = mpsc::channel();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept envelope request");
+            let mut buffer = Vec::new();
+            let mut headers_end = None;
+            while headers_end.is_none() {
+                let mut chunk = [0_u8; 4096];
+                let read = stream.read(&mut chunk).expect("read request headers");
+                buffer.extend_from_slice(&chunk[..read]);
+                headers_end = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+            }
+            let headers_end = headers_end.expect("headers terminator should exist") + 4;
+            let headers = String::from_utf8_lossy(&buffer[..headers_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    if name.eq_ignore_ascii_case("content-length") {
+                        Some(value.trim().parse::<usize>().expect("content-length"))
+                    } else {
+                        None
+                    }
+                })
+                .expect("content-length header");
+            while buffer.len() < headers_end + content_length {
+                let mut chunk = [0_u8; 4096];
+                let read = stream.read(&mut chunk).expect("read request body");
+                buffer.extend_from_slice(&chunk[..read]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .expect("write response");
+            tx.send(buffer).expect("capture request");
+        });
+
+        let dsn = format!("http://public@127.0.0.1:{}/1", addr.port());
+        upload_auth_failure_event_with_dsn_override(
+            finalize_auth_failure_tags(BTreeMap::from([
+                (String::from("endpoint"), String::from("/oauth/token")),
+                (
+                    String::from("auth_error_code"),
+                    String::from("refresh_token_reused"),
+                ),
+                (String::from("auth_header_attached"), String::from("true")),
+            ])),
+            Some(&dsn),
+        )
+        .expect("upload auth failure event");
+
+        let request = rx
+            .recv_timeout(StdDuration::from_secs(5))
+            .expect("receive envelope request");
+        server.join().expect("server thread should exit");
+
+        let request_text = String::from_utf8_lossy(&request);
+        assert!(request_text.contains("POST /api/1/envelope/"));
+        assert!(request_text.contains("\"report_kind\":\"auth_failure_auto\""));
+        assert!(request_text.contains("\"endpoint\":\"/oauth/token\""));
+        assert!(request_text.contains("\"auth_error_code\":\"refresh_token_reused\""));
     }
 
     #[test]
