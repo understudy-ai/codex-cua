@@ -21,6 +21,9 @@ use crate::test_support::PathBufExt;
 use crate::test_support::test_path_display;
 use crate::tui::FrameRequester;
 use assert_matches::assert_matches;
+use codex_app_server_protocol::AdditionalFileSystemPermissions as AppServerAdditionalFileSystemPermissions;
+use codex_app_server_protocol::AdditionalNetworkPermissions as AppServerAdditionalNetworkPermissions;
+use codex_app_server_protocol::AdditionalPermissionProfile as AppServerAdditionalPermissionProfile;
 use codex_app_server_protocol::AppSummary;
 use codex_app_server_protocol::CollabAgentState as AppServerCollabAgentState;
 use codex_app_server_protocol::CollabAgentStatus as AppServerCollabAgentStatus;
@@ -54,6 +57,7 @@ use codex_app_server_protocol::McpServerStartupState;
 use codex_app_server_protocol::McpServerStatusUpdatedNotification;
 use codex_app_server_protocol::PatchApplyStatus as AppServerPatchApplyStatus;
 use codex_app_server_protocol::PatchChangeKind;
+use codex_app_server_protocol::PermissionsRequestApprovalParams as AppServerPermissionsRequestApprovalParams;
 use codex_app_server_protocol::PluginAuthPolicy;
 use codex_app_server_protocol::PluginDetail;
 use codex_app_server_protocol::PluginInstallPolicy;
@@ -108,7 +112,10 @@ use codex_protocol::items::AgentMessageItem;
 use codex_protocol::items::PlanItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
+use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::MessagePhase;
+use codex_protocol::models::NetworkPermissions;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::openai_models::default_input_modalities;
@@ -172,6 +179,7 @@ use codex_protocol::protocol::UndoCompletedEvent;
 use codex_protocol::protocol::UndoStartedEvent;
 use codex_protocol::protocol::ViewImageToolCallEvent;
 use codex_protocol::protocol::WarningEvent;
+use codex_protocol::request_permissions::RequestPermissionProfile;
 use codex_protocol::request_user_input::RequestUserInputEvent;
 use codex_protocol::request_user_input::RequestUserInputQuestion;
 use codex_protocol::request_user_input::RequestUserInputQuestionOption;
@@ -3624,6 +3632,98 @@ fn app_server_exec_approval_request_splits_shell_wrapped_command() {
             "-lc".to_string(),
             script.to_string(),
         ]
+    );
+}
+
+#[test]
+fn app_server_exec_approval_request_preserves_permissions_context() {
+    let read_path = AbsolutePathBuf::try_from(PathBuf::from(test_path_display("/tmp/read-only")))
+        .expect("absolute read path");
+    let write_path = AbsolutePathBuf::try_from(PathBuf::from(test_path_display("/tmp/write")))
+        .expect("absolute write path");
+    let request =
+        exec_approval_request_from_params(AppServerCommandExecutionRequestApprovalParams {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item_id: "item-1".to_string(),
+            approval_id: Some("approval-1".to_string()),
+            reason: None,
+            network_approval_context: Some(codex_app_server_protocol::NetworkApprovalContext {
+                host: "example.com".to_string(),
+                protocol: codex_app_server_protocol::NetworkApprovalProtocol::Socks5Tcp,
+            }),
+            command: Some("ls".to_string()),
+            cwd: Some(PathBuf::from("/tmp")),
+            command_actions: None,
+            additional_permissions: Some(AppServerAdditionalPermissionProfile {
+                network: Some(AppServerAdditionalNetworkPermissions {
+                    enabled: Some(true),
+                }),
+                file_system: Some(AppServerAdditionalFileSystemPermissions {
+                    read: Some(vec![read_path.clone()]),
+                    write: Some(vec![write_path.clone()]),
+                }),
+            }),
+            proposed_execpolicy_amendment: None,
+            proposed_network_policy_amendments: None,
+            available_decisions: None,
+        });
+
+    assert_eq!(
+        request.network_approval_context,
+        Some(codex_protocol::protocol::NetworkApprovalContext {
+            host: "example.com".to_string(),
+            protocol: codex_protocol::protocol::NetworkApprovalProtocol::Socks5Tcp,
+        })
+    );
+    assert_eq!(
+        request.additional_permissions,
+        Some(PermissionProfile {
+            network: Some(NetworkPermissions {
+                enabled: Some(true),
+            }),
+            file_system: Some(FileSystemPermissions {
+                read: Some(vec![read_path]),
+                write: Some(vec![write_path]),
+            }),
+        })
+    );
+}
+
+#[test]
+fn app_server_request_permissions_preserves_file_system_permissions() {
+    let read_path = AbsolutePathBuf::try_from(PathBuf::from(test_path_display("/tmp/read-only")))
+        .expect("absolute read path");
+    let write_path = AbsolutePathBuf::try_from(PathBuf::from(test_path_display("/tmp/write")))
+        .expect("absolute write path");
+
+    let request = request_permissions_from_params(AppServerPermissionsRequestApprovalParams {
+        thread_id: "thread-1".to_string(),
+        turn_id: "turn-1".to_string(),
+        item_id: "item-1".to_string(),
+        reason: Some("Select a workspace root".to_string()),
+        permissions: codex_app_server_protocol::RequestPermissionProfile {
+            network: Some(AppServerAdditionalNetworkPermissions {
+                enabled: Some(true),
+            }),
+            file_system: Some(AppServerAdditionalFileSystemPermissions {
+                read: Some(vec![read_path.clone()]),
+                write: Some(vec![write_path.clone()]),
+            }),
+        },
+    });
+
+    assert_eq!(
+        request.permissions,
+        RequestPermissionProfile {
+            network: Some(NetworkPermissions {
+                enabled: Some(true),
+            }),
+            file_system: Some(FileSystemPermissions {
+                read: Some(vec![read_path]),
+                write: Some(vec![write_path]),
+            }),
+        }
     );
 }
 
