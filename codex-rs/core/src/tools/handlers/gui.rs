@@ -331,13 +331,6 @@ pub struct GuiToolOutput {
 }
 
 impl GuiToolOutput {
-    fn from_text(text: String) -> Self {
-        Self {
-            code_result: serde_json::json!({ "message": text }),
-            body: vec![FunctionCallOutputContentItem::InputText { text }],
-            success: true,
-        }
-    }
 }
 
 impl ToolOutput for GuiToolOutput {
@@ -896,12 +889,34 @@ impl GuiHandler {
                 ""
             }
         );
+        let mut extra_details = serde_json::Map::new();
+        extra_details.insert(
+            "action_kind".to_string(),
+            JsonValue::String(event_mode.to_string()),
+        );
+        extra_details.insert(
+            "executed_point".to_string(),
+            point_json(global_x, global_y),
+        );
+        if let Some(target_details) = target_details {
+            extend_object_fields(&mut extra_details, target_details);
+            extra_details.insert(
+                "pre_action_capture".to_string(),
+                build_capture_details_from_state(&state),
+            );
+        } else {
+            extra_details.insert(
+                "grounding_method".to_string(),
+                JsonValue::String("absolute_coordinates".to_string()),
+            );
+            extra_details.insert("confidence".to_string(), JsonValue::from(1.0));
+        }
         Ok(self.build_gui_output(
             summary,
             evidence.state,
             evidence.image_url,
             true,
-            target_details,
+            Some(JsonValue::Object(extra_details)),
         ))
     }
 
@@ -1138,11 +1153,27 @@ impl GuiHandler {
             }
         );
         let mut extra_details = serde_json::Map::new();
+        extra_details.insert("action_kind".to_string(), JsonValue::String("drag".to_string()));
+        extra_details.insert(
+            "executed_from_point".to_string(),
+            point_json(from_global_x, from_global_y),
+        );
+        extra_details.insert(
+            "executed_to_point".to_string(),
+            point_json(to_global_x, to_global_y),
+        );
+        extra_details.insert(
+            "pre_action_capture".to_string(),
+            build_capture_details_from_state(&state),
+        );
         if let Some(source_target_details) = source_target_details {
+            extend_object_fields(&mut extra_details, source_target_details);
+        } else {
             extra_details.insert(
-                "source_target_resolution".to_string(),
-                source_target_details,
+                "grounding_method".to_string(),
+                JsonValue::String("absolute_coordinates".to_string()),
             );
+            extra_details.insert("confidence".to_string(), JsonValue::from(1.0));
         }
         if let Some(destination_target_details) = destination_target_details {
             extra_details.insert(
@@ -1182,6 +1213,8 @@ impl GuiHandler {
         let mut float_env = Vec::new();
         let mut state_for_summary = None;
         let mut target_details = None;
+        let mut executed_point = None;
+        let mut used_absolute_coordinates = false;
         if let Some(target) = semantic_target.as_deref() {
             if args.x.is_some() || args.y.is_some() {
                 return Err(FunctionCallError::RespondToModel(
@@ -1211,6 +1244,7 @@ impl GuiHandler {
             let resolved = grounded.resolved;
             float_env.push(("CODEX_GUI_X", resolved.point.x));
             float_env.push(("CODEX_GUI_Y", resolved.point.y));
+            executed_point = Some((resolved.point.x, resolved.point.y));
             state_for_summary = Some(resolved.capture_state);
             target_details = Some(details);
         } else if let (Some(x), Some(y)) = (args.x, args.y) {
@@ -1224,7 +1258,9 @@ impl GuiHandler {
             )?;
             float_env.push(("CODEX_GUI_X", global_x));
             float_env.push(("CODEX_GUI_Y", global_y));
+            executed_point = Some((global_x, global_y));
             state_for_summary = Some(state);
+            used_absolute_coordinates = true;
         } else if args.x.is_some() || args.y.is_some() {
             return Err(FunctionCallError::RespondToModel(
                 "gui_scroll requires both `x` and `y` when specifying a scroll location"
@@ -1278,12 +1314,41 @@ impl GuiHandler {
                 ""
             }
         );
+        let mut extra_details = serde_json::Map::new();
+        extra_details.insert(
+            "action_kind".to_string(),
+            JsonValue::String("scroll".to_string()),
+        );
+        if let Some((x, y)) = executed_point {
+            extra_details.insert("executed_point".to_string(), point_json(x, y));
+        }
+        if let Some(target_details) = target_details {
+            extend_object_fields(&mut extra_details, target_details);
+            if let Some(state) = state_for_summary.as_ref() {
+                extra_details.insert(
+                    "pre_action_capture".to_string(),
+                    build_capture_details_from_state(state),
+                );
+            }
+        } else if used_absolute_coordinates {
+            extra_details.insert(
+                "grounding_method".to_string(),
+                JsonValue::String("absolute_coordinates".to_string()),
+            );
+            extra_details.insert("confidence".to_string(), JsonValue::from(1.0));
+        } else {
+            extra_details.insert(
+                "grounding_method".to_string(),
+                JsonValue::String("targetless".to_string()),
+            );
+            extra_details.insert("confidence".to_string(), JsonValue::from(1.0));
+        }
         Ok(self.build_gui_output(
             summary,
             evidence.state,
             evidence.image_url,
             true,
-            target_details,
+            Some(JsonValue::Object(extra_details)),
         ))
     }
 
@@ -1302,6 +1367,8 @@ impl GuiHandler {
         let scope = normalize_optional_string(args.scope.as_deref());
         let strategy = args.strategy.as_deref().unwrap_or("unicode");
         let mut target_details = None;
+        let mut executed_point = None;
+        let mut pre_action_capture = None;
         if let Some(target) = semantic_target.as_deref() {
             let grounded = self.resolve_gui_target(GuiTargetRequest {
                 app: args.app.as_deref(),
@@ -1333,6 +1400,8 @@ impl GuiHandler {
                 ],
                 &[],
             )?;
+            executed_point = Some((resolved.point.x, resolved.point.y));
+            pre_action_capture = Some(build_capture_details_from_state(&resolved.capture_state));
             target_details = Some(details);
         } else {
             prepare_targeted_gui_action(
@@ -1415,12 +1484,32 @@ impl GuiHandler {
                 ""
             }
         );
+        let mut extra_details = serde_json::Map::new();
+        extra_details.insert(
+            "action_kind".to_string(),
+            JsonValue::String(strategy.to_string()),
+        );
+        if let Some((x, y)) = executed_point {
+            extra_details.insert("executed_point".to_string(), point_json(x, y));
+        }
+        if let Some(target_details) = target_details {
+            extend_object_fields(&mut extra_details, target_details);
+            if let Some(pre_action_capture) = pre_action_capture {
+                extra_details.insert("pre_action_capture".to_string(), pre_action_capture);
+            }
+        } else {
+            extra_details.insert(
+                "grounding_method".to_string(),
+                JsonValue::String("targetless".to_string()),
+            );
+            extra_details.insert("confidence".to_string(), JsonValue::from(1.0));
+        }
         Ok(self.build_gui_output(
             summary,
             evidence.state,
             evidence.image_url,
             true,
-            target_details,
+            Some(JsonValue::Object(extra_details)),
         ))
     }
 
@@ -1480,7 +1569,18 @@ impl GuiHandler {
                 ""
             }
         );
-        Ok(self.build_action_output(summary, evidence))
+        Ok(self.build_gui_output(
+            summary,
+            evidence.state,
+            evidence.image_url,
+            true,
+            Some(serde_json::json!({
+                "action_kind": "key_press",
+                "grounding_method": "targetless",
+                "confidence": 1.0,
+                "repeat": repeat,
+            })),
+        ))
     }
 
     async fn handle_move(
@@ -1495,11 +1595,28 @@ impl GuiHandler {
             &[("CODEX_GUI_SETTLE_MS", DEFAULT_HOVER_SETTLE_MS.to_string())],
         )?;
 
-        Ok(GuiToolOutput::from_text(format!(
+        let summary = format!(
             "Moved the macOS pointer to absolute display coordinate ({}, {}).",
             args.x.round(),
             args.y.round()
-        )))
+        );
+        Ok(GuiToolOutput {
+            body: vec![FunctionCallOutputContentItem::InputText {
+                text: summary.clone(),
+            }],
+            code_result: serde_json::json!({
+                "message": summary,
+                "action_kind": "move_cursor",
+                "grounding_method": "absolute_coordinates",
+                "confidence": 1.0,
+                "executed_point": {
+                    "x": args.x,
+                    "y": args.y,
+                },
+                "app": args.app,
+            }),
+            success: true,
+        })
     }
 
     fn resolve_global_point(
@@ -1637,10 +1754,6 @@ impl GuiHandler {
             );
 
         Ok(ActionEvidence { image_url, state })
-    }
-
-    fn build_action_output(&self, summary: String, evidence: ActionEvidence) -> GuiToolOutput {
-        self.build_gui_output(summary, evidence.state, evidence.image_url, true, None)
     }
 
     fn build_gui_output(
@@ -1992,6 +2105,35 @@ fn build_target_resolution_details(target: &str, grounded: &GroundedGuiTarget) -
             "height": resolved.bounds.height,
         },
     })
+}
+
+fn build_capture_details_from_state(state: &ObserveState) -> JsonValue {
+    serde_json::json!({
+        "capture_mode": state.capture_mode,
+        "origin_x": state.capture_x,
+        "origin_y": state.capture_y,
+        "width": state.width,
+        "height": state.height,
+        "app": state.app_name,
+        "window_title": state.window_title,
+        "window_count": state.window_count,
+        "window_capture_strategy": state.window_capture_strategy,
+    })
+}
+
+fn point_json(x: f64, y: f64) -> JsonValue {
+    serde_json::json!({
+        "x": x,
+        "y": y,
+    })
+}
+
+fn extend_object_fields(target: &mut serde_json::Map<String, JsonValue>, value: JsonValue) {
+    if let JsonValue::Object(fields) = value {
+        for (key, value) in fields {
+            target.insert(key, value);
+        }
+    }
 }
 
 fn local_point_within_state(state: &ObserveState, point: &HelperPoint) -> Option<HelperPoint> {
