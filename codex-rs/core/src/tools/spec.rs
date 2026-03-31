@@ -54,6 +54,7 @@ use codex_tools::create_exec_command_tool;
 use codex_tools::create_gui_click_tool;
 use codex_tools::create_gui_drag_tool;
 use codex_tools::create_gui_key_tool;
+use codex_tools::create_gui_move_tool;
 use codex_tools::create_gui_observe_tool;
 use codex_tools::create_gui_scroll_tool;
 use codex_tools::create_gui_type_tool;
@@ -811,12 +812,19 @@ pub(crate) fn build_specs_with_discoverable_tools(
             /*supports_parallel_tool_calls*/ false,
             config.code_mode_enabled,
         );
+        push_tool_spec(
+            &mut builder,
+            create_gui_move_tool(),
+            /*supports_parallel_tool_calls*/ false,
+            config.code_mode_enabled,
+        );
         builder.register_handler("gui_observe", gui_handler.clone());
         builder.register_handler("gui_click", gui_handler.clone());
         builder.register_handler("gui_drag", gui_handler.clone());
         builder.register_handler("gui_scroll", gui_handler.clone());
         builder.register_handler("gui_type", gui_handler.clone());
-        builder.register_handler("gui_key", gui_handler);
+        builder.register_handler("gui_key", gui_handler.clone());
+        builder.register_handler("gui_move", gui_handler);
     }
 
     push_tool_spec(

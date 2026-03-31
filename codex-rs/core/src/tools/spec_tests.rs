@@ -1104,6 +1104,7 @@ fn gui_tools_present_when_feature_enabled() {
             "gui_scroll",
             "gui_type",
             "gui_key",
+            "gui_move",
         ],
     );
 }

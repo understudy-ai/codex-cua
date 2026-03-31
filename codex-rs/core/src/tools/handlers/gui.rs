@@ -34,6 +34,8 @@ const GUI_IMAGE_UNSUPPORTED_MESSAGE: &str =
     "gui_observe is not allowed because you do not support image inputs";
 const DEFAULT_DRAG_DURATION_MS: i64 = 450;
 const DEFAULT_DRAG_STEPS: i64 = 24;
+const DEFAULT_HOVER_SETTLE_MS: i64 = 200;
+const DEFAULT_CLICK_AND_HOLD_MS: i64 = 650;
 
 #[derive(Default)]
 pub struct GuiHandler {
@@ -42,17 +44,31 @@ pub struct GuiHandler {
 
 #[derive(Clone, Debug)]
 struct ObserveState {
-    origin_x: f64,
-    origin_y: f64,
+    capture_x: f64,
+    capture_y: f64,
     width: u32,
     height: u32,
     app_name: Option<String>,
     display_index: i64,
+    capture_mode: &'static str,
+    window_title: Option<String>,
+    window_count: Option<i64>,
+    window_capture_strategy: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct WindowSelector {
+    title: Option<String>,
+    title_contains: Option<String>,
+    index: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ObserveArgs {
     app: Option<String>,
+    capture_mode: Option<String>,
+    window_title: Option<String>,
+    window_selector: Option<WindowSelector>,
     return_image: Option<bool>,
 }
 
@@ -62,6 +78,11 @@ struct ClickArgs {
     y: f64,
     button: Option<String>,
     clicks: Option<i64>,
+    hold_ms: Option<i64>,
+    settle_ms: Option<i64>,
+    capture_mode: Option<String>,
+    window_title: Option<String>,
+    window_selector: Option<WindowSelector>,
     app: Option<String>,
 }
 
@@ -73,6 +94,9 @@ struct DragArgs {
     to_y: f64,
     duration_ms: Option<i64>,
     steps: Option<i64>,
+    capture_mode: Option<String>,
+    window_title: Option<String>,
+    window_selector: Option<WindowSelector>,
     app: Option<String>,
 }
 
@@ -83,15 +107,23 @@ struct ScrollArgs {
     x: Option<f64>,
     y: Option<f64>,
     unit: Option<String>,
+    capture_mode: Option<String>,
+    window_title: Option<String>,
+    window_selector: Option<WindowSelector>,
     app: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TypeArgs {
-    text: String,
+    text: Option<String>,
+    secret_env_var: Option<String>,
+    secret_command_env_var: Option<String>,
     replace: Option<bool>,
     submit: Option<bool>,
     strategy: Option<String>,
+    capture_mode: Option<String>,
+    window_title: Option<String>,
+    window_selector: Option<WindowSelector>,
     app: Option<String>,
 }
 
@@ -100,6 +132,16 @@ struct KeyArgs {
     key: String,
     modifiers: Option<Vec<String>>,
     repeat: Option<i64>,
+    capture_mode: Option<String>,
+    window_title: Option<String>,
+    window_selector: Option<WindowSelector>,
+    app: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MoveArgs {
+    x: f64,
+    y: f64,
     app: Option<String>,
 }
 
@@ -109,21 +151,26 @@ struct HelperCaptureContext {
     app_name: Option<String>,
     cursor: HelperPoint,
     display: HelperDisplayDescriptor,
+    window_id: Option<i64>,
+    window_title: Option<String>,
+    window_bounds: Option<HelperRect>,
+    window_count: Option<i64>,
+    window_capture_strategy: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct HelperPoint {
     x: f64,
     y: f64,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct HelperDisplayDescriptor {
     index: i64,
     bounds: HelperRect,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct HelperRect {
     x: f64,
     y: f64,
@@ -199,6 +246,7 @@ impl ToolHandler for GuiHandler {
             "gui_scroll" => self.handle_scroll(invocation).await,
             "gui_type" => self.handle_type(invocation).await,
             "gui_key" => self.handle_key(invocation).await,
+            "gui_move" => self.handle_move(invocation).await,
             name => Err(FunctionCallError::RespondToModel(format!(
                 "unsupported gui tool `{name}`"
             ))),
@@ -223,18 +271,29 @@ impl GuiHandler {
         }
 
         let args = parse_function_args::<ObserveArgs>(&invocation.payload)?;
-        let context = capture_context(args.app.as_deref(), true)?;
-        let width = rounded_dimension(context.display.bounds.width, "display width")?;
-        let height = rounded_dimension(context.display.bounds.height, "display height")?;
-        let image_bytes = capture_display_region(&context.display.bounds, width, height)?;
+        let window_selection = normalize_window_selection(
+            args.window_title.as_deref(),
+            args.window_selector.as_ref(),
+        )?;
+        let context = capture_context(args.app.as_deref(), true, window_selection.as_ref())?;
+        let capture = resolve_capture_target(
+            &context,
+            args.capture_mode.as_deref(),
+            window_selection.is_some(),
+        )?;
+        let image_bytes = capture_region(&capture.bounds, capture.width, capture.height)?;
         let image_url = data_url_png(&image_bytes);
         let state = ObserveState {
-            origin_x: context.display.bounds.x,
-            origin_y: context.display.bounds.y,
-            width,
-            height,
+            capture_x: capture.bounds.x,
+            capture_y: capture.bounds.y,
+            width: capture.width,
+            height: capture.height,
             app_name: context.app_name.clone(),
             display_index: context.display.index,
+            capture_mode: capture.mode,
+            window_title: capture.window_title.clone(),
+            window_count: capture.window_count,
+            window_capture_strategy: capture.window_capture_strategy.clone(),
         };
         self.observe_state
             .lock()
@@ -244,16 +303,24 @@ impl GuiHandler {
                 state.clone(),
             );
 
-        let summary = format!(
-            "Captured macOS display {}{} at origin ({}, {}) with size {}x{}. Coordinates for gui_click/gui_drag/gui_scroll are measured from the top-left of this image.",
-            state.display_index,
+        let app_label = state
+            .app_name
+            .as_ref()
+            .map(|app| format!(" for app `{app}`"))
+            .unwrap_or_default();
+        let subject = if state.capture_mode == "window" {
             state
-                .app_name
+                .window_title
                 .as_ref()
-                .map(|app| format!(" for app `{app}`"))
-                .unwrap_or_default(),
-            state.origin_x.round(),
-            state.origin_y.round(),
+                .map(|title| format!("window `{title}`"))
+                .unwrap_or_else(|| "window".to_string())
+        } else {
+            format!("display {}", state.display_index)
+        };
+        let summary = format!(
+            "Captured macOS {subject}{app_label} at origin ({}, {}) with size {}x{}. Coordinates for gui_click/gui_drag/gui_scroll are measured from the top-left of this image.",
+            state.capture_x.round(),
+            state.capture_y.round(),
             state.width,
             state.height
         );
@@ -274,11 +341,15 @@ impl GuiHandler {
                 "message": summary,
                 "image_url": image_url,
                 "display_index": state.display_index,
-                "origin_x": state.origin_x,
-                "origin_y": state.origin_y,
+                "capture_mode": state.capture_mode,
+                "origin_x": state.capture_x,
+                "origin_y": state.capture_y,
                 "width": state.width,
                 "height": state.height,
                 "app": state.app_name,
+                "window_title": state.window_title,
+                "window_count": state.window_count,
+                "window_capture_strategy": state.window_capture_strategy,
             }),
             success: true,
         })
@@ -289,27 +360,56 @@ impl GuiHandler {
         invocation: ToolInvocation,
     ) -> Result<GuiToolOutput, FunctionCallError> {
         let args = parse_function_args::<ClickArgs>(&invocation.payload)?;
-        let (global_x, global_y, state) =
-            self.resolve_global_point(&invocation, args.app.as_deref(), args.x, args.y)?;
+        let window_selection = normalize_window_selection(
+            args.window_title.as_deref(),
+            args.window_selector.as_ref(),
+        )?;
+        let (global_x, global_y, state) = self.resolve_global_point(
+            &invocation,
+            args.app.as_deref(),
+            args.capture_mode.as_deref(),
+            window_selection.as_ref(),
+            args.x,
+            args.y,
+        )?;
         let button = args.button.as_deref().unwrap_or("left");
         let clicks = args.clicks.unwrap_or(1);
-        let event_mode = match (button, clicks) {
-            ("left", 1) => "click",
-            ("left", 2) => "double_click",
-            ("right", 1) => "right_click",
-            ("left", other) => {
+        let hold_ms = args.hold_ms.unwrap_or(DEFAULT_CLICK_AND_HOLD_MS).max(1);
+        let settle_ms = args.settle_ms.unwrap_or(DEFAULT_HOVER_SETTLE_MS).max(1);
+        let event_mode = match (button, clicks, args.hold_ms) {
+            ("none", 1, None) => "move_cursor",
+            ("left", 1, None) => "click",
+            ("left", 1, Some(_)) => "click_and_hold",
+            ("left", 2, None) => "double_click",
+            ("right", 1, None) => "right_click",
+            ("none", _, Some(_)) => {
+                return Err(FunctionCallError::RespondToModel(
+                    "gui_click cannot combine `button: none` with `hold_ms`".to_string(),
+                ));
+            }
+            ("none", other, None) => {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "gui_click with `button: none` only supports a single hover action, got `{other}`"
+                )));
+            }
+            ("left", 2, Some(_)) => {
+                return Err(FunctionCallError::RespondToModel(
+                    "gui_click cannot combine `clicks: 2` with `hold_ms`".to_string(),
+                ));
+            }
+            ("left", other, _) => {
                 return Err(FunctionCallError::RespondToModel(format!(
                     "gui_click only supports 1 or 2 left clicks, got `{other}`"
                 )));
             }
-            ("right", other) => {
+            ("right", other, _) => {
                 return Err(FunctionCallError::RespondToModel(format!(
                     "gui_click only supports a single right click, got `{other}`"
                 )));
             }
-            (other, _) => {
+            (other, _, _) => {
                 return Err(FunctionCallError::RespondToModel(format!(
-                    "gui_click.button only supports `left` or `right`, got `{other}`"
+                    "gui_click.button only supports `left`, `right`, or `none`, got `{other}`"
                 )));
             }
         };
@@ -318,15 +418,19 @@ impl GuiHandler {
             event_mode,
             args.app.as_deref(),
             &[("CODEX_GUI_X", global_x), ("CODEX_GUI_Y", global_y)],
-            &[],
+            &[
+                ("CODEX_GUI_HOLD_MS", hold_ms.to_string()),
+                ("CODEX_GUI_SETTLE_MS", settle_ms.to_string()),
+            ],
         )?;
 
         Ok(GuiToolOutput::from_text(format!(
-            "Clicked {} at image coordinate ({}, {}) on macOS display {} (global {}, {}).",
-            button,
+            "{} at image coordinate ({}, {}) on macOS {} {} (global {}, {}).",
+            describe_click_action(button, clicks, args.hold_ms.is_some()),
             args.x.round(),
             args.y.round(),
-            state.display_index,
+            state.capture_mode,
+            describe_capture_subject(&state),
             global_x.round(),
             global_y.round()
         )))
@@ -337,10 +441,26 @@ impl GuiHandler {
         invocation: ToolInvocation,
     ) -> Result<GuiToolOutput, FunctionCallError> {
         let args = parse_function_args::<DragArgs>(&invocation.payload)?;
-        let (from_global_x, from_global_y, state) =
-            self.resolve_global_point(&invocation, args.app.as_deref(), args.from_x, args.from_y)?;
-        let (to_global_x, to_global_y, _) =
-            self.resolve_global_point(&invocation, args.app.as_deref(), args.to_x, args.to_y)?;
+        let window_selection = normalize_window_selection(
+            args.window_title.as_deref(),
+            args.window_selector.as_ref(),
+        )?;
+        let (from_global_x, from_global_y, state) = self.resolve_global_point(
+            &invocation,
+            args.app.as_deref(),
+            args.capture_mode.as_deref(),
+            window_selection.as_ref(),
+            args.from_x,
+            args.from_y,
+        )?;
+        let (to_global_x, to_global_y, _) = self.resolve_global_point(
+            &invocation,
+            args.app.as_deref(),
+            args.capture_mode.as_deref(),
+            window_selection.as_ref(),
+            args.to_x,
+            args.to_y,
+        )?;
         let duration_ms = args.duration_ms.unwrap_or(DEFAULT_DRAG_DURATION_MS).max(1);
         let steps = args.steps.unwrap_or(DEFAULT_DRAG_STEPS).max(1);
 
@@ -360,12 +480,13 @@ impl GuiHandler {
         )?;
 
         Ok(GuiToolOutput::from_text(format!(
-            "Dragged from ({}, {}) to ({}, {}) on macOS display {}.",
+            "Dragged from ({}, {}) to ({}, {}) on macOS {} {}.",
             args.from_x.round(),
             args.from_y.round(),
             args.to_x.round(),
             args.to_y.round(),
-            state.display_index
+            state.capture_mode,
+            describe_capture_subject(&state)
         )))
     }
 
@@ -374,6 +495,10 @@ impl GuiHandler {
         invocation: ToolInvocation,
     ) -> Result<GuiToolOutput, FunctionCallError> {
         let args = parse_function_args::<ScrollArgs>(&invocation.payload)?;
+        let window_selection = normalize_window_selection(
+            args.window_title.as_deref(),
+            args.window_selector.as_ref(),
+        )?;
         let delta_x = args.delta_x.unwrap_or(0);
         let delta_y = args.delta_y.unwrap_or(0);
         if delta_x == 0 && delta_y == 0 {
@@ -383,11 +508,19 @@ impl GuiHandler {
         }
 
         let mut float_env = Vec::new();
+        let mut state_for_summary = None;
         if let (Some(x), Some(y)) = (args.x, args.y) {
-            let (global_x, global_y, _) =
-                self.resolve_global_point(&invocation, args.app.as_deref(), x, y)?;
+            let (global_x, global_y, state) = self.resolve_global_point(
+                &invocation,
+                args.app.as_deref(),
+                args.capture_mode.as_deref(),
+                window_selection.as_ref(),
+                x,
+                y,
+            )?;
             float_env.push(("CODEX_GUI_X", global_x));
             float_env.push(("CODEX_GUI_Y", global_y));
+            state_for_summary = Some(state);
         } else if args.x.is_some() || args.y.is_some() {
             return Err(FunctionCallError::RespondToModel(
                 "gui_scroll requires both `x` and `y` when specifying a scroll location"
@@ -414,8 +547,17 @@ impl GuiHandler {
         )?;
 
         Ok(GuiToolOutput::from_text(format!(
-            "Scrolled macOS GUI with delta_x={} delta_y={} ({unit}).",
-            delta_x, delta_y
+            "Scrolled macOS GUI with delta_x={} delta_y={} ({unit}){}.",
+            delta_x,
+            delta_y,
+            state_for_summary
+                .as_ref()
+                .map(|state| format!(
+                    " on {} {}",
+                    state.capture_mode,
+                    describe_capture_subject(state)
+                ))
+                .unwrap_or_default()
         )))
     }
 
@@ -424,44 +566,70 @@ impl GuiHandler {
         invocation: ToolInvocation,
     ) -> Result<GuiToolOutput, FunctionCallError> {
         let args = parse_function_args::<TypeArgs>(&invocation.payload)?;
+        let window_selection = normalize_window_selection(
+            args.window_title.as_deref(),
+            args.window_selector.as_ref(),
+        )?;
+        let text = resolve_type_text(&args)?;
         let strategy = args.strategy.as_deref().unwrap_or("unicode");
-        if !matches!(strategy, "unicode" | "clipboard_paste" | "physical_keys") {
+        prepare_targeted_gui_action(
+            args.app.as_deref(),
+            args.capture_mode.as_deref(),
+            window_selection.as_ref(),
+        )?;
+        if !matches!(
+            strategy,
+            "unicode"
+                | "clipboard_paste"
+                | "physical_keys"
+                | "system_events_paste"
+                | "system_events_keystroke"
+                | "system_events_keystroke_chars"
+        ) {
             return Err(FunctionCallError::RespondToModel(format!(
-                "gui_type.strategy only supports `unicode`, `clipboard_paste`, or `physical_keys`, got `{strategy}`"
+                "gui_type.strategy only supports `unicode`, `clipboard_paste`, `physical_keys`, `system_events_paste`, `system_events_keystroke`, or `system_events_keystroke_chars`, got `{strategy}`"
             )));
         }
 
-        run_gui_event(
-            "type_text",
-            args.app.as_deref(),
-            &[],
-            &[
-                ("CODEX_GUI_TEXT", args.text.clone()),
-                (
-                    "CODEX_GUI_REPLACE",
-                    if args.replace.unwrap_or(false) {
-                        "1"
-                    } else {
-                        "0"
-                    }
-                    .to_string(),
-                ),
-                (
-                    "CODEX_GUI_SUBMIT",
-                    if args.submit.unwrap_or(false) {
-                        "1"
-                    } else {
-                        "0"
-                    }
-                    .to_string(),
-                ),
-                ("CODEX_GUI_TYPE_STRATEGY", strategy.to_string()),
-            ],
-        )?;
+        if matches!(
+            strategy,
+            "system_events_paste" | "system_events_keystroke" | "system_events_keystroke_chars"
+        ) {
+            let replace = args.replace.unwrap_or(true);
+            let submit = args.submit.unwrap_or(false);
+            run_system_events_type(
+                args.app.as_deref(),
+                window_selection.as_ref(),
+                &text,
+                replace,
+                submit,
+                strategy,
+            )?;
+        } else {
+            let replace = args.replace.unwrap_or(true);
+            let submit = args.submit.unwrap_or(false);
+            run_gui_event(
+                "type_text",
+                args.app.as_deref(),
+                &[],
+                &[
+                    ("CODEX_GUI_TEXT", text.clone()),
+                    (
+                        "CODEX_GUI_REPLACE",
+                        if replace { "1" } else { "0" }.to_string(),
+                    ),
+                    (
+                        "CODEX_GUI_SUBMIT",
+                        if submit { "1" } else { "0" }.to_string(),
+                    ),
+                    ("CODEX_GUI_TYPE_STRATEGY", strategy.to_string()),
+                ],
+            )?;
+        }
 
         Ok(GuiToolOutput::from_text(format!(
             "Typed {} character(s) with strategy `{strategy}`.",
-            args.text.chars().count()
+            text.chars().count()
         )))
     }
 
@@ -470,10 +638,19 @@ impl GuiHandler {
         invocation: ToolInvocation,
     ) -> Result<GuiToolOutput, FunctionCallError> {
         let args = parse_function_args::<KeyArgs>(&invocation.payload)?;
+        let window_selection = normalize_window_selection(
+            args.window_title.as_deref(),
+            args.window_selector.as_ref(),
+        )?;
         let repeat = args.repeat.unwrap_or(1).max(1);
         let mut modifiers = args.modifiers.unwrap_or_default();
         let key_code = resolve_key_code(&args.key, &mut modifiers)?;
         let modifiers_env = modifiers.join(",");
+        prepare_targeted_gui_action(
+            args.app.as_deref(),
+            args.capture_mode.as_deref(),
+            window_selection.as_ref(),
+        )?;
 
         run_gui_event(
             "key_press",
@@ -498,15 +675,36 @@ impl GuiHandler {
         )))
     }
 
+    async fn handle_move(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<GuiToolOutput, FunctionCallError> {
+        let args = parse_function_args::<MoveArgs>(&invocation.payload)?;
+        run_gui_event(
+            "move_cursor",
+            args.app.as_deref(),
+            &[("CODEX_GUI_X", args.x), ("CODEX_GUI_Y", args.y)],
+            &[("CODEX_GUI_SETTLE_MS", DEFAULT_HOVER_SETTLE_MS.to_string())],
+        )?;
+
+        Ok(GuiToolOutput::from_text(format!(
+            "Moved the macOS pointer to absolute display coordinate ({}, {}).",
+            args.x.round(),
+            args.y.round()
+        )))
+    }
+
     fn resolve_global_point(
         &self,
         invocation: &ToolInvocation,
         app: Option<&str>,
+        capture_mode: Option<&str>,
+        window_selection: Option<&WindowSelector>,
         local_x: f64,
         local_y: f64,
     ) -> Result<(f64, f64, ObserveState), FunctionCallError> {
         let session_id = invocation.session.conversation_id.to_string();
-        let state = if app.is_none() {
+        let state = if app.is_none() && capture_mode.is_none() && window_selection.is_none() {
             self.observe_state
                 .lock()
                 .expect("gui observe state poisoned")
@@ -519,21 +717,25 @@ impl GuiHandler {
         let state = match state {
             Some(state) => state,
             None => {
-                let context = capture_context(app, false)?;
-                let width = rounded_dimension(context.display.bounds.width, "display width")?;
-                let height = rounded_dimension(context.display.bounds.height, "display height")?;
+                let context = capture_context(app, false, window_selection)?;
+                let capture =
+                    resolve_capture_target(&context, capture_mode, window_selection.is_some())?;
                 ObserveState {
-                    origin_x: context.display.bounds.x,
-                    origin_y: context.display.bounds.y,
-                    width,
-                    height,
+                    capture_x: capture.bounds.x,
+                    capture_y: capture.bounds.y,
+                    width: capture.width,
+                    height: capture.height,
                     app_name: context.app_name,
                     display_index: context.display.index,
+                    capture_mode: capture.mode,
+                    window_title: capture.window_title,
+                    window_count: capture.window_count,
+                    window_capture_strategy: capture.window_capture_strategy,
                 }
             }
         };
 
-        Ok((state.origin_x + local_x, state.origin_y + local_y, state))
+        Ok((state.capture_x + local_x, state.capture_y + local_y, state))
     }
 }
 
@@ -559,9 +761,134 @@ fn rounded_dimension(value: f64, label: &str) -> Result<u32, FunctionCallError> 
     Ok(rounded as u32)
 }
 
+#[derive(Clone, Debug)]
+struct CaptureTarget {
+    mode: &'static str,
+    bounds: HelperRect,
+    width: u32,
+    height: u32,
+    window_title: Option<String>,
+    window_count: Option<i64>,
+    window_capture_strategy: Option<String>,
+}
+
+fn normalize_optional_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn normalize_window_selection(
+    window_title: Option<&str>,
+    selector: Option<&WindowSelector>,
+) -> Result<Option<WindowSelector>, FunctionCallError> {
+    let title = normalize_optional_string(window_title).or_else(|| {
+        selector
+            .and_then(|selector| selector.title.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+    });
+    let title_contains = selector
+        .and_then(|selector| selector.title_contains.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let index = selector.and_then(|selector| selector.index);
+    if let Some(index) = index
+        && index <= 0
+    {
+        return Err(FunctionCallError::RespondToModel(
+            "gui window_selector.index must be a positive integer".to_string(),
+        ));
+    }
+    if title.is_none() && title_contains.is_none() && index.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(WindowSelector {
+        title,
+        title_contains,
+        index,
+    }))
+}
+
+fn normalize_capture_mode(
+    capture_mode: Option<&str>,
+) -> Result<Option<&'static str>, FunctionCallError> {
+    match capture_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        None => Ok(None),
+        Some("display") => Ok(Some("display")),
+        Some("window") => Ok(Some("window")),
+        Some(other) => Err(FunctionCallError::RespondToModel(format!(
+            "gui capture_mode only supports `display` or `window`, got `{other}`"
+        ))),
+    }
+}
+
+fn resolve_capture_target(
+    context: &HelperCaptureContext,
+    capture_mode: Option<&str>,
+    window_selection_requested: bool,
+) -> Result<CaptureTarget, FunctionCallError> {
+    let requested_mode = normalize_capture_mode(capture_mode)?;
+    if window_selection_requested && context.window_bounds.is_none() {
+        return Err(FunctionCallError::RespondToModel(
+            "requested macOS window could not be found; check `window_title`/`window_selector` or switch to `capture_mode: \"display\"`"
+                .to_string(),
+        ));
+    }
+
+    let use_window = match requested_mode {
+        Some("window") => context.window_bounds.is_some(),
+        Some("display") => false,
+        None => window_selection_requested,
+        Some(_) => false,
+    };
+
+    let (mode, bounds) = if use_window {
+        let Some(bounds) = context.window_bounds.clone() else {
+            return Err(FunctionCallError::RespondToModel(
+                "window capture requested but no matching window bounds were available".to_string(),
+            ));
+        };
+        ("window", bounds)
+    } else {
+        ("display", context.display.bounds.clone())
+    };
+    let width = rounded_dimension(bounds.width, "capture width")?;
+    let height = rounded_dimension(bounds.height, "capture height")?;
+
+    Ok(CaptureTarget {
+        mode,
+        bounds,
+        width,
+        height,
+        window_title: if mode == "window" {
+            context.window_title.clone()
+        } else {
+            None
+        },
+        window_count: if mode == "window" {
+            context.window_count
+        } else {
+            None
+        },
+        window_capture_strategy: if mode == "window" {
+            context.window_capture_strategy.clone()
+        } else {
+            None
+        },
+    })
+}
+
 fn capture_context(
     app: Option<&str>,
     activate_app: bool,
+    window_selection: Option<&WindowSelector>,
 ) -> Result<HelperCaptureContext, FunctionCallError> {
     let mut env = vec![(
         "CODEX_GUI_ACTIVATE_APP",
@@ -573,6 +900,17 @@ fn capture_context(
     )];
     if let Some(app) = app.filter(|app| !app.trim().is_empty()) {
         env.push(("CODEX_GUI_APP", app.to_string()));
+    }
+    if let Some(window_selection) = window_selection {
+        if let Some(title) = &window_selection.title {
+            env.push(("CODEX_GUI_WINDOW_TITLE", title.clone()));
+        }
+        if let Some(title_contains) = &window_selection.title_contains {
+            env.push(("CODEX_GUI_WINDOW_TITLE_CONTAINS", title_contains.clone()));
+        }
+        if let Some(index) = window_selection.index {
+            env.push(("CODEX_GUI_WINDOW_INDEX", index.to_string()));
+        }
     }
 
     let output = run_helper("capture-context", &env)?;
@@ -602,7 +940,45 @@ fn run_gui_event(
     run_helper("event", &env).map(|_| ())
 }
 
-fn capture_display_region(
+fn prepare_targeted_gui_action(
+    app: Option<&str>,
+    capture_mode: Option<&str>,
+    window_selection: Option<&WindowSelector>,
+) -> Result<(), FunctionCallError> {
+    if app.is_none() && capture_mode.is_none() && window_selection.is_none() {
+        return Ok(());
+    }
+
+    let context = capture_context(app, true, window_selection)?;
+    if capture_mode.is_some() || window_selection.is_some() {
+        let _ = resolve_capture_target(&context, capture_mode, window_selection.is_some())?;
+    }
+    Ok(())
+}
+
+fn describe_capture_subject(state: &ObserveState) -> String {
+    if state.capture_mode == "window" {
+        state
+            .window_title
+            .clone()
+            .unwrap_or_else(|| "current window".to_string())
+    } else {
+        format!("display {}", state.display_index)
+    }
+}
+
+fn describe_click_action(button: &str, clicks: i64, hold: bool) -> String {
+    match (button, clicks, hold) {
+        ("none", _, _) => "Hovered pointer".to_string(),
+        ("left", 1, true) => "Click-and-held".to_string(),
+        ("left", 2, _) => "Double-clicked".to_string(),
+        ("right", 1, _) => "Right-clicked".to_string(),
+        ("left", _, _) => "Clicked".to_string(),
+        (other, _, _) => format!("Interacted with button `{other}`"),
+    }
+}
+
+fn capture_region(
     bounds: &HelperRect,
     target_width: u32,
     target_height: u32,
@@ -693,6 +1069,131 @@ fn run_helper(command: &str, env: &[(&str, String)]) -> Result<String, FunctionC
         )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn resolve_type_text(args: &TypeArgs) -> Result<String, FunctionCallError> {
+    let literal_text = args.text.clone();
+    let secret_env_var = normalize_optional_string(args.secret_env_var.as_deref());
+    let secret_command_env_var = normalize_optional_string(args.secret_command_env_var.as_deref());
+    let configured_source_count = [
+        literal_text.is_some(),
+        secret_env_var.is_some(),
+        secret_command_env_var.is_some(),
+    ]
+    .into_iter()
+    .filter(|configured| *configured)
+    .count();
+    if configured_source_count != 1 {
+        return Err(FunctionCallError::RespondToModel(
+            "gui_type requires exactly one of `text`, `secret_env_var`, or `secret_command_env_var`"
+                .to_string(),
+        ));
+    }
+    if let Some(text) = literal_text {
+        return Ok(text);
+    }
+    if let Some(secret_env_var) = secret_env_var {
+        return std::env::var(&secret_env_var).map_err(|_| {
+            FunctionCallError::RespondToModel(format!(
+                "gui_type secret env var `{secret_env_var}` is missing or empty"
+            ))
+        });
+    }
+    let Some(secret_command_env_var) = secret_command_env_var else {
+        return Err(FunctionCallError::RespondToModel(
+            "gui_type input source could not be resolved".to_string(),
+        ));
+    };
+    let command = std::env::var(&secret_command_env_var).map_err(|_| {
+        FunctionCallError::RespondToModel(format!(
+            "gui_type secret command env var `{secret_command_env_var}` is missing or empty"
+        ))
+    })?;
+    let output = Command::new("zsh")
+        .args(["-lc", &command])
+        .output()
+        .map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "failed to resolve gui_type secret command `{secret_command_env_var}`: {error}"
+            ))
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(FunctionCallError::RespondToModel(format!(
+            "gui_type secret command `{secret_command_env_var}` failed: {}",
+            stderr.trim()
+        )));
+    }
+    let text = String::from_utf8_lossy(&output.stdout)
+        .trim_end_matches(&['\r', '\n'][..])
+        .to_string();
+    if text.is_empty() {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "gui_type secret command `{secret_command_env_var}` produced empty output"
+        )));
+    }
+    Ok(text)
+}
+
+fn run_apple_script(script: &str, env: &[(&str, String)]) -> Result<String, FunctionCallError> {
+    let mut command = Command::new("osascript");
+    command.args(["-l", "AppleScript", "-e", script]);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let output = command.output().map_err(|error| {
+        FunctionCallError::RespondToModel(format!(
+            "failed to execute `osascript` for GUI typing: {error}"
+        ))
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(FunctionCallError::RespondToModel(format!(
+            "macOS System Events typing failed: {}",
+            stderr.trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn run_system_events_type(
+    app: Option<&str>,
+    window_selection: Option<&WindowSelector>,
+    text: &str,
+    replace: bool,
+    submit: bool,
+    strategy: &str,
+) -> Result<(), FunctionCallError> {
+    let mut env = Vec::new();
+    if let Some(app) = app.filter(|app| !app.trim().is_empty()) {
+        env.push(("CODEX_GUI_APP", app.to_string()));
+    }
+    if let Some(window_selection) = window_selection {
+        if let Some(title) = &window_selection.title {
+            env.push(("CODEX_GUI_WINDOW_TITLE", title.clone()));
+        }
+        if let Some(title_contains) = &window_selection.title_contains {
+            env.push(("CODEX_GUI_WINDOW_TITLE_CONTAINS", title_contains.clone()));
+        }
+        if let Some(index) = window_selection.index {
+            env.push(("CODEX_GUI_WINDOW_INDEX", index.to_string()));
+        }
+    }
+    env.push(("CODEX_GUI_TEXT", text.to_string()));
+    env.push((
+        "CODEX_GUI_REPLACE",
+        if replace { "1" } else { "0" }.to_string(),
+    ));
+    env.push((
+        "CODEX_GUI_SUBMIT",
+        if submit { "1" } else { "0" }.to_string(),
+    ));
+    env.push((
+        "CODEX_GUI_SYSTEM_EVENTS_TYPE_STRATEGY",
+        strategy.to_string(),
+    ));
+
+    run_apple_script(TYPE_SYSTEM_EVENTS_SCRIPT, &env).map(|_| ())
 }
 
 fn resolve_helper_binary() -> Result<PathBuf, FunctionCallError> {
@@ -868,6 +1369,117 @@ fn resolve_key_code(key: &str, modifiers: &mut Vec<String>) -> Result<i64, Funct
     Ok(code)
 }
 
+static TYPE_SYSTEM_EVENTS_SCRIPT: &str = r##"
+on textContains(haystack, needle)
+	if needle is "" then return true
+	ignoring case
+		return (offset of needle in haystack) is not 0
+	end ignoring
+end textContains
+
+on matchingWindows(targetProc, exactTitle, titleContains)
+	set matches to {}
+	repeat with candidateWindow in windows of targetProc
+		set windowTitle to ""
+		try
+			set windowTitle to name of candidateWindow as text
+		end try
+		set exactMatch to true
+		if exactTitle is not "" then
+			ignoring case
+				set exactMatch to windowTitle is exactTitle
+			end ignoring
+		end if
+		set containsMatch to my textContains(windowTitle, titleContains)
+		if exactMatch and containsMatch then set end of matches to candidateWindow
+	end repeat
+	return matches
+end matchingWindows
+
+on focusRequestedWindow(targetProc, exactTitle, titleContains, windowIndexText)
+	if exactTitle is "" and titleContains is "" and windowIndexText is "" then return
+	set matches to my matchingWindows(targetProc, exactTitle, titleContains)
+	if (count of matches) is 0 then error "Window not found for the requested selection."
+	set targetWindow to item 1 of matches
+	if windowIndexText is not "" then
+		set requestedIndex to windowIndexText as integer
+		if requestedIndex < 1 or requestedIndex > (count of matches) then error "Requested window index is out of range."
+		set targetWindow to item requestedIndex of matches
+	end if
+	try
+		tell targetWindow to perform action "AXRaise"
+	end try
+	try
+		tell targetWindow to set value of attribute "AXMain" to true
+	end try
+	try
+		tell targetWindow to set value of attribute "AXFocused" to true
+	end try
+	delay 0.1
+end focusRequestedWindow
+
+on run argv
+	set requestedApp to system attribute "CODEX_GUI_APP"
+	set requestedWindowTitle to system attribute "CODEX_GUI_WINDOW_TITLE"
+	set requestedWindowTitleContains to system attribute "CODEX_GUI_WINDOW_TITLE_CONTAINS"
+	set requestedWindowIndex to system attribute "CODEX_GUI_WINDOW_INDEX"
+	set replaceText to system attribute "CODEX_GUI_REPLACE"
+	set submitText to system attribute "CODEX_GUI_SUBMIT"
+	set inputText to system attribute "CODEX_GUI_TEXT"
+	set typeStrategy to system attribute "CODEX_GUI_SYSTEM_EVENTS_TYPE_STRATEGY"
+
+	tell application "System Events"
+		if requestedApp is not "" then
+			if not (exists application process requestedApp) then error "Application process not found: " & requestedApp
+			set targetProc to application process requestedApp
+			set frontmost of targetProc to true
+			delay 0.1
+		else
+			set targetProc to first application process whose frontmost is true
+		end if
+		my focusRequestedWindow(targetProc, requestedWindowTitle, requestedWindowTitleContains, requestedWindowIndex)
+
+		if replaceText is "1" then
+			keystroke "a" using command down
+			delay 0.05
+		end if
+
+		if typeStrategy is "system_events_keystroke" then
+			keystroke inputText
+		else if typeStrategy is "system_events_keystroke_chars" then
+			repeat with currentCharacter in characters of inputText
+				set typedCharacter to contents of currentCharacter
+				if typedCharacter is return or typedCharacter is linefeed then
+					key code 36
+				else
+					keystroke typedCharacter
+				end if
+				delay 0.055
+			end repeat
+		else
+			set previousClipboard to missing value
+			set hadClipboard to false
+			try
+				set previousClipboard to the clipboard
+				set hadClipboard to true
+			end try
+			set the clipboard to inputText
+			delay 0.15
+			keystroke "v" using command down
+			delay 0.25
+			if hadClipboard then
+				try
+					set the clipboard to previousClipboard
+				end try
+			end if
+		end if
+
+		if submitText is "1" then key code 36
+		return "typed"
+	end tell
+end run
+"##;
+
 static HELPER_SOURCE: &str = r##"
 import Foundation
 import AppKit
@@ -922,6 +1534,25 @@ struct CaptureContext: Codable {
     let appName: String?
     let display: DisplayDescriptor
     let cursor: Point
+    let windowId: Int?
+    let windowTitle: String?
+    let windowBounds: Rect?
+    let windowCount: Int?
+    let windowCaptureStrategy: String?
+}
+
+struct WindowMatch {
+    let id: Int
+    let title: String?
+    let bounds: CGRect
+    let layer: Int
+}
+
+struct WindowSelection {
+    let primary: WindowMatch
+    let captureBounds: CGRect
+    let windowCount: Int
+    let captureStrategy: String
 }
 
 func env(_ key: String) -> String {
@@ -931,6 +1562,12 @@ func env(_ key: String) -> String {
 func trimmedEnv(_ key: String) -> String? {
     let value = env(key).trimmingCharacters(in: .whitespacesAndNewlines)
     return value.isEmpty ? nil : value
+}
+
+func normalizedText(_ value: String?) -> String? {
+    guard let value else { return nil }
+    let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    return normalized.isEmpty ? nil : normalized
 }
 
 func requiredDouble(_ key: String) throws -> Double {
@@ -1037,8 +1674,150 @@ func displayForPoint(_ point: CGPoint, displays: [(index: Int, bounds: CGRect)])
     return displays.first ?? (index: 1, bounds: CGDisplayBounds(CGMainDisplayID()))
 }
 
+func matchingWindows(
+    ownerName: String?,
+    exactTitle: String?,
+    titleContains: String?
+) -> [WindowMatch] {
+    guard let windowInfo = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
+        return []
+    }
+    let normalizedExactTitle = normalizedText(exactTitle)
+    let normalizedContainsTitle = normalizedText(titleContains)
+    var matches: [WindowMatch] = []
+    for info in windowInfo {
+        let alpha = info[kCGWindowAlpha as String] as? Double ?? 1
+        let layer = info[kCGWindowLayer as String] as? Int ?? 0
+        let owner = info[kCGWindowOwnerName as String] as? String ?? ""
+        if alpha <= 0.01 {
+            continue
+        }
+        if let ownerName, owner != ownerName {
+            continue
+        }
+        guard let rawBounds = info[kCGWindowBounds as String] else {
+            continue
+        }
+        let boundsDict = rawBounds as! CFDictionary
+        guard
+            let bounds = CGRect(dictionaryRepresentation: boundsDict),
+            bounds.width >= 80,
+            bounds.height >= 80
+        else {
+            continue
+        }
+        let windowId = (info[kCGWindowNumber as String] as? NSNumber)?.intValue
+        let title = info[kCGWindowName as String] as? String
+        let normalizedTitle = normalizedText(title) ?? ""
+        if let normalizedExactTitle, normalizedTitle != normalizedExactTitle {
+            continue
+        }
+        if let normalizedContainsTitle, !normalizedTitle.contains(normalizedContainsTitle) {
+            continue
+        }
+        matches.append(WindowMatch(
+            id: windowId ?? 0,
+            title: title,
+            bounds: bounds.integral,
+            layer: layer
+        ))
+    }
+    return matches
+}
+
+func rankWindows(_ matches: [WindowMatch]) -> [WindowMatch] {
+    return matches.sorted { lhs, rhs in
+        let lhsPrimaryLayer = lhs.layer == 0 ? 0 : 1
+        let rhsPrimaryLayer = rhs.layer == 0 ? 0 : 1
+        if lhsPrimaryLayer != rhsPrimaryLayer {
+            return lhsPrimaryLayer < rhsPrimaryLayer
+        }
+        if lhs.layer != rhs.layer {
+            return lhs.layer < rhs.layer
+        }
+        let lhsArea = lhs.bounds.width * lhs.bounds.height
+        let rhsArea = rhs.bounds.width * rhs.bounds.height
+        if lhsArea != rhsArea {
+            return lhsArea > rhsArea
+        }
+        let lhsHasTitle = normalizedText(lhs.title) != nil
+        let rhsHasTitle = normalizedText(rhs.title) != nil
+        if lhsHasTitle != rhsHasTitle {
+            return lhsHasTitle && !rhsHasTitle
+        }
+        return lhs.id < rhs.id
+    }
+}
+
+func unionBounds(for matches: [WindowMatch]) -> CGRect? {
+    guard let first = matches.first else {
+        return nil
+    }
+    return matches.dropFirst().reduce(first.bounds) { partial, match in
+        partial.union(match.bounds)
+    }.integral
+}
+
+func selectedWindow(
+    ownerName: String?,
+    exactTitle: String?,
+    titleContains: String?,
+    index: Int?
+) -> WindowSelection? {
+    let matches = matchingWindows(
+        ownerName: ownerName,
+        exactTitle: exactTitle,
+        titleContains: titleContains
+    )
+    guard !matches.isEmpty else {
+        return nil
+    }
+    let hasExplicitSelection = normalizedText(exactTitle) != nil || normalizedText(titleContains) != nil || index != nil
+    let ranked = rankWindows(matches)
+    if let index, index > 0, index <= ranked.count {
+        let window = ranked[index - 1]
+        return WindowSelection(
+            primary: window,
+            captureBounds: window.bounds.integral,
+            windowCount: 1,
+            captureStrategy: "selected_window"
+        )
+    }
+    guard let primary = ranked.first else {
+        return nil
+    }
+    if hasExplicitSelection {
+        return WindowSelection(
+            primary: primary,
+            captureBounds: primary.bounds.integral,
+            windowCount: 1,
+            captureStrategy: "selected_window"
+        )
+    }
+    if matches.count == 1 {
+        return WindowSelection(
+            primary: primary,
+            captureBounds: primary.bounds.integral,
+            windowCount: 1,
+            captureStrategy: "main_window"
+        )
+    }
+    guard let combinedBounds = unionBounds(for: matches) else {
+        return nil
+    }
+    return WindowSelection(
+        primary: primary,
+        captureBounds: combinedBounds,
+        windowCount: matches.count,
+        captureStrategy: "app_union"
+    )
+}
+
 func handleCaptureContext() throws {
     let requestedApp = trimmedEnv("CODEX_GUI_APP")
+    let requestedWindowTitle = trimmedEnv("CODEX_GUI_WINDOW_TITLE")
+    let requestedWindowTitleContains = trimmedEnv("CODEX_GUI_WINDOW_TITLE_CONTAINS")
+    let requestedWindowIndex = optionalInt("CODEX_GUI_WINDOW_INDEX")
     if shouldActivateApp() {
         try activateApplication(named: requestedApp)
     }
@@ -1046,12 +1825,23 @@ func handleCaptureContext() throws {
     let targetApp = resolvedApp?.localizedName ?? requestedApp ?? NSWorkspace.shared.frontmostApplication?.localizedName
     let cursorLocation = CGEvent(source: nil)?.location ?? .zero
     let displays = activeDisplays()
-    let anchorPoint = resolvedApp?.isActive == true ? cursorLocation : cursorLocation
+    let window = selectedWindow(
+        ownerName: targetApp,
+        exactTitle: requestedWindowTitle,
+        titleContains: requestedWindowTitleContains,
+        index: requestedWindowIndex
+    )
+    let anchorPoint = window.map { CGPoint(x: $0.primary.bounds.midX, y: $0.primary.bounds.midY) } ?? cursorLocation
     let display = displayForPoint(anchorPoint, displays: displays)
     let payload = CaptureContext(
         appName: targetApp,
         display: DisplayDescriptor(index: display.index, bounds: rect(display.bounds)),
-        cursor: point(cursorLocation)
+        cursor: point(cursorLocation),
+        windowId: window?.primary.id,
+        windowTitle: window?.primary.title,
+        windowBounds: window.map { rect($0.captureBounds) },
+        windowCount: window?.windowCount,
+        windowCaptureStrategy: window?.captureStrategy
     )
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.sortedKeys]
@@ -1287,6 +2077,12 @@ func handleEvent() throws {
     }
 
     switch env("CODEX_GUI_EVENT_MODE") {
+    case "move_cursor":
+        let point = CGPoint(x: try requiredDouble("CODEX_GUI_X"), y: try requiredDouble("CODEX_GUI_Y"))
+        let settleMs = max(1, optionalInt("CODEX_GUI_SETTLE_MS") ?? 200)
+        try moveCursor(to: point)
+        usleep(useconds_t(settleMs * 1_000))
+        print("cg_move_cursor")
     case "click":
         let point = CGPoint(x: try requiredDouble("CODEX_GUI_X"), y: try requiredDouble("CODEX_GUI_Y"))
         try moveCursor(to: point)
@@ -1294,6 +2090,14 @@ func handleEvent() throws {
         usleep(30_000)
         try leftUp(at: point)
         print("cg_click")
+    case "click_and_hold":
+        let point = CGPoint(x: try requiredDouble("CODEX_GUI_X"), y: try requiredDouble("CODEX_GUI_Y"))
+        let holdMs = max(1, optionalInt("CODEX_GUI_HOLD_MS") ?? 650)
+        try moveCursor(to: point)
+        try leftDown(at: point)
+        usleep(useconds_t(holdMs * 1_000))
+        try leftUp(at: point)
+        print("cg_click_and_hold")
     case "right_click":
         let point = CGPoint(x: try requiredDouble("CODEX_GUI_X"), y: try requiredDouble("CODEX_GUI_Y"))
         try moveCursor(to: point)
@@ -1386,3 +2190,106 @@ do {
     exit(1)
 }
 "##;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_window_selection_merges_top_level_and_selector_fields() {
+        let selector = WindowSelector {
+            title: None,
+            title_contains: Some(" Settings ".to_string()),
+            index: Some(2),
+        };
+
+        let selection = normalize_window_selection(Some(" Preferences "), Some(&selector))
+            .expect("window selection should normalize")
+            .expect("window selection should exist");
+
+        assert_eq!(selection.title.as_deref(), Some("Preferences"));
+        assert_eq!(selection.title_contains.as_deref(), Some("Settings"));
+        assert_eq!(selection.index, Some(2));
+    }
+
+    #[test]
+    fn resolve_capture_target_uses_window_bounds_when_requested() {
+        let context = HelperCaptureContext {
+            app_name: Some("Notes".to_string()),
+            cursor: HelperPoint { x: 10.0, y: 20.0 },
+            display: HelperDisplayDescriptor {
+                index: 1,
+                bounds: HelperRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1440.0,
+                    height: 900.0,
+                },
+            },
+            window_id: Some(42),
+            window_title: Some("Quick Note".to_string()),
+            window_bounds: Some(HelperRect {
+                x: 100.0,
+                y: 80.0,
+                width: 800.0,
+                height: 600.0,
+            }),
+            window_count: Some(3),
+            window_capture_strategy: Some("bounds".to_string()),
+        };
+
+        let capture =
+            resolve_capture_target(&context, Some("window"), true).expect("window capture");
+
+        assert_eq!(capture.mode, "window");
+        assert_eq!(capture.width, 800);
+        assert_eq!(capture.height, 600);
+        assert_eq!(capture.window_title.as_deref(), Some("Quick Note"));
+        assert_eq!(capture.window_count, Some(3));
+        assert_eq!(capture.window_capture_strategy.as_deref(), Some("bounds"));
+    }
+
+    #[test]
+    fn prepare_targeted_gui_action_is_noop_without_targeting() {
+        prepare_targeted_gui_action(None, None, None).expect("no-op targeted action");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "manual macOS GUI smoke test requiring Screen Recording and Accessibility permissions"]
+    fn macos_gui_capture_smoke_test() {
+        let helper_path = resolve_helper_binary().expect("native GUI helper should compile");
+        assert!(helper_path.exists(), "helper binary should exist");
+
+        let context =
+            capture_context(None, false, None).expect("capture context should be available");
+        let capture =
+            resolve_capture_target(&context, Some("display"), false).expect("display capture");
+        let image_bytes =
+            capture_region(&capture.bounds, capture.width, capture.height).expect("screenshot");
+
+        assert!(
+            !image_bytes.is_empty(),
+            "captured image should not be empty"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "manual macOS GUI smoke test requiring Accessibility permissions"]
+    fn macos_gui_move_cursor_smoke_test() {
+        let context =
+            capture_context(None, false, None).expect("capture context should be available");
+
+        run_gui_event(
+            "move_cursor",
+            None,
+            &[
+                ("CODEX_GUI_X", context.cursor.x),
+                ("CODEX_GUI_Y", context.cursor.y),
+            ],
+            &[("CODEX_GUI_SETTLE_MS", "1".to_string())],
+        )
+        .expect("move cursor event should succeed");
+    }
+}

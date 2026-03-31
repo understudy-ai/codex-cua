@@ -42,6 +42,7 @@ pub use dynamic_tool::parse_dynamic_tool;
 pub use gui_tool::create_gui_click_tool;
 pub use gui_tool::create_gui_drag_tool;
 pub use gui_tool::create_gui_key_tool;
+pub use gui_tool::create_gui_move_tool;
 pub use gui_tool::create_gui_observe_tool;
 pub use gui_tool::create_gui_scroll_tool;
 pub use gui_tool::create_gui_type_tool;

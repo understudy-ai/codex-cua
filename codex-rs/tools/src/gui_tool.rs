@@ -7,8 +7,66 @@ fn string_enum_description(values: &[&str], extra: &str) -> String {
     format!("Supported values: {}. {extra}", values.join(", "))
 }
 
+fn window_selector_schema() -> JsonSchema {
+    JsonSchema::Object {
+        properties: BTreeMap::from([
+            (
+                "title".to_string(),
+                JsonSchema::String {
+                    description: Some("Optional exact visible window title.".to_string()),
+                },
+            ),
+            (
+                "title_contains".to_string(),
+                JsonSchema::String {
+                    description: Some(
+                        "Optional visible substring of the target window title.".to_string(),
+                    ),
+                },
+            ),
+            (
+                "index".to_string(),
+                JsonSchema::Number {
+                    description: Some(
+                        "Optional 1-based index among matching visible windows.".to_string(),
+                    ),
+                },
+            ),
+        ]),
+        required: None,
+        additional_properties: Some(false.into()),
+    }
+}
+
+fn with_capture_selection_properties(
+    mut properties: BTreeMap<String, JsonSchema>,
+    include_window_title: bool,
+) -> BTreeMap<String, JsonSchema> {
+    properties.insert(
+        "capture_mode".to_string(),
+        JsonSchema::String {
+            description: Some(string_enum_description(
+                &["display", "window"],
+                "Use `window` to capture the active app window when available. Defaults to `display`.",
+            )),
+        },
+    );
+    if include_window_title {
+        properties.insert(
+            "window_title".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Optional exact visible window title to capture or focus.".to_string(),
+                ),
+            },
+        );
+    }
+    properties.insert("window_selector".to_string(), window_selector_schema());
+    properties
+}
+
 pub fn create_gui_observe_tool() -> ToolSpec {
-    let properties = BTreeMap::from([
+    let properties = with_capture_selection_properties(BTreeMap::from([
         (
             "app".to_string(),
             JsonSchema::String {
@@ -27,11 +85,11 @@ pub fn create_gui_observe_tool() -> ToolSpec {
                 ),
             },
         ),
-    ]);
+    ]), true);
 
     ToolSpec::Function(ResponsesApiTool {
         name: "gui_observe".to_string(),
-        description: "Capture a screenshot of the current macOS GUI. Use this before GUI actions to inspect state and obtain the coordinate space for other gui_* tools."
+        description: "Capture a screenshot of the current macOS GUI. Use this before GUI actions to inspect state and obtain the coordinate space for other gui_* tools. Supports display-wide capture and focused-window capture."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -45,7 +103,7 @@ pub fn create_gui_observe_tool() -> ToolSpec {
 }
 
 pub fn create_gui_click_tool() -> ToolSpec {
-    let properties = BTreeMap::from([
+    let properties = with_capture_selection_properties(BTreeMap::from([
         (
             "x".to_string(),
             JsonSchema::Number {
@@ -68,8 +126,8 @@ pub fn create_gui_click_tool() -> ToolSpec {
             "button".to_string(),
             JsonSchema::String {
                 description: Some(string_enum_description(
-                    &["left", "right"],
-                    "Defaults to `left`.",
+                    &["left", "right", "none"],
+                    "Use `none` for hover-only pointer movement. Defaults to `left`.",
                 )),
             },
         ),
@@ -83,6 +141,24 @@ pub fn create_gui_click_tool() -> ToolSpec {
             },
         ),
         (
+            "hold_ms".to_string(),
+            JsonSchema::Number {
+                description: Some(
+                    "Optional press-and-hold duration in milliseconds before releasing. Use this for long-press interactions."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "settle_ms".to_string(),
+            JsonSchema::Number {
+                description: Some(
+                    "Optional hover settle time in milliseconds when `button` is `none`. Defaults to 200."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
             "app".to_string(),
             JsonSchema::String {
                 description: Some(
@@ -91,12 +167,12 @@ pub fn create_gui_click_tool() -> ToolSpec {
                 ),
             },
         ),
-    ]);
+    ]), true);
 
     ToolSpec::Function(ResponsesApiTool {
         name: "gui_click".to_string(),
         description:
-            "Click at a coordinate in the current macOS GUI. Coordinates are interpreted in the coordinate space returned by gui_observe."
+            "Click, right-click, double-click, hover, or click-and-hold at a coordinate in the current macOS GUI. Coordinates are interpreted in the coordinate space returned by gui_observe."
                 .to_string(),
         strict: false,
         defer_loading: None,
@@ -110,7 +186,7 @@ pub fn create_gui_click_tool() -> ToolSpec {
 }
 
 pub fn create_gui_drag_tool() -> ToolSpec {
-    let properties = BTreeMap::from([
+    let properties = with_capture_selection_properties(BTreeMap::from([
         (
             "from_x".to_string(),
             JsonSchema::Number {
@@ -174,7 +250,7 @@ pub fn create_gui_drag_tool() -> ToolSpec {
                 ),
             },
         ),
-    ]);
+    ]), true);
 
     ToolSpec::Function(ResponsesApiTool {
         name: "gui_drag".to_string(),
@@ -198,7 +274,7 @@ pub fn create_gui_drag_tool() -> ToolSpec {
 }
 
 pub fn create_gui_scroll_tool() -> ToolSpec {
-    let properties = BTreeMap::from([
+    let properties = with_capture_selection_properties(BTreeMap::from([
         (
             "delta_y".to_string(),
             JsonSchema::Number {
@@ -253,7 +329,7 @@ pub fn create_gui_scroll_tool() -> ToolSpec {
                 ),
             },
         ),
-    ]);
+    ]), true);
 
     ToolSpec::Function(ResponsesApiTool {
         name: "gui_scroll".to_string(),
@@ -271,7 +347,7 @@ pub fn create_gui_scroll_tool() -> ToolSpec {
 }
 
 pub fn create_gui_type_tool() -> ToolSpec {
-    let properties = BTreeMap::from([
+    let properties = with_capture_selection_properties(BTreeMap::from([
         (
             "text".to_string(),
             JsonSchema::String {
@@ -280,10 +356,28 @@ pub fn create_gui_type_tool() -> ToolSpec {
             },
         ),
         (
+            "secret_env_var".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Environment variable name whose value should be typed without exposing the literal secret in the tool call."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "secret_command_env_var".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Environment variable name containing a local shell command whose stdout should be typed without exposing the secret in the tool call."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
             "replace".to_string(),
             JsonSchema::Boolean {
                 description: Some(
-                    "Whether to replace the current field contents before typing. Defaults to false."
+                    "Whether to replace the current field contents before typing. Defaults to true."
                         .to_string(),
                 ),
             },
@@ -300,7 +394,14 @@ pub fn create_gui_type_tool() -> ToolSpec {
             "strategy".to_string(),
             JsonSchema::String {
                 description: Some(string_enum_description(
-                    &["unicode", "clipboard_paste", "physical_keys"],
+                    &[
+                        "unicode",
+                        "clipboard_paste",
+                        "physical_keys",
+                        "system_events_paste",
+                        "system_events_keystroke",
+                        "system_events_keystroke_chars",
+                    ],
                     "Defaults to `unicode`.",
                 )),
             },
@@ -314,18 +415,18 @@ pub fn create_gui_type_tool() -> ToolSpec {
                 ),
             },
         ),
-    ]);
+    ]), true);
 
     ToolSpec::Function(ResponsesApiTool {
         name: "gui_type".to_string(),
         description:
-            "Type text into the currently focused macOS GUI control. Typically use gui_click first to focus the desired field."
+            "Type text into the currently focused macOS GUI control. Typically use gui_click first to focus the desired field. Provide exactly one of `text`, `secret_env_var`, or `secret_command_env_var`."
                 .to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::Object {
             properties,
-            required: Some(vec!["text".to_string()]),
+            required: None,
             additional_properties: Some(false.into()),
         },
         output_schema: None,
@@ -333,44 +434,49 @@ pub fn create_gui_type_tool() -> ToolSpec {
 }
 
 pub fn create_gui_key_tool() -> ToolSpec {
-    let properties = BTreeMap::from([
-        (
-            "key".to_string(),
-            JsonSchema::String {
-                description: Some(
-                    "Key to press, such as `Enter`, `Tab`, `Escape`, `ArrowDown`, or `s`."
-                        .to_string(),
-                ),
-            },
-        ),
-        (
-            "modifiers".to_string(),
-            JsonSchema::Array {
-                items: Box::new(JsonSchema::String {
+    let properties = with_capture_selection_properties(
+        BTreeMap::from([
+            (
+                "key".to_string(),
+                JsonSchema::String {
                     description: Some(
-                        "Modifier name such as `command`, `shift`, `option`, or `control`."
+                        "Key to press, such as `Enter`, `Tab`, `Escape`, `ArrowDown`, or `s`."
                             .to_string(),
                     ),
-                }),
-                description: Some("Optional modifier list.".to_string()),
-            },
-        ),
-        (
-            "repeat".to_string(),
-            JsonSchema::Number {
-                description: Some("How many times to press the key. Defaults to 1.".to_string()),
-            },
-        ),
-        (
-            "app".to_string(),
-            JsonSchema::String {
-                description: Some(
-                    "Optional macOS application name to activate before pressing the key."
-                        .to_string(),
-                ),
-            },
-        ),
-    ]);
+                },
+            ),
+            (
+                "modifiers".to_string(),
+                JsonSchema::Array {
+                    items: Box::new(JsonSchema::String {
+                        description: Some(
+                            "Modifier name such as `command`, `shift`, `option`, or `control`."
+                                .to_string(),
+                        ),
+                    }),
+                    description: Some("Optional modifier list.".to_string()),
+                },
+            ),
+            (
+                "repeat".to_string(),
+                JsonSchema::Number {
+                    description: Some(
+                        "How many times to press the key. Defaults to 1.".to_string(),
+                    ),
+                },
+            ),
+            (
+                "app".to_string(),
+                JsonSchema::String {
+                    description: Some(
+                        "Optional macOS application name to activate before pressing the key."
+                            .to_string(),
+                    ),
+                },
+            ),
+        ]),
+        true,
+    );
 
     ToolSpec::Function(ResponsesApiTool {
         name: "gui_key".to_string(),
@@ -380,6 +486,50 @@ pub fn create_gui_key_tool() -> ToolSpec {
         parameters: JsonSchema::Object {
             properties,
             required: Some(vec!["key".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+        output_schema: None,
+    })
+}
+
+pub fn create_gui_move_tool() -> ToolSpec {
+    let properties = BTreeMap::from([
+        (
+            "x".to_string(),
+            JsonSchema::Number {
+                description: Some(
+                    "Absolute macOS display X coordinate in logical points.".to_string(),
+                ),
+            },
+        ),
+        (
+            "y".to_string(),
+            JsonSchema::Number {
+                description: Some(
+                    "Absolute macOS display Y coordinate in logical points.".to_string(),
+                ),
+            },
+        ),
+        (
+            "app".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Optional macOS application name to activate before moving the pointer."
+                        .to_string(),
+                ),
+            },
+        ),
+    ]);
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "gui_move".to_string(),
+        description: "Move the macOS pointer to an absolute display coordinate in logical points."
+            .to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["x".to_string(), "y".to_string()]),
             additional_properties: Some(false.into()),
         },
         output_schema: None,
