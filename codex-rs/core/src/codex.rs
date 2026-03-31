@@ -26,6 +26,7 @@ use crate::compact_remote::run_inline_remote_auto_compact_task;
 use crate::config::ManagedFeatures;
 use crate::connectors;
 use crate::exec_policy::ExecPolicyManager;
+use crate::gui_instructions::render_gui_tools_section;
 #[cfg(test)]
 use crate::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use crate::models_manager::manager::ModelsManager;
@@ -3657,6 +3658,11 @@ impl Session {
         if let Some(plugin_section) = render_plugins_section(loaded_plugins.capability_summaries())
         {
             developer_sections.push(plugin_section);
+        }
+        if let Some(gui_tools_section) =
+            render_gui_tools_section(turn_context.features.enabled(Feature::GuiTools))
+        {
+            developer_sections.push(gui_tools_section);
         }
         if turn_context.features.enabled(Feature::CodexGitCommit)
             && let Some(commit_message_instruction) = commit_message_trailer_instruction(

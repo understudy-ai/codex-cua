@@ -1099,6 +1099,7 @@ fn gui_tools_present_when_feature_enabled() {
         &tools,
         &[
             "gui_observe",
+            "gui_wait",
             "gui_click",
             "gui_drag",
             "gui_scroll",

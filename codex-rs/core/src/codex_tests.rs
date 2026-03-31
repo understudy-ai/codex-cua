@@ -3970,6 +3970,25 @@ async fn build_initial_context_omits_default_image_save_location_without_image_h
 }
 
 #[tokio::test]
+async fn build_initial_context_includes_gui_workflow_instructions_when_feature_enabled() {
+    let (session, mut turn_context) = make_session_and_context().await;
+    turn_context
+        .features
+        .enable(Feature::GuiTools)
+        .expect("enable gui tools");
+
+    let initial_context = session.build_initial_context(&turn_context).await;
+    let developer_texts = developer_input_texts(&initial_context);
+
+    assert!(
+        developer_texts
+            .iter()
+            .any(|text| text.contains("## Native GUI Tools") && text.contains("`gui_wait`")),
+        "expected initial context to include gui workflow instructions, got {developer_texts:?}"
+    );
+}
+
+#[tokio::test]
 async fn handle_output_item_done_records_image_save_history_message() {
     let (session, turn_context) = make_session_and_context().await;
     let session = Arc::new(session);

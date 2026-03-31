@@ -102,6 +102,55 @@ pub fn create_gui_observe_tool() -> ToolSpec {
     })
 }
 
+pub fn create_gui_wait_tool() -> ToolSpec {
+    let properties = with_capture_selection_properties(
+        BTreeMap::from([
+            (
+                "duration_ms".to_string(),
+                JsonSchema::Number {
+                    description: Some(
+                        "How long to wait before refreshing the GUI screenshot. Defaults to 1000."
+                            .to_string(),
+                    ),
+                },
+            ),
+            (
+                "app".to_string(),
+                JsonSchema::String {
+                    description: Some(
+                        "Optional macOS application name to activate before refreshing the screenshot. Defaults to the current frontmost app."
+                            .to_string(),
+                    ),
+                },
+            ),
+            (
+                "return_image".to_string(),
+                JsonSchema::Boolean {
+                    description: Some(
+                        "Whether to attach the refreshed screenshot image. Defaults to true."
+                            .to_string(),
+                    ),
+                },
+            ),
+        ]),
+        true,
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "gui_wait".to_string(),
+        description: "Wait briefly, then refresh the current macOS GUI screenshot so you can verify the next state after a GUI action. Reuses the previous gui_observe target when no explicit capture selection is provided."
+            .to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::Object {
+            properties,
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+        output_schema: None,
+    })
+}
+
 pub fn create_gui_click_tool() -> ToolSpec {
     let properties = with_capture_selection_properties(BTreeMap::from([
         (
