@@ -73,6 +73,10 @@ struct WindowSelector {
 #[derive(Debug, Deserialize)]
 struct ObserveArgs {
     app: Option<String>,
+    target: Option<String>,
+    location_hint: Option<String>,
+    scope: Option<String>,
+    grounding_mode: Option<String>,
     capture_mode: Option<String>,
     window_title: Option<String>,
     window_selector: Option<WindowSelector>,
@@ -85,6 +89,8 @@ struct ClickArgs {
     y: Option<f64>,
     target: Option<String>,
     location_hint: Option<String>,
+    scope: Option<String>,
+    grounding_mode: Option<String>,
     button: Option<String>,
     clicks: Option<i64>,
     hold_ms: Option<i64>,
@@ -102,6 +108,8 @@ struct WaitArgs {
     duration_ms: Option<i64>,
     target: Option<String>,
     location_hint: Option<String>,
+    scope: Option<String>,
+    grounding_mode: Option<String>,
     state: Option<String>,
     timeout_ms: Option<i64>,
     interval_ms: Option<i64>,
@@ -118,10 +126,13 @@ struct DragArgs {
     from_y: Option<f64>,
     from_target: Option<String>,
     from_location_hint: Option<String>,
+    from_scope: Option<String>,
     to_x: Option<f64>,
     to_y: Option<f64>,
     to_target: Option<String>,
     to_location_hint: Option<String>,
+    to_scope: Option<String>,
+    grounding_mode: Option<String>,
     duration_ms: Option<i64>,
     steps: Option<i64>,
     capture_mode: Option<String>,
@@ -138,6 +149,8 @@ struct ScrollArgs {
     delta_x: Option<i64>,
     target: Option<String>,
     location_hint: Option<String>,
+    scope: Option<String>,
+    grounding_mode: Option<String>,
     x: Option<f64>,
     y: Option<f64>,
     unit: Option<String>,
@@ -156,6 +169,8 @@ struct TypeArgs {
     secret_command_env_var: Option<String>,
     target: Option<String>,
     location_hint: Option<String>,
+    scope: Option<String>,
+    grounding_mode: Option<String>,
     replace: Option<bool>,
     submit: Option<bool>,
     strategy: Option<String>,
@@ -235,6 +250,8 @@ struct HelperResolvedTarget {
     role: Option<String>,
     role_description: Option<String>,
     identifier: Option<String>,
+    confidence: f64,
+    reason: Option<String>,
     point: HelperPoint,
     bounds: HelperRect,
 }
@@ -246,6 +263,11 @@ struct ResolvedTarget {
     role: Option<String>,
     role_description: Option<String>,
     identifier: Option<String>,
+    confidence: f64,
+    reason: Option<String>,
+    grounding_mode_requested: String,
+    grounding_mode_effective: String,
+    scope: Option<String>,
     point: HelperPoint,
     bounds: HelperRect,
     local_point: Option<HelperPoint>,
@@ -280,8 +302,11 @@ struct GuiTargetRequest<'a> {
     window_selection: Option<&'a WindowSelector>,
     target: &'a str,
     location_hint: Option<&'a str>,
+    scope: Option<&'a str>,
+    grounding_mode: Option<&'a str>,
     action: &'static str,
     related_target: Option<&'a str>,
+    related_scope: Option<&'a str>,
     related_location_hint: Option<&'a str>,
     related_point: Option<&'a HelperPoint>,
 }
@@ -295,6 +320,7 @@ enum DragEndpoint<'a> {
     Target {
         target: &'a str,
         location_hint: Option<&'a str>,
+        scope: Option<&'a str>,
     },
 }
 
@@ -391,6 +417,9 @@ impl GuiHandler {
             args.window_title.as_deref(),
             args.window_selector.as_ref(),
         )?;
+        let semantic_target = normalize_optional_string(args.target.as_deref());
+        let location_hint = normalize_optional_string(args.location_hint.as_deref());
+        let scope = normalize_optional_string(args.scope.as_deref());
         let context = capture_context(args.app.as_deref(), true, window_selection.as_ref())?;
         let capture = resolve_capture_target(
             &context,
@@ -419,7 +448,8 @@ impl GuiHandler {
                 invocation.session.conversation_id.to_string(),
                 state.clone(),
             );
-
+        let attach_image = args.return_image.unwrap_or(true);
+        let image_output = attach_image.then_some(image_url);
         let app_label = state
             .app_name
             .as_ref()
@@ -434,6 +464,58 @@ impl GuiHandler {
         } else {
             format!("display {}", state.display_index)
         };
+        if let Some(target) = semantic_target.as_deref() {
+            let grounded = self.resolve_gui_target(GuiTargetRequest {
+                app: args.app.as_deref(),
+                capture_mode: args.capture_mode.as_deref(),
+                window_selection: window_selection.as_ref(),
+                target,
+                location_hint: location_hint.as_deref(),
+                scope: scope.as_deref(),
+                grounding_mode: args.grounding_mode.as_deref(),
+                action: "observe",
+                related_target: None,
+                related_scope: None,
+                related_location_hint: None,
+                related_point: None,
+            })?;
+            let Some(grounded) = grounded else {
+                let summary = format!(
+                    "Captured macOS {subject}{app_label}, but could not resolve semantic GUI target `{target}` in the observed surface."
+                );
+                return Ok(self.build_gui_output(
+                    summary,
+                    state,
+                    image_output,
+                    false,
+                    Some(serde_json::json!({
+                        "error": format!("No confident semantic GUI target `{target}` was found."),
+                        "target": target,
+                        "grounding_method": "accessibility",
+                        "grounding_mode_requested": normalize_grounding_mode(args.grounding_mode.as_deref(), "observe")?,
+                        "grounding_mode_effective": "accessibility",
+                        "scope": scope,
+                        "confidence": 0.0,
+                    })),
+                ));
+            };
+            let summary = format!(
+                "Captured macOS {subject}{app_label} and resolved semantic GUI target `{target}`. Coordinates for gui_click/gui_drag/gui_scroll are still measured from the top-left of this image."
+            );
+            let mut extra = serde_json::Map::new();
+            extra.insert(
+                "target_resolution".to_string(),
+                build_target_resolution_details(target, &grounded),
+            );
+            return Ok(self.build_gui_output(
+                summary,
+                state,
+                image_output,
+                true,
+                Some(JsonValue::Object(extra)),
+            ));
+        }
+
         let summary = format!(
             "Captured macOS {subject}{app_label} at origin ({}, {}) with size {}x{}. Coordinates for gui_click/gui_drag/gui_scroll are measured from the top-left of this image.",
             state.capture_x.round(),
@@ -441,35 +523,7 @@ impl GuiHandler {
             state.width,
             state.height
         );
-
-        let mut body = vec![FunctionCallOutputContentItem::InputText {
-            text: summary.clone(),
-        }];
-        if args.return_image.unwrap_or(true) {
-            body.push(FunctionCallOutputContentItem::InputImage {
-                image_url: image_url.clone(),
-                detail: None,
-            });
-        }
-
-        Ok(GuiToolOutput {
-            body,
-            code_result: serde_json::json!({
-                "message": summary,
-                "image_url": image_url,
-                "display_index": state.display_index,
-                "capture_mode": state.capture_mode,
-                "origin_x": state.capture_x,
-                "origin_y": state.capture_y,
-                "width": state.width,
-                "height": state.height,
-                "app": state.app_name,
-                "window_title": state.window_title,
-                "window_count": state.window_count,
-                "window_capture_strategy": state.window_capture_strategy,
-            }),
-            success: true,
-        })
+        Ok(self.build_gui_output(summary, state, image_output, true, None))
     }
 
     async fn handle_wait(
@@ -485,6 +539,7 @@ impl GuiHandler {
         let mut capture_mode = normalize_optional_string(args.capture_mode.as_deref());
         let target = normalize_optional_string(args.target.as_deref());
         let location_hint = normalize_optional_string(args.location_hint.as_deref());
+        let scope = normalize_optional_string(args.scope.as_deref());
         if app.is_none() && capture_mode.is_none() && window_selection.is_none() {
             if let Some(previous_state) = self.get_observe_state(&invocation) {
                 app = previous_state.app_name.clone();
@@ -535,8 +590,11 @@ impl GuiHandler {
                         window_selection: window_selection.as_ref(),
                         target: &target,
                         location_hint: location_hint.as_deref(),
+                        scope: scope.as_deref(),
+                        grounding_mode: args.grounding_mode.as_deref(),
                         action: "wait",
                         related_target: None,
+                        related_scope: None,
                         related_location_hint: None,
                         related_point: None,
                     },
@@ -673,6 +731,7 @@ impl GuiHandler {
         )?;
         let semantic_target = normalize_optional_string(args.target.as_deref());
         let location_hint = normalize_optional_string(args.location_hint.as_deref());
+        let scope = normalize_optional_string(args.scope.as_deref());
         let (global_x, global_y, state, coordinate_summary, target_details) = if let Some(target) =
             semantic_target.as_deref()
         {
@@ -687,8 +746,11 @@ impl GuiHandler {
                 window_selection: window_selection.as_ref(),
                 target,
                 location_hint: location_hint.as_deref(),
+                scope: scope.as_deref(),
+                grounding_mode: args.grounding_mode.as_deref(),
                 action: "click",
                 related_target: None,
+                related_scope: None,
                 related_location_hint: None,
                 related_point: None,
             })?;
@@ -854,8 +916,10 @@ impl GuiHandler {
         )?;
         let from_target = normalize_optional_string(args.from_target.as_deref());
         let from_location_hint = normalize_optional_string(args.from_location_hint.as_deref());
+        let from_scope = normalize_optional_string(args.from_scope.as_deref());
         let to_target = normalize_optional_string(args.to_target.as_deref());
         let to_location_hint = normalize_optional_string(args.to_location_hint.as_deref());
+        let to_scope = normalize_optional_string(args.to_scope.as_deref());
         let source_endpoint = normalize_drag_endpoint(
             "source",
             "from_target",
@@ -863,6 +927,7 @@ impl GuiHandler {
             "from_y",
             from_target.as_deref(),
             from_location_hint.as_deref(),
+            from_scope.as_deref(),
             args.from_x,
             args.from_y,
         )?;
@@ -873,6 +938,7 @@ impl GuiHandler {
             "to_y",
             to_target.as_deref(),
             to_location_hint.as_deref(),
+            to_scope.as_deref(),
             args.to_x,
             args.to_y,
         )?;
@@ -908,6 +974,7 @@ impl GuiHandler {
             DragEndpoint::Target {
                 target,
                 location_hint,
+                scope,
             } => {
                 let grounded = self.resolve_gui_target(GuiTargetRequest {
                     app: args.app.as_deref(),
@@ -915,8 +982,11 @@ impl GuiHandler {
                     window_selection: window_selection.as_ref(),
                     target,
                     location_hint,
+                    scope,
+                    grounding_mode: args.grounding_mode.as_deref(),
                     action: "drag_source",
                     related_target: to_target.as_deref(),
+                    related_scope: to_scope.as_deref(),
                     related_location_hint: to_location_hint.as_deref(),
                     related_point: None,
                 })?;
@@ -976,6 +1046,7 @@ impl GuiHandler {
                 DragEndpoint::Target {
                     target,
                     location_hint,
+                    scope,
                 } => {
                     let grounded = self.resolve_gui_target(GuiTargetRequest {
                         app: args.app.as_deref(),
@@ -983,8 +1054,11 @@ impl GuiHandler {
                         window_selection: window_selection.as_ref(),
                         target,
                         location_hint,
+                        scope,
+                        grounding_mode: args.grounding_mode.as_deref(),
                         action: "drag_destination",
                         related_target: from_target.as_deref(),
+                        related_scope: from_scope.as_deref(),
                         related_location_hint: from_location_hint.as_deref(),
                         related_point: Some(&source_point),
                     })?;
@@ -1098,6 +1172,7 @@ impl GuiHandler {
         let delta_y = args.delta_y.unwrap_or(0);
         let semantic_target = normalize_optional_string(args.target.as_deref());
         let location_hint = normalize_optional_string(args.location_hint.as_deref());
+        let scope = normalize_optional_string(args.scope.as_deref());
         if delta_x == 0 && delta_y == 0 {
             return Err(FunctionCallError::RespondToModel(
                 "gui_scroll requires at least one of `delta_x` or `delta_y`".to_string(),
@@ -1119,8 +1194,11 @@ impl GuiHandler {
                 window_selection: window_selection.as_ref(),
                 target,
                 location_hint: location_hint.as_deref(),
+                scope: scope.as_deref(),
+                grounding_mode: args.grounding_mode.as_deref(),
                 action: "scroll",
                 related_target: None,
+                related_scope: None,
                 related_location_hint: None,
                 related_point: None,
             })?;
@@ -1221,6 +1299,7 @@ impl GuiHandler {
         let text = resolve_type_text(&args)?;
         let semantic_target = normalize_optional_string(args.target.as_deref());
         let location_hint = normalize_optional_string(args.location_hint.as_deref());
+        let scope = normalize_optional_string(args.scope.as_deref());
         let strategy = args.strategy.as_deref().unwrap_or("unicode");
         let mut target_details = None;
         if let Some(target) = semantic_target.as_deref() {
@@ -1230,8 +1309,11 @@ impl GuiHandler {
                 window_selection: window_selection.as_ref(),
                 target,
                 location_hint: location_hint.as_deref(),
+                scope: scope.as_deref(),
+                grounding_mode: args.grounding_mode.as_deref(),
                 action: "type",
                 related_target: None,
+                related_scope: None,
                 related_location_hint: None,
                 related_point: None,
             })?;
@@ -1632,12 +1714,19 @@ impl GuiHandler {
             window_capture_strategy: capture.window_capture_strategy.clone(),
         };
         let helper_target = resolve_semantic_target(request)?;
+        let grounding_mode =
+            normalize_grounding_mode(request.grounding_mode, request.action).map(str::to_string)?;
         let target = helper_target.map(|resolved| ResolvedTarget {
             window_title: resolved.window_title,
             matched_text: resolved.matched_text,
             role: resolved.role,
             role_description: resolved.role_description,
             identifier: resolved.identifier,
+            confidence: resolved.confidence,
+            reason: resolved.reason,
+            grounding_mode_requested: grounding_mode.clone(),
+            grounding_mode_effective: grounding_mode,
+            scope: request.scope.map(ToOwned::to_owned),
             point: resolved.point.clone(),
             bounds: resolved.bounds,
             local_point: local_point_within_state(&capture_state, &resolved.point),
@@ -1809,6 +1898,23 @@ fn normalize_wait_target_state(state: Option<&str>) -> Result<&'static str, Func
     }
 }
 
+fn normalize_grounding_mode(
+    grounding_mode: Option<&str>,
+    tool_name: &str,
+) -> Result<&'static str, FunctionCallError> {
+    match grounding_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        None => Ok("single"),
+        Some("single") => Ok("single"),
+        Some("complex") => Ok("complex"),
+        Some(other) => Err(FunctionCallError::RespondToModel(format!(
+            "{tool_name}.grounding_mode only supports `single` or `complex`, got `{other}`"
+        ))),
+    }
+}
+
 fn normalize_drag_endpoint<'a>(
     endpoint_label: &str,
     target_field: &str,
@@ -1816,6 +1922,7 @@ fn normalize_drag_endpoint<'a>(
     y_field: &str,
     target: Option<&'a str>,
     location_hint: Option<&'a str>,
+    scope: Option<&'a str>,
     x: Option<f64>,
     y: Option<f64>,
 ) -> Result<DragEndpoint<'a>, FunctionCallError> {
@@ -1828,6 +1935,7 @@ fn normalize_drag_endpoint<'a>(
         return Ok(DragEndpoint::Target {
             target,
             location_hint,
+            scope,
         });
     }
 
@@ -1847,11 +1955,28 @@ fn build_target_resolution_details(target: &str, grounded: &GroundedGuiTarget) -
     serde_json::json!({
         "target": target,
         "grounding_method": grounded.grounding_method,
+        "grounding_provider": "native_accessibility",
+        "grounding_mode_requested": resolved.grounding_mode_requested,
+        "grounding_mode_effective": resolved.grounding_mode_effective,
+        "grounding_coordinate_space": "display_pixels",
+        "confidence": resolved.confidence,
+        "reason": resolved.reason,
+        "scope": resolved.scope,
         "matched_text": resolved.matched_text,
         "target_role": resolved.role,
         "target_role_description": resolved.role_description,
         "target_identifier": resolved.identifier,
         "target_window_title": resolved.window_title,
+        "grounding_display_point": {
+            "x": resolved.point.x,
+            "y": resolved.point.y,
+        },
+        "grounding_display_box": {
+            "x": resolved.bounds.x,
+            "y": resolved.bounds.y,
+            "width": resolved.bounds.width,
+            "height": resolved.bounds.height,
+        },
         "target_global_point": {
             "x": resolved.point.x,
             "y": resolved.point.y,
@@ -2074,9 +2199,11 @@ fn capture_context(
 fn resolve_semantic_target(
     request: GuiTargetRequest<'_>,
 ) -> Result<Option<HelperResolvedTarget>, FunctionCallError> {
+    let grounding_mode = normalize_grounding_mode(request.grounding_mode, request.action)?;
     let mut env = vec![
         ("CODEX_GUI_ACTIVATE_APP", "1".to_string()),
         ("CODEX_GUI_TARGET", request.target.to_string()),
+        ("CODEX_GUI_GROUNDING_MODE", grounding_mode.to_string()),
     ];
     if let Some(app) = request.app.filter(|app| !app.trim().is_empty()) {
         env.push(("CODEX_GUI_APP", app.to_string()));
@@ -2087,12 +2214,21 @@ fn resolve_semantic_target(
     {
         env.push(("CODEX_GUI_LOCATION_HINT", location_hint.to_string()));
     }
+    if let Some(scope) = request.scope.filter(|value| !value.trim().is_empty()) {
+        env.push(("CODEX_GUI_SCOPE", scope.to_string()));
+    }
     env.push(("CODEX_GUI_ACTION", request.action.to_string()));
     if let Some(related_target) = request
         .related_target
         .filter(|value| !value.trim().is_empty())
     {
         env.push(("CODEX_GUI_RELATED_TARGET", related_target.to_string()));
+    }
+    if let Some(related_scope) = request
+        .related_scope
+        .filter(|value| !value.trim().is_empty())
+    {
+        env.push(("CODEX_GUI_RELATED_SCOPE", related_scope.to_string()));
     }
     if let Some(related_location_hint) = request
         .related_location_hint
@@ -2764,6 +2900,8 @@ struct ResolvedTargetPayload: Codable {
     let role: String?
     let roleDescription: String?
     let identifier: String?
+    let confidence: Double
+    let reason: String?
     let point: Point
     let bounds: Rect
 }
@@ -2789,6 +2927,7 @@ struct AccessibilityCandidate {
     let role: String?
     let roleDescription: String?
     let identifier: String?
+    let reason: String?
     let score: Double
 }
 
@@ -3182,6 +3321,21 @@ func candidateStrings(for element: AXUIElement) -> [(text: String, weight: Doubl
     return values
 }
 
+func ancestorStrings(for element: AXUIElement, limit: Int = 3) -> [(text: String, weight: Double)] {
+    var results: [(String, Double)] = []
+    var current = axElementAttribute(element, kAXParentAttribute as CFString)
+    var depth = 0
+    while let parent = current, depth < limit {
+        let depthWeight = depth == 0 ? 0.7 : (depth == 1 ? 0.5 : 0.35)
+        for candidate in candidateStrings(for: parent) {
+            results.append((candidate.text, candidate.weight * depthWeight))
+        }
+        current = axElementAttribute(parent, kAXParentAttribute as CFString)
+        depth += 1
+    }
+    return results
+}
+
 func locationHintScore(_ hint: String?, bounds: CGRect, rootBounds: CGRect?) -> Double {
     guard let hint = normalizedText(hint), let rootBounds, rootBounds.width > 0, rootBounds.height > 0 else {
         return 0
@@ -3205,6 +3359,31 @@ func locationHintScore(_ hint: String?, bounds: CGRect, rootBounds: CGRect?) -> 
         score += (1.0 - min(1.0, abs(centerX - 0.5) + abs(centerY - 0.5))) * 20
     }
     return score
+}
+
+func scopeScore(
+    _ scope: String?,
+    element: AXUIElement,
+    bounds: CGRect,
+    rootBounds: CGRect?
+) -> Double {
+    guard let scope = normalizedText(scope) else {
+        return 0
+    }
+    var bestScore = 0.0
+    for candidate in candidateStrings(for: element) {
+        let score = matchScore(target: scope, candidate: candidate.text, weight: candidate.weight * 0.7)
+        if score > bestScore {
+            bestScore = score
+        }
+    }
+    for candidate in ancestorStrings(for: element) {
+        let score = matchScore(target: scope, candidate: candidate.text, weight: candidate.weight)
+        if score > bestScore {
+            bestScore = score
+        }
+    }
+    return bestScore + (locationHintScore(scope, bounds: bounds, rootBounds: rootBounds) * 0.35)
 }
 
 func matchScore(target: String, candidate: String, weight: Double) -> Double {
@@ -3263,6 +3442,7 @@ func selectedAXWindow(
 func collectAccessibilityCandidates(
     root: AXUIElement,
     target: String,
+    scope: String?,
     locationHint: String?,
     rootBounds: CGRect?
 ) -> [AccessibilityCandidate] {
@@ -3303,7 +3483,10 @@ func collectAccessibilityCandidates(
             continue
         }
 
-        let finalScore = bestScore + locationHintScore(locationHint, bounds: bounds, rootBounds: rootBounds)
+        let finalScore =
+            bestScore
+            + scopeScore(scope, element: element, bounds: bounds, rootBounds: rootBounds)
+            + locationHintScore(locationHint, bounds: bounds, rootBounds: rootBounds)
         results.append(
             AccessibilityCandidate(
                 element: element,
@@ -3312,6 +3495,7 @@ func collectAccessibilityCandidates(
                 role: axStringAttribute(element, kAXRoleAttribute as CFString),
                 roleDescription: axStringAttribute(element, kAXRoleDescriptionAttribute as CFString),
                 identifier: axStringAttribute(element, kAXIdentifierAttribute as CFString),
+                reason: bestText.map { "Matched accessibility text `\($0)`" } ?? "Matched accessibility element",
                 score: finalScore
             )
         )
@@ -3336,6 +3520,7 @@ func handleResolveTarget() throws {
     let requestedWindowTitleContains = trimmedEnv("CODEX_GUI_WINDOW_TITLE_CONTAINS")
     let requestedWindowIndex = optionalInt("CODEX_GUI_WINDOW_INDEX")
     let target = trimmedEnv("CODEX_GUI_TARGET")
+    let scope = trimmedEnv("CODEX_GUI_SCOPE")
     let locationHint = trimmedEnv("CODEX_GUI_LOCATION_HINT")
     guard let target, !target.isEmpty else {
         throw HelperError.missingEnv("CODEX_GUI_TARGET")
@@ -3357,11 +3542,13 @@ func handleResolveTarget() throws {
     guard let candidate = collectAccessibilityCandidates(
         root: rootElement,
         target: target,
+        scope: scope,
         locationHint: locationHint,
         rootBounds: rootBounds
     ).first else {
         return
     }
+    let normalizedConfidence = min(1.0, max(0.0, candidate.score / 160.0))
     let payload = ResolvedTargetPayload(
         appName: resolvedApp.localizedName ?? requestedApp,
         windowTitle: axStringAttribute(rootElement, kAXTitleAttribute as CFString),
@@ -3369,6 +3556,8 @@ func handleResolveTarget() throws {
         role: candidate.role,
         roleDescription: candidate.roleDescription,
         identifier: candidate.identifier,
+        confidence: normalizedConfidence,
+        reason: candidate.reason,
         point: point(CGPoint(x: candidate.bounds.midX, y: candidate.bounds.midY)),
         bounds: rect(candidate.bounds)
     )
@@ -3927,6 +4116,7 @@ mod tests {
             "from_y",
             Some("Save button"),
             Some("top right"),
+            Some("toolbar"),
             None,
             None,
         )
@@ -3936,9 +4126,11 @@ mod tests {
             DragEndpoint::Target {
                 target,
                 location_hint,
+                scope,
             } => {
                 assert_eq!(target, "Save button");
                 assert_eq!(location_hint, Some("top right"));
+                assert_eq!(scope, Some("toolbar"));
             }
             DragEndpoint::Coordinates { .. } => {
                 panic!("expected semantic drag endpoint");
@@ -3954,6 +4146,7 @@ mod tests {
             "to_x",
             "to_y",
             Some("Sidebar"),
+            None,
             None,
             Some(10.0),
             Some(20.0),
@@ -3976,6 +4169,7 @@ mod tests {
             "from_y",
             None,
             None,
+            None,
             Some(10.0),
             None,
         )
@@ -3986,6 +4180,19 @@ mod tests {
                 .to_string()
                 .contains("requires both `from_x` and `from_y`")
         );
+    }
+
+    #[test]
+    fn normalize_grounding_mode_defaults_and_validates() {
+        assert_eq!(
+            normalize_grounding_mode(None, "gui_click").unwrap(),
+            "single"
+        );
+        assert_eq!(
+            normalize_grounding_mode(Some("complex"), "gui_click").unwrap(),
+            "complex"
+        );
+        assert!(normalize_grounding_mode(Some("dense"), "gui_click").is_err());
     }
 
     #[test]

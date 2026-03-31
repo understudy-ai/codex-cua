@@ -110,12 +110,39 @@ fn with_target_properties(
             ),
         },
     );
+    properties.insert(
+        "scope".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Optional semantic region that further narrows the target, such as `left sidebar`, `toolbar`, or `composer pane`."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "grounding_mode".to_string(),
+        JsonSchema::String {
+            description: Some(string_enum_description(
+                &["single", "complex"],
+                "Optional grounding hint. `single` suits simple isolated controls; `complex` suits dense or ambiguous layouts.",
+            )),
+        },
+    );
     properties
 }
 
 fn with_drag_target_properties(
     mut properties: BTreeMap<String, JsonSchema>,
 ) -> BTreeMap<String, JsonSchema> {
+    properties.insert(
+        "grounding_mode".to_string(),
+        JsonSchema::String {
+            description: Some(string_enum_description(
+                &["single", "complex"],
+                "Optional grounding hint shared by drag source and destination. `single` suits simple isolated controls; `complex` suits dense or ambiguous layouts.",
+            )),
+        },
+    );
     properties.insert(
         "from_target".to_string(),
         JsonSchema::String {
@@ -130,6 +157,15 @@ fn with_drag_target_properties(
         JsonSchema::String {
             description: Some(
                 "Optional disambiguation hint for `from_target`, such as `left sidebar` or `near the top`."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "from_scope".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Optional semantic region that narrows `from_target`, such as `left sidebar` or `active tab strip`."
                     .to_string(),
             ),
         },
@@ -152,34 +188,49 @@ fn with_drag_target_properties(
             ),
         },
     );
+    properties.insert(
+        "to_scope".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Optional semantic region that narrows `to_target`, such as `timeline`, `calendar grid`, or `drop zone`."
+                    .to_string(),
+            ),
+        },
+    );
     properties
 }
 
 pub fn create_gui_observe_tool() -> ToolSpec {
-    let properties = with_capture_selection_properties(BTreeMap::from([
-        (
-            "app".to_string(),
-            JsonSchema::String {
-                description: Some(
-                    "Optional macOS application name to activate before capturing. Defaults to the current frontmost app."
-                        .to_string(),
+    let properties = with_target_properties(
+        with_capture_selection_properties(
+            BTreeMap::from([
+                (
+                    "app".to_string(),
+                    JsonSchema::String {
+                        description: Some(
+                            "Optional macOS application name to activate before capturing. Defaults to the current frontmost app."
+                                .to_string(),
+                        ),
+                    },
                 ),
-            },
-        ),
-        (
-            "return_image".to_string(),
-            JsonSchema::Boolean {
-                description: Some(
-                    "Whether to attach the captured screenshot image. Defaults to true."
-                        .to_string(),
+                (
+                    "return_image".to_string(),
+                    JsonSchema::Boolean {
+                        description: Some(
+                            "Whether to attach the captured screenshot image. Defaults to true."
+                                .to_string(),
+                        ),
+                    },
                 ),
-            },
+            ]),
+            true,
         ),
-    ]), true);
+        "observing a semantic GUI target",
+    );
 
     ToolSpec::Function(ResponsesApiTool {
         name: "gui_observe".to_string(),
-        description: "Capture a screenshot of the current macOS GUI. Use this before GUI actions to inspect state and obtain the coordinate space for other gui_* tools. Supports display-wide capture and focused-window capture."
+        description: "Capture a screenshot of the current macOS GUI. Use this before GUI actions to inspect state and obtain the coordinate space for other gui_* tools. Supports display-wide capture and focused-window capture, and can also resolve a semantic `target` within the observed GUI."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -734,6 +785,8 @@ mod tests {
 
         assert!(properties.contains_key("target"));
         assert!(properties.contains_key("location_hint"));
+        assert!(properties.contains_key("scope"));
+        assert!(properties.contains_key("grounding_mode"));
     }
 
     #[test]
@@ -744,15 +797,30 @@ mod tests {
         assert!(properties.contains_key("state"));
         assert!(properties.contains_key("timeout_ms"));
         assert!(properties.contains_key("interval_ms"));
+        assert!(properties.contains_key("scope"));
+        assert!(properties.contains_key("grounding_mode"));
     }
 
     #[test]
     fn drag_tool_exposes_semantic_source_and_destination_properties() {
         let properties = function_parameters(create_gui_drag_tool());
 
+        assert!(properties.contains_key("grounding_mode"));
         assert!(properties.contains_key("from_target"));
         assert!(properties.contains_key("from_location_hint"));
+        assert!(properties.contains_key("from_scope"));
         assert!(properties.contains_key("to_target"));
         assert!(properties.contains_key("to_location_hint"));
+        assert!(properties.contains_key("to_scope"));
+    }
+
+    #[test]
+    fn observe_tool_exposes_semantic_grounding_properties() {
+        let properties = function_parameters(create_gui_observe_tool());
+
+        assert!(properties.contains_key("target"));
+        assert!(properties.contains_key("location_hint"));
+        assert!(properties.contains_key("scope"));
+        assert!(properties.contains_key("grounding_mode"));
     }
 }
