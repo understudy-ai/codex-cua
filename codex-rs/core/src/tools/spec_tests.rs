@@ -1071,6 +1071,43 @@ fn image_generation_tools_require_feature_and_supported_model() {
     );
 }
 
+#[test]
+fn gui_tools_present_when_feature_enabled() {
+    let config = test_config();
+    let model_info = ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+    let mut features = Features::with_defaults();
+    features.enable(Feature::GuiTools);
+    let available_models = Vec::new();
+    let tools_config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &model_info,
+        available_models: &available_models,
+        features: &features,
+        web_search_mode: Some(WebSearchMode::Cached),
+        session_source: SessionSource::Cli,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+    });
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
+
+    assert_contains_tool_names(
+        &tools,
+        &[
+            "gui_observe",
+            "gui_click",
+            "gui_drag",
+            "gui_scroll",
+            "gui_type",
+            "gui_key",
+        ],
+    );
+}
+
 fn assert_model_tools(
     model_slug: &str,
     features: &Features,

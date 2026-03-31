@@ -152,6 +152,8 @@ pub enum Feature {
     Plugins,
     /// Allow the model to invoke the built-in image generation tool.
     ImageGeneration,
+    /// Enable native macOS GUI observation and input tools.
+    GuiTools,
     /// Allow prompting and installing missing MCP dependencies.
     SkillMcpDependencyInstall,
     /// Prompt for missing skill env var dependencies.
@@ -753,6 +755,16 @@ pub const FEATURES: &[FeatureSpec] = &[
         id: Feature::ImageGeneration,
         key: "image_generation",
         stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::GuiTools,
+        key: "gui_tools",
+        stage: Stage::Experimental {
+            name: "Native GUI Tools",
+            menu_description: "Enable native macOS GUI screenshot, click, drag, scroll, typing, and keypress tools for direct desktop interaction.",
+            announcement: "NEW: Native GUI Tools are now available in /experimental on macOS.",
+        },
         default_enabled: false,
     },
     FeatureSpec {
