@@ -47,7 +47,7 @@ fn with_capture_selection_properties(
         JsonSchema::String {
             description: Some(string_enum_description(
                 &["display", "window"],
-                "Use `window` to capture the active app window when available. Defaults to `display`.",
+                "Use `window` to capture the active app window when available. When omitted, GUI tools prefer `window` for in-app or window-targeted work and fall back to `display` otherwise.",
             )),
         },
     );

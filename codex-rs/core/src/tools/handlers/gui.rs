@@ -307,6 +307,7 @@ impl GuiHandler {
             &context,
             args.capture_mode.as_deref(),
             window_selection.is_some(),
+            args.app.as_deref().is_some(),
         )?;
         let image_bytes = capture_region(&capture.bounds, capture.width, capture.height)?;
         let image_url = data_url_png(&image_bytes);
@@ -432,6 +433,7 @@ impl GuiHandler {
             &context,
             capture_mode.as_deref(),
             window_selection.is_some(),
+            app.as_deref().is_some(),
         )?;
         let image_bytes = capture_region(&capture.bounds, capture.width, capture.height)?;
         let image_url = data_url_png(&image_bytes);
@@ -956,8 +958,12 @@ impl GuiHandler {
             Some(state) => state,
             None => {
                 let context = capture_context(app, false, window_selection)?;
-                let capture =
-                    resolve_capture_target(&context, capture_mode, window_selection.is_some())?;
+                let capture = resolve_capture_target(
+                    &context,
+                    capture_mode,
+                    window_selection.is_some(),
+                    app.is_some(),
+                )?;
                 ObserveState {
                     capture_x: capture.bounds.x,
                     capture_y: capture.bounds.y,
@@ -1030,6 +1036,7 @@ impl GuiHandler {
             &context,
             capture_mode.as_deref(),
             window_selection.is_some(),
+            app.as_deref().is_some(),
         )?;
         let image_bytes = if attach_image {
             Some(capture_region(
@@ -1218,6 +1225,7 @@ fn resolve_capture_target(
     context: &HelperCaptureContext,
     capture_mode: Option<&str>,
     window_selection_requested: bool,
+    prefer_window_when_available: bool,
 ) -> Result<CaptureTarget, FunctionCallError> {
     let requested_mode = normalize_capture_mode(capture_mode)?;
     if window_selection_requested && context.window_bounds.is_none() {
@@ -1230,7 +1238,10 @@ fn resolve_capture_target(
     let use_window = match requested_mode {
         Some("window") => context.window_bounds.is_some(),
         Some("display") => false,
-        None => window_selection_requested,
+        None => {
+            window_selection_requested
+                || (prefer_window_when_available && context.window_bounds.is_some())
+        }
         Some(_) => false,
     };
 
@@ -1336,7 +1347,12 @@ fn prepare_targeted_gui_action(
 
     let context = capture_context(app, true, window_selection)?;
     if capture_mode.is_some() || window_selection.is_some() {
-        let _ = resolve_capture_target(&context, capture_mode, window_selection.is_some())?;
+        let _ = resolve_capture_target(
+            &context,
+            capture_mode,
+            window_selection.is_some(),
+            app.is_some(),
+        )?;
     }
     Ok(())
 }
@@ -2624,7 +2640,7 @@ mod tests {
         };
 
         let capture =
-            resolve_capture_target(&context, Some("window"), true).expect("window capture");
+            resolve_capture_target(&context, Some("window"), true, true).expect("window capture");
 
         assert_eq!(capture.mode, "window");
         assert_eq!(capture.width, 800);
@@ -2637,6 +2653,40 @@ mod tests {
     #[test]
     fn prepare_targeted_gui_action_is_noop_without_targeting() {
         prepare_targeted_gui_action(None, None, None).expect("no-op targeted action");
+    }
+
+    #[test]
+    fn resolve_capture_target_prefers_window_for_in_app_work_when_available() {
+        let context = HelperCaptureContext {
+            app_name: Some("Notes".to_string()),
+            cursor: HelperPoint { x: 10.0, y: 20.0 },
+            display: HelperDisplayDescriptor {
+                index: 1,
+                bounds: HelperRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1440.0,
+                    height: 900.0,
+                },
+            },
+            window_id: Some(42),
+            window_title: Some("Quick Note".to_string()),
+            window_bounds: Some(HelperRect {
+                x: 100.0,
+                y: 80.0,
+                width: 800.0,
+                height: 600.0,
+            }),
+            window_count: Some(1),
+            window_capture_strategy: Some("bounds".to_string()),
+        };
+
+        let capture = resolve_capture_target(&context, None, false, true)
+            .expect("window should be preferred for in-app work");
+
+        assert_eq!(capture.mode, "window");
+        assert_eq!(capture.width, 800);
+        assert_eq!(capture.height, 600);
     }
 
     #[test]
@@ -2701,8 +2751,8 @@ mod tests {
 
         let context =
             capture_context(None, false, None).expect("capture context should be available");
-        let capture =
-            resolve_capture_target(&context, Some("display"), false).expect("display capture");
+        let capture = resolve_capture_target(&context, Some("display"), false, false)
+            .expect("display capture");
         let image_bytes =
             capture_region(&capture.bounds, capture.width, capture.height).expect("screenshot");
 
@@ -2739,8 +2789,8 @@ mod tests {
 
         let context =
             capture_context(None, false, None).expect("capture context should be available");
-        let capture =
-            resolve_capture_target(&context, Some("display"), false).expect("display capture");
+        let capture = resolve_capture_target(&context, Some("display"), false, false)
+            .expect("display capture");
         let image_bytes =
             capture_region(&capture.bounds, capture.width, capture.height).expect("screenshot");
 
