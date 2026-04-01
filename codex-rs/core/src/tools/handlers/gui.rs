@@ -15,7 +15,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
 use tokio::time::Duration;
+use tokio::time::Instant;
 use tokio::time::sleep;
+use tokio::time::timeout;
 
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
@@ -312,6 +314,7 @@ struct ResolvedTarget {
 struct TargetProbe {
     capture_state: ObserveState,
     target: Option<ResolvedTarget>,
+    timed_out: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1782,6 +1785,55 @@ impl GuiHandler {
         Ok(TargetProbe {
             capture_state,
             target,
+            timed_out: false,
+        })
+    }
+
+    async fn probe_semantic_target_before_deadline(
+        &self,
+        invocation: &ToolInvocation,
+        request: GuiTargetRequest<'_>,
+        deadline: Instant,
+    ) -> Result<TargetProbe, FunctionCallError> {
+        let observation = observe_platform(
+            request.app,
+            true,
+            request.capture_mode,
+            request.window_selection,
+            request.app.is_some(),
+        )?;
+        let capture_state = observation.state;
+        let Some(remaining) = remaining_wait_budget_duration(deadline) else {
+            return Ok(TargetProbe {
+                capture_state,
+                target: None,
+                timed_out: true,
+            });
+        };
+        let target = match timeout(
+            remaining,
+            self.ground_target(
+                invocation,
+                request,
+                &capture_state,
+                &observation.image_bytes,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                return Ok(TargetProbe {
+                    capture_state,
+                    target: None,
+                    timed_out: true,
+                });
+            }
+        };
+        Ok(TargetProbe {
+            capture_state,
+            target,
+            timed_out: false,
         })
     }
 
@@ -1891,15 +1943,16 @@ impl GuiHandler {
         interval_ms: i64,
     ) -> Result<GuiTargetProbeResult, FunctionCallError> {
         let attach_image = supports_image_input(invocation);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
         let mut attempts = 0;
-        let mut elapsed_ms = 0;
         let initial_probe = self
-            .probe_semantic_target(
+            .probe_semantic_target_before_deadline(
                 invocation,
                 GuiTargetRequest {
                     capture_mode: fallback_probe_capture_mode(request.capture_mode, 1, request.app),
                     ..request
                 },
+                deadline,
             )
             .await?;
         let mut last_grounded = initial_probe.target.map(|resolved| GroundedGuiTarget {
@@ -1908,6 +1961,7 @@ impl GuiHandler {
         });
         attempts += 1;
         let mut current_state = initial_probe.capture_state;
+        let mut budget_exhausted = initial_probe.timed_out;
         let initial_satisfied = match state {
             "appear" => last_grounded.is_some(),
             "disappear" => last_grounded.is_none(),
@@ -1916,12 +1970,17 @@ impl GuiHandler {
         let mut consecutive_satisfied = if initial_satisfied { 1 } else { 0 };
         let mut matched = consecutive_satisfied >= WAIT_CONFIRMATION_COUNT;
 
-        while !matched && elapsed_ms < timeout_ms {
-            let sleep_ms = (timeout_ms - elapsed_ms).min(interval_ms);
+        while !matched && !budget_exhausted {
+            let Some(remaining_ms) = remaining_wait_budget_ms(deadline) else {
+                break;
+            };
+            let sleep_ms = remaining_ms.min(interval_ms);
             sleep(Duration::from_millis(sleep_ms as u64)).await;
-            elapsed_ms += sleep_ms;
+            let Some(_) = remaining_wait_budget_ms(deadline) else {
+                break;
+            };
             let probe = self
-                .probe_semantic_target(
+                .probe_semantic_target_before_deadline(
                     invocation,
                     GuiTargetRequest {
                         capture_mode: fallback_probe_capture_mode(
@@ -1931,6 +1990,7 @@ impl GuiHandler {
                         ),
                         ..request
                     },
+                    deadline,
                 )
                 .await?;
             current_state = probe.capture_state.clone();
@@ -1939,6 +1999,10 @@ impl GuiHandler {
                 resolved,
             });
             attempts += 1;
+            budget_exhausted = probe.timed_out;
+            if budget_exhausted {
+                break;
+            }
             let satisfied = match state {
                 "appear" => last_grounded.is_some(),
                 "disappear" => last_grounded.is_none(),
@@ -2021,6 +2085,19 @@ fn normalize_grounding_mode(
         Some(other) => Err(FunctionCallError::RespondToModel(format!(
             "{action}.grounding_mode only supports `single` or `complex`, got `{other}`"
         ))),
+    }
+}
+
+fn remaining_wait_budget_ms(deadline: Instant) -> Option<i64> {
+    remaining_wait_budget_duration(deadline).map(|duration| duration.as_millis() as i64)
+}
+
+fn remaining_wait_budget_duration(deadline: Instant) -> Option<Duration> {
+    let now = Instant::now();
+    if now >= deadline {
+        None
+    } else {
+        Some(deadline.duration_since(now))
     }
 }
 

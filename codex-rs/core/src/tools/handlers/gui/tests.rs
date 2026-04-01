@@ -275,6 +275,15 @@ fn fallback_probe_capture_mode_is_generic_for_waits_and_grounded_actions() {
 }
 
 #[test]
+fn remaining_wait_budget_stops_at_zero() {
+    let future_deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+    assert!(remaining_wait_budget_ms(future_deadline).unwrap() > 0);
+
+    let expired_deadline = tokio::time::Instant::now() - Duration::from_millis(1);
+    assert_eq!(remaining_wait_budget_ms(expired_deadline), None);
+}
+
+#[test]
 fn normalize_drag_endpoint_accepts_semantic_targets() {
     let endpoint = normalize_drag_endpoint(
         "source",
