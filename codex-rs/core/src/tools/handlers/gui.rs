@@ -20,6 +20,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
 use tempfile::tempdir;
+use tokio::time::Duration;
+use tokio::time::sleep;
 
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
@@ -31,11 +33,14 @@ use crate::tools::registry::ToolKind;
 
 const GUI_UNSUPPORTED_MESSAGE: &str = "Native GUI tools are currently supported on macOS only.";
 const GUI_IMAGE_UNSUPPORTED_MESSAGE: &str =
-    "gui_observe is not allowed because you do not support image inputs";
+    "Native GUI screenshot tools are not allowed because you do not support image inputs";
 const DEFAULT_DRAG_DURATION_MS: i64 = 450;
 const DEFAULT_DRAG_STEPS: i64 = 24;
 const DEFAULT_HOVER_SETTLE_MS: i64 = 200;
 const DEFAULT_CLICK_AND_HOLD_MS: i64 = 650;
+const DEFAULT_GUI_WAIT_MS: i64 = 1000;
+const DEFAULT_POST_ACTION_SETTLE_MS: i64 = 1200;
+const DEFAULT_POST_TYPE_SETTLE_MS: i64 = 500;
 
 #[derive(Default)]
 pub struct GuiHandler {
@@ -84,6 +89,18 @@ struct ClickArgs {
     window_title: Option<String>,
     window_selector: Option<WindowSelector>,
     app: Option<String>,
+    post_action_settle_ms: Option<i64>,
+    return_image: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WaitArgs {
+    duration_ms: Option<i64>,
+    capture_mode: Option<String>,
+    window_title: Option<String>,
+    window_selector: Option<WindowSelector>,
+    app: Option<String>,
+    return_image: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,6 +115,8 @@ struct DragArgs {
     window_title: Option<String>,
     window_selector: Option<WindowSelector>,
     app: Option<String>,
+    post_action_settle_ms: Option<i64>,
+    return_image: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,6 +130,8 @@ struct ScrollArgs {
     window_title: Option<String>,
     window_selector: Option<WindowSelector>,
     app: Option<String>,
+    post_action_settle_ms: Option<i64>,
+    return_image: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,6 +146,8 @@ struct TypeArgs {
     window_title: Option<String>,
     window_selector: Option<WindowSelector>,
     app: Option<String>,
+    post_action_settle_ms: Option<i64>,
+    return_image: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -136,6 +159,8 @@ struct KeyArgs {
     window_title: Option<String>,
     window_selector: Option<WindowSelector>,
     app: Option<String>,
+    post_action_settle_ms: Option<i64>,
+    return_image: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,6 +201,12 @@ struct HelperRect {
     y: f64,
     width: f64,
     height: f64,
+}
+
+#[derive(Clone, Debug)]
+struct ActionEvidence {
+    image_url: Option<String>,
+    state: ObserveState,
 }
 
 pub struct GuiToolOutput {
@@ -241,6 +272,7 @@ impl ToolHandler for GuiHandler {
 
         match invocation.tool_name.as_str() {
             "gui_observe" => self.handle_observe(invocation).await,
+            "gui_wait" => self.handle_wait(invocation).await,
             "gui_click" => self.handle_click(invocation).await,
             "gui_drag" => self.handle_drag(invocation).await,
             "gui_scroll" => self.handle_scroll(invocation).await,
@@ -259,12 +291,7 @@ impl GuiHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<GuiToolOutput, FunctionCallError> {
-        if !invocation
-            .turn
-            .model_info
-            .input_modalities
-            .contains(&InputModality::Image)
-        {
+        if !supports_image_input(&invocation) {
             return Err(FunctionCallError::RespondToModel(
                 GUI_IMAGE_UNSUPPORTED_MESSAGE.to_string(),
             ));
@@ -280,6 +307,7 @@ impl GuiHandler {
             &context,
             args.capture_mode.as_deref(),
             window_selection.is_some(),
+            args.app.as_deref().is_some(),
         )?;
         let image_bytes = capture_region(&capture.bounds, capture.width, capture.height)?;
         let image_url = data_url_png(&image_bytes);
@@ -340,6 +368,133 @@ impl GuiHandler {
             code_result: serde_json::json!({
                 "message": summary,
                 "image_url": image_url,
+                "display_index": state.display_index,
+                "capture_mode": state.capture_mode,
+                "origin_x": state.capture_x,
+                "origin_y": state.capture_y,
+                "width": state.width,
+                "height": state.height,
+                "app": state.app_name,
+                "window_title": state.window_title,
+                "window_count": state.window_count,
+                "window_capture_strategy": state.window_capture_strategy,
+            }),
+            success: true,
+        })
+    }
+
+    async fn handle_wait(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<GuiToolOutput, FunctionCallError> {
+        let args = parse_function_args::<WaitArgs>(&invocation.payload)?;
+        let mut window_selection = normalize_window_selection(
+            args.window_title.as_deref(),
+            args.window_selector.as_ref(),
+        )?;
+        let mut app = normalize_optional_string(args.app.as_deref());
+        let mut capture_mode = normalize_optional_string(args.capture_mode.as_deref());
+        let return_image = args.return_image.unwrap_or(true);
+
+        if return_image && !supports_image_input(&invocation) {
+            return Err(FunctionCallError::RespondToModel(
+                GUI_IMAGE_UNSUPPORTED_MESSAGE.to_string(),
+            ));
+        }
+
+        if app.is_none() && capture_mode.is_none() && window_selection.is_none() {
+            if let Some(previous_state) = self.get_observe_state(&invocation) {
+                app = previous_state.app_name.clone();
+                capture_mode = Some(previous_state.capture_mode.to_string());
+                if previous_state.capture_mode == "window" {
+                    window_selection =
+                        previous_state
+                            .window_title
+                            .as_ref()
+                            .map(|title| WindowSelector {
+                                title: Some(title.clone()),
+                                title_contains: None,
+                                index: None,
+                            });
+                }
+            }
+        }
+
+        let wait_ms = args.duration_ms.unwrap_or(DEFAULT_GUI_WAIT_MS);
+        if wait_ms < 0 {
+            return Err(FunctionCallError::RespondToModel(
+                "gui_wait.duration_ms must be zero or a positive integer".to_string(),
+            ));
+        }
+        sleep(Duration::from_millis(wait_ms as u64)).await;
+
+        let context = capture_context(app.as_deref(), true, window_selection.as_ref())?;
+        let capture = resolve_capture_target(
+            &context,
+            capture_mode.as_deref(),
+            window_selection.is_some(),
+            app.as_deref().is_some(),
+        )?;
+        let image_bytes = capture_region(&capture.bounds, capture.width, capture.height)?;
+        let image_url = data_url_png(&image_bytes);
+        let state = ObserveState {
+            capture_x: capture.bounds.x,
+            capture_y: capture.bounds.y,
+            width: capture.width,
+            height: capture.height,
+            app_name: context.app_name.clone(),
+            display_index: context.display.index,
+            capture_mode: capture.mode,
+            window_title: capture.window_title.clone(),
+            window_count: capture.window_count,
+            window_capture_strategy: capture.window_capture_strategy.clone(),
+        };
+        self.observe_state
+            .lock()
+            .expect("gui observe state poisoned")
+            .insert(
+                invocation.session.conversation_id.to_string(),
+                state.clone(),
+            );
+
+        let app_label = state
+            .app_name
+            .as_ref()
+            .map(|app| format!(" for app `{app}`"))
+            .unwrap_or_default();
+        let subject = if state.capture_mode == "window" {
+            state
+                .window_title
+                .as_ref()
+                .map(|title| format!("window `{title}`"))
+                .unwrap_or_else(|| "window".to_string())
+        } else {
+            format!("display {}", state.display_index)
+        };
+        let summary = format!(
+            "Waited {wait_ms}ms, then refreshed macOS {subject}{app_label} at origin ({}, {}) with size {}x{}. Coordinates for gui_click/gui_drag/gui_scroll are measured from the top-left of this image.",
+            state.capture_x.round(),
+            state.capture_y.round(),
+            state.width,
+            state.height
+        );
+
+        let mut body = vec![FunctionCallOutputContentItem::InputText {
+            text: summary.clone(),
+        }];
+        if return_image {
+            body.push(FunctionCallOutputContentItem::InputImage {
+                image_url: image_url.clone(),
+                detail: None,
+            });
+        }
+
+        Ok(GuiToolOutput {
+            body,
+            code_result: serde_json::json!({
+                "message": summary,
+                "image_url": image_url,
+                "waited_ms": wait_ms,
                 "display_index": state.display_index,
                 "capture_mode": state.capture_mode,
                 "origin_x": state.capture_x,
@@ -424,16 +579,34 @@ impl GuiHandler {
             ],
         )?;
 
-        Ok(GuiToolOutput::from_text(format!(
-            "{} at image coordinate ({}, {}) on macOS {} {} (global {}, {}).",
+        let evidence = self
+            .capture_post_action_evidence(
+                &invocation,
+                args.app.as_deref(),
+                args.capture_mode.as_deref(),
+                window_selection.as_ref(),
+                args.post_action_settle_ms,
+                args.return_image,
+                DEFAULT_POST_ACTION_SETTLE_MS,
+            )
+            .await?;
+
+        let summary = format!(
+            "{} at image coordinate ({}, {}) on macOS {} {} (global {}, {}).{} Use gui_wait or gui_observe to verify the resulting UI state before the next risky action.",
             describe_click_action(button, clicks, args.hold_ms.is_some()),
             args.x.round(),
             args.y.round(),
             state.capture_mode,
             describe_capture_subject(&state),
             global_x.round(),
-            global_y.round()
-        )))
+            global_y.round(),
+            if evidence.image_url.is_some() {
+                " Attached a refreshed GUI evidence screenshot."
+            } else {
+                ""
+            }
+        );
+        Ok(self.build_action_output(summary, evidence))
     }
 
     async fn handle_drag(
@@ -479,15 +652,32 @@ impl GuiHandler {
             ],
         )?;
 
-        Ok(GuiToolOutput::from_text(format!(
-            "Dragged from ({}, {}) to ({}, {}) on macOS {} {}.",
+        let evidence = self
+            .capture_post_action_evidence(
+                &invocation,
+                args.app.as_deref(),
+                args.capture_mode.as_deref(),
+                window_selection.as_ref(),
+                args.post_action_settle_ms,
+                args.return_image,
+                DEFAULT_POST_ACTION_SETTLE_MS,
+            )
+            .await?;
+        let summary = format!(
+            "Dragged from ({}, {}) to ({}, {}) on macOS {} {}.{} Use gui_wait or gui_observe to confirm the drop landed where you expected.",
             args.from_x.round(),
             args.from_y.round(),
             args.to_x.round(),
             args.to_y.round(),
             state.capture_mode,
-            describe_capture_subject(&state)
-        )))
+            describe_capture_subject(&state),
+            if evidence.image_url.is_some() {
+                " Attached a refreshed GUI evidence screenshot."
+            } else {
+                ""
+            }
+        );
+        Ok(self.build_action_output(summary, evidence))
     }
 
     async fn handle_scroll(
@@ -545,9 +735,19 @@ impl GuiHandler {
                 ("CODEX_GUI_SCROLL_UNIT", unit.to_string()),
             ],
         )?;
-
-        Ok(GuiToolOutput::from_text(format!(
-            "Scrolled macOS GUI with delta_x={} delta_y={} ({unit}){}.",
+        let evidence = self
+            .capture_post_action_evidence(
+                &invocation,
+                args.app.as_deref(),
+                args.capture_mode.as_deref(),
+                window_selection.as_ref(),
+                args.post_action_settle_ms,
+                args.return_image,
+                DEFAULT_POST_ACTION_SETTLE_MS,
+            )
+            .await?;
+        let summary = format!(
+            "Scrolled macOS GUI with delta_x={} delta_y={} ({unit}){}.{} Refresh with gui_wait or gui_observe before grounding the next GUI action.",
             delta_x,
             delta_y,
             state_for_summary
@@ -557,8 +757,14 @@ impl GuiHandler {
                     state.capture_mode,
                     describe_capture_subject(state)
                 ))
-                .unwrap_or_default()
-        )))
+                .unwrap_or_default(),
+            if evidence.image_url.is_some() {
+                " Attached a refreshed GUI evidence screenshot."
+            } else {
+                ""
+            }
+        );
+        Ok(self.build_action_output(summary, evidence))
     }
 
     async fn handle_type(
@@ -627,10 +833,27 @@ impl GuiHandler {
             )?;
         }
 
-        Ok(GuiToolOutput::from_text(format!(
-            "Typed {} character(s) with strategy `{strategy}`.",
-            text.chars().count()
-        )))
+        let evidence = self
+            .capture_post_action_evidence(
+                &invocation,
+                args.app.as_deref(),
+                args.capture_mode.as_deref(),
+                window_selection.as_ref(),
+                args.post_action_settle_ms,
+                args.return_image,
+                DEFAULT_POST_TYPE_SETTLE_MS,
+            )
+            .await?;
+        let summary = format!(
+            "Typed {} character(s) with strategy `{strategy}`.{} Use gui_wait or gui_observe to verify the field contents and any follow-on UI changes.",
+            text.chars().count(),
+            if evidence.image_url.is_some() {
+                " Attached a refreshed GUI evidence screenshot."
+            } else {
+                ""
+            }
+        );
+        Ok(self.build_action_output(summary, evidence))
     }
 
     async fn handle_key(
@@ -663,16 +886,33 @@ impl GuiHandler {
             ],
         )?;
 
-        Ok(GuiToolOutput::from_text(format!(
-            "Pressed key `{}`{} {} time(s).",
+        let evidence = self
+            .capture_post_action_evidence(
+                &invocation,
+                args.app.as_deref(),
+                args.capture_mode.as_deref(),
+                window_selection.as_ref(),
+                args.post_action_settle_ms,
+                args.return_image,
+                DEFAULT_POST_TYPE_SETTLE_MS,
+            )
+            .await?;
+        let summary = format!(
+            "Pressed key `{}`{} {} time(s).{} Use gui_wait or gui_observe if this shortcut should change the visible UI.",
             args.key,
             if modifiers_env.is_empty() {
                 String::new()
             } else {
                 format!(" with modifiers [{}]", modifiers_env)
             },
-            repeat
-        )))
+            repeat,
+            if evidence.image_url.is_some() {
+                " Attached a refreshed GUI evidence screenshot."
+            } else {
+                ""
+            }
+        );
+        Ok(self.build_action_output(summary, evidence))
     }
 
     async fn handle_move(
@@ -718,8 +958,12 @@ impl GuiHandler {
             Some(state) => state,
             None => {
                 let context = capture_context(app, false, window_selection)?;
-                let capture =
-                    resolve_capture_target(&context, capture_mode, window_selection.is_some())?;
+                let capture = resolve_capture_target(
+                    &context,
+                    capture_mode,
+                    window_selection.is_some(),
+                    app.is_some(),
+                )?;
                 ObserveState {
                     capture_x: capture.bounds.x,
                     capture_y: capture.bounds.y,
@@ -737,6 +981,126 @@ impl GuiHandler {
 
         Ok((state.capture_x + local_x, state.capture_y + local_y, state))
     }
+
+    fn get_observe_state(&self, invocation: &ToolInvocation) -> Option<ObserveState> {
+        self.observe_state
+            .lock()
+            .expect("gui observe state poisoned")
+            .get(&invocation.session.conversation_id.to_string())
+            .cloned()
+    }
+
+    async fn capture_post_action_evidence(
+        &self,
+        invocation: &ToolInvocation,
+        app: Option<&str>,
+        capture_mode: Option<&str>,
+        window_selection: Option<&WindowSelector>,
+        settle_ms: Option<i64>,
+        return_image: Option<bool>,
+        default_settle_ms: i64,
+    ) -> Result<ActionEvidence, FunctionCallError> {
+        let attach_image = should_attach_image(invocation, return_image)?;
+        let mut app = normalize_optional_string(app);
+        let mut capture_mode = normalize_optional_string(capture_mode);
+        let mut window_selection = window_selection.cloned();
+
+        if app.is_none() && capture_mode.is_none() && window_selection.is_none() {
+            if let Some(previous_state) = self.get_observe_state(invocation) {
+                app = previous_state.app_name.clone();
+                capture_mode = Some(previous_state.capture_mode.to_string());
+                if previous_state.capture_mode == "window" {
+                    window_selection =
+                        previous_state
+                            .window_title
+                            .as_ref()
+                            .map(|title| WindowSelector {
+                                title: Some(title.clone()),
+                                title_contains: None,
+                                index: None,
+                            });
+                }
+            }
+        }
+
+        let settle_ms = settle_ms.unwrap_or(default_settle_ms);
+        if settle_ms < 0 {
+            return Err(FunctionCallError::RespondToModel(
+                "gui post_action_settle_ms must be zero or a positive integer".to_string(),
+            ));
+        }
+        sleep(Duration::from_millis(settle_ms as u64)).await;
+
+        let context = capture_context(app.as_deref(), true, window_selection.as_ref())?;
+        let capture = resolve_capture_target(
+            &context,
+            capture_mode.as_deref(),
+            window_selection.is_some(),
+            app.as_deref().is_some(),
+        )?;
+        let image_bytes = if attach_image {
+            Some(capture_region(
+                &capture.bounds,
+                capture.width,
+                capture.height,
+            )?)
+        } else {
+            None
+        };
+        let image_url = image_bytes.as_deref().map(data_url_png);
+        let state = ObserveState {
+            capture_x: capture.bounds.x,
+            capture_y: capture.bounds.y,
+            width: capture.width,
+            height: capture.height,
+            app_name: context.app_name.clone(),
+            display_index: context.display.index,
+            capture_mode: capture.mode,
+            window_title: capture.window_title.clone(),
+            window_count: capture.window_count,
+            window_capture_strategy: capture.window_capture_strategy.clone(),
+        };
+        self.observe_state
+            .lock()
+            .expect("gui observe state poisoned")
+            .insert(
+                invocation.session.conversation_id.to_string(),
+                state.clone(),
+            );
+
+        Ok(ActionEvidence { image_url, state })
+    }
+
+    fn build_action_output(&self, summary: String, evidence: ActionEvidence) -> GuiToolOutput {
+        let mut body = vec![FunctionCallOutputContentItem::InputText {
+            text: summary.clone(),
+        }];
+        if let Some(image_url) = &evidence.image_url {
+            body.push(FunctionCallOutputContentItem::InputImage {
+                image_url: image_url.clone(),
+                detail: None,
+            });
+        }
+
+        GuiToolOutput {
+            body,
+            code_result: serde_json::json!({
+                "message": summary,
+                "image_url": evidence.image_url,
+                "display_index": evidence.state.display_index,
+                "capture_mode": evidence.state.capture_mode,
+                "origin_x": evidence.state.capture_x,
+                "origin_y": evidence.state.capture_y,
+                "width": evidence.state.width,
+                "height": evidence.state.height,
+                "app": evidence.state.app_name,
+                "window_title": evidence.state.window_title,
+                "window_count": evidence.state.window_count,
+                "window_capture_strategy": evidence.state.window_capture_strategy,
+            }),
+            success: true,
+        }
+    }
 }
 
 fn parse_function_args<T>(payload: &ToolPayload) -> Result<T, FunctionCallError>
@@ -749,6 +1113,34 @@ where
         ));
     };
     parse_arguments(arguments)
+}
+
+fn supports_image_input(invocation: &ToolInvocation) -> bool {
+    invocation
+        .turn
+        .model_info
+        .input_modalities
+        .contains(&InputModality::Image)
+}
+
+fn should_attach_image(
+    invocation: &ToolInvocation,
+    return_image: Option<bool>,
+) -> Result<bool, FunctionCallError> {
+    should_attach_image_with_support(supports_image_input(invocation), return_image)
+}
+
+fn should_attach_image_with_support(
+    image_supported: bool,
+    return_image: Option<bool>,
+) -> Result<bool, FunctionCallError> {
+    match return_image {
+        Some(true) if !image_supported => Err(FunctionCallError::RespondToModel(
+            GUI_IMAGE_UNSUPPORTED_MESSAGE.to_string(),
+        )),
+        Some(value) => Ok(value),
+        None => Ok(image_supported),
+    }
 }
 
 fn rounded_dimension(value: f64, label: &str) -> Result<u32, FunctionCallError> {
@@ -833,6 +1225,7 @@ fn resolve_capture_target(
     context: &HelperCaptureContext,
     capture_mode: Option<&str>,
     window_selection_requested: bool,
+    prefer_window_when_available: bool,
 ) -> Result<CaptureTarget, FunctionCallError> {
     let requested_mode = normalize_capture_mode(capture_mode)?;
     if window_selection_requested && context.window_bounds.is_none() {
@@ -845,7 +1238,10 @@ fn resolve_capture_target(
     let use_window = match requested_mode {
         Some("window") => context.window_bounds.is_some(),
         Some("display") => false,
-        None => window_selection_requested,
+        None => {
+            window_selection_requested
+                || (prefer_window_when_available && context.window_bounds.is_some())
+        }
         Some(_) => false,
     };
 
@@ -951,7 +1347,12 @@ fn prepare_targeted_gui_action(
 
     let context = capture_context(app, true, window_selection)?;
     if capture_mode.is_some() || window_selection.is_some() {
-        let _ = resolve_capture_target(&context, capture_mode, window_selection.is_some())?;
+        let _ = resolve_capture_target(
+            &context,
+            capture_mode,
+            window_selection.is_some(),
+            app.is_some(),
+        )?;
     }
     Ok(())
 }
@@ -2239,7 +2640,7 @@ mod tests {
         };
 
         let capture =
-            resolve_capture_target(&context, Some("window"), true).expect("window capture");
+            resolve_capture_target(&context, Some("window"), true, true).expect("window capture");
 
         assert_eq!(capture.mode, "window");
         assert_eq!(capture.width, 800);
@@ -2255,6 +2656,93 @@ mod tests {
     }
 
     #[test]
+    fn resolve_capture_target_prefers_window_for_in_app_work_when_available() {
+        let context = HelperCaptureContext {
+            app_name: Some("Notes".to_string()),
+            cursor: HelperPoint { x: 10.0, y: 20.0 },
+            display: HelperDisplayDescriptor {
+                index: 1,
+                bounds: HelperRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1440.0,
+                    height: 900.0,
+                },
+            },
+            window_id: Some(42),
+            window_title: Some("Quick Note".to_string()),
+            window_bounds: Some(HelperRect {
+                x: 100.0,
+                y: 80.0,
+                width: 800.0,
+                height: 600.0,
+            }),
+            window_count: Some(1),
+            window_capture_strategy: Some("bounds".to_string()),
+        };
+
+        let capture = resolve_capture_target(&context, None, false, true)
+            .expect("window should be preferred for in-app work");
+
+        assert_eq!(capture.mode, "window");
+        assert_eq!(capture.width, 800);
+        assert_eq!(capture.height, 600);
+    }
+
+    #[test]
+    fn gui_wait_reuses_previous_window_observe_target_when_not_overridden() {
+        let previous = ObserveState {
+            capture_x: 0.0,
+            capture_y: 0.0,
+            width: 800,
+            height: 600,
+            app_name: Some("Notes".to_string()),
+            display_index: 1,
+            capture_mode: "window",
+            window_title: Some("Quick Note".to_string()),
+            window_count: Some(1),
+            window_capture_strategy: Some("bounds".to_string()),
+        };
+
+        let mut app = None;
+        let mut capture_mode = None;
+        let mut window_selection = None;
+
+        if app.is_none() && capture_mode.is_none() && window_selection.is_none() {
+            app = previous.app_name.clone();
+            capture_mode = Some(previous.capture_mode.to_string());
+            if previous.capture_mode == "window" {
+                window_selection = previous.window_title.as_ref().map(|title| WindowSelector {
+                    title: Some(title.clone()),
+                    title_contains: None,
+                    index: None,
+                });
+            }
+        }
+
+        assert_eq!(app.as_deref(), Some("Notes"));
+        assert_eq!(capture_mode.as_deref(), Some("window"));
+        assert_eq!(
+            window_selection.and_then(|selection| selection.title),
+            Some("Quick Note".to_string())
+        );
+    }
+
+    #[test]
+    fn should_attach_image_defaults_to_supported_modalities() {
+        assert_eq!(should_attach_image_with_support(true, None).unwrap(), true);
+        assert_eq!(
+            should_attach_image_with_support(false, None).unwrap(),
+            false
+        );
+        assert_eq!(
+            should_attach_image_with_support(true, Some(false)).unwrap(),
+            false
+        );
+        assert!(should_attach_image_with_support(false, Some(true)).is_err());
+    }
+
+    #[test]
     #[cfg(target_os = "macos")]
     #[ignore = "manual macOS GUI smoke test requiring Screen Recording and Accessibility permissions"]
     fn macos_gui_capture_smoke_test() {
@@ -2263,8 +2751,8 @@ mod tests {
 
         let context =
             capture_context(None, false, None).expect("capture context should be available");
-        let capture =
-            resolve_capture_target(&context, Some("display"), false).expect("display capture");
+        let capture = resolve_capture_target(&context, Some("display"), false, false)
+            .expect("display capture");
         let image_bytes =
             capture_region(&capture.bounds, capture.width, capture.height).expect("screenshot");
 
@@ -2291,5 +2779,24 @@ mod tests {
             &[("CODEX_GUI_SETTLE_MS", "1".to_string())],
         )
         .expect("move cursor event should succeed");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "manual macOS GUI smoke test requiring Screen Recording and Accessibility permissions"]
+    fn macos_gui_wait_smoke_test() {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
+        let context =
+            capture_context(None, false, None).expect("capture context should be available");
+        let capture = resolve_capture_target(&context, Some("display"), false, false)
+            .expect("display capture");
+        let image_bytes =
+            capture_region(&capture.bounds, capture.width, capture.height).expect("screenshot");
+
+        assert!(
+            !image_bytes.is_empty(),
+            "refreshed image should not be empty"
+        );
     }
 }

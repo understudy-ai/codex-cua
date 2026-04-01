@@ -47,7 +47,7 @@ fn with_capture_selection_properties(
         JsonSchema::String {
             description: Some(string_enum_description(
                 &["display", "window"],
-                "Use `window` to capture the active app window when available. Defaults to `display`.",
+                "Use `window` to capture the active app window when available. When omitted, GUI tools prefer `window` for in-app or window-targeted work and fall back to `display` otherwise.",
             )),
         },
     );
@@ -62,6 +62,30 @@ fn with_capture_selection_properties(
         );
     }
     properties.insert("window_selector".to_string(), window_selector_schema());
+    properties
+}
+
+fn with_post_action_evidence_properties(
+    mut properties: BTreeMap<String, JsonSchema>,
+) -> BTreeMap<String, JsonSchema> {
+    properties.insert(
+        "post_action_settle_ms".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "How long to wait before capturing post-action evidence. Defaults vary by tool."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "return_image".to_string(),
+        JsonSchema::Boolean {
+            description: Some(
+                "Whether to attach a post-action evidence screenshot. Defaults to true when image inputs are supported."
+                    .to_string(),
+            ),
+        },
+    );
     properties
 }
 
@@ -102,72 +126,124 @@ pub fn create_gui_observe_tool() -> ToolSpec {
     })
 }
 
+pub fn create_gui_wait_tool() -> ToolSpec {
+    let properties = with_capture_selection_properties(
+        BTreeMap::from([
+            (
+                "duration_ms".to_string(),
+                JsonSchema::Number {
+                    description: Some(
+                        "How long to wait before refreshing the GUI screenshot. Defaults to 1000."
+                            .to_string(),
+                    ),
+                },
+            ),
+            (
+                "app".to_string(),
+                JsonSchema::String {
+                    description: Some(
+                        "Optional macOS application name to activate before refreshing the screenshot. Defaults to the current frontmost app."
+                            .to_string(),
+                    ),
+                },
+            ),
+            (
+                "return_image".to_string(),
+                JsonSchema::Boolean {
+                    description: Some(
+                        "Whether to attach the refreshed screenshot image. Defaults to true."
+                            .to_string(),
+                    ),
+                },
+            ),
+        ]),
+        true,
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "gui_wait".to_string(),
+        description: "Wait briefly, then refresh the current macOS GUI screenshot so you can verify the next state after a GUI action. Reuses the previous gui_observe target when no explicit capture selection is provided."
+            .to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::Object {
+            properties,
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+        output_schema: None,
+    })
+}
+
 pub fn create_gui_click_tool() -> ToolSpec {
-    let properties = with_capture_selection_properties(BTreeMap::from([
-        (
-            "x".to_string(),
-            JsonSchema::Number {
-                description: Some(
-                    "Horizontal pixel coordinate measured from the top-left of the most recent gui_observe image."
-                        .to_string(),
-                ),
-            },
-        ),
-        (
-            "y".to_string(),
-            JsonSchema::Number {
-                description: Some(
-                    "Vertical pixel coordinate measured from the top-left of the most recent gui_observe image."
-                        .to_string(),
-                ),
-            },
-        ),
-        (
-            "button".to_string(),
-            JsonSchema::String {
-                description: Some(string_enum_description(
-                    &["left", "right", "none"],
-                    "Use `none` for hover-only pointer movement. Defaults to `left`.",
-                )),
-            },
-        ),
-        (
-            "clicks".to_string(),
-            JsonSchema::Number {
-                description: Some(
-                    "Number of clicks to send. Defaults to 1. Use 2 for a double-click."
-                        .to_string(),
-                ),
-            },
-        ),
-        (
-            "hold_ms".to_string(),
-            JsonSchema::Number {
-                description: Some(
-                    "Optional press-and-hold duration in milliseconds before releasing. Use this for long-press interactions."
-                        .to_string(),
-                ),
-            },
-        ),
-        (
-            "settle_ms".to_string(),
-            JsonSchema::Number {
-                description: Some(
-                    "Optional hover settle time in milliseconds when `button` is `none`. Defaults to 200."
-                        .to_string(),
-                ),
-            },
-        ),
-        (
-            "app".to_string(),
-            JsonSchema::String {
-                description: Some(
-                    "Optional macOS application name to activate before clicking."
-                        .to_string(),
-                ),
-            },
-        ),
-    ]), true);
+    let properties = with_post_action_evidence_properties(with_capture_selection_properties(
+        BTreeMap::from([
+            (
+                "x".to_string(),
+                JsonSchema::Number {
+                    description: Some(
+                        "Horizontal pixel coordinate measured from the top-left of the most recent gui_observe image."
+                            .to_string(),
+                    ),
+                },
+            ),
+            (
+                "y".to_string(),
+                JsonSchema::Number {
+                    description: Some(
+                        "Vertical pixel coordinate measured from the top-left of the most recent gui_observe image."
+                            .to_string(),
+                    ),
+                },
+            ),
+            (
+                "button".to_string(),
+                JsonSchema::String {
+                    description: Some(string_enum_description(
+                        &["left", "right", "none"],
+                        "Use `none` for hover-only pointer movement. Defaults to `left`.",
+                    )),
+                },
+            ),
+            (
+                "clicks".to_string(),
+                JsonSchema::Number {
+                    description: Some(
+                        "Number of clicks to send. Defaults to 1. Use 2 for a double-click."
+                            .to_string(),
+                    ),
+                },
+            ),
+            (
+                "hold_ms".to_string(),
+                JsonSchema::Number {
+                    description: Some(
+                        "Optional press-and-hold duration in milliseconds before releasing. Use this for long-press interactions."
+                            .to_string(),
+                    ),
+                },
+            ),
+            (
+                "settle_ms".to_string(),
+                JsonSchema::Number {
+                    description: Some(
+                        "Optional hover settle time in milliseconds when `button` is `none`. Defaults to 200."
+                            .to_string(),
+                    ),
+                },
+            ),
+            (
+                "app".to_string(),
+                JsonSchema::String {
+                    description: Some(
+                        "Optional macOS application name to activate before clicking."
+                            .to_string(),
+                    ),
+                },
+            ),
+        ]),
+        true,
+    ));
 
     ToolSpec::Function(ResponsesApiTool {
         name: "gui_click".to_string(),
@@ -186,7 +262,7 @@ pub fn create_gui_click_tool() -> ToolSpec {
 }
 
 pub fn create_gui_drag_tool() -> ToolSpec {
-    let properties = with_capture_selection_properties(BTreeMap::from([
+    let properties = with_post_action_evidence_properties(with_capture_selection_properties(BTreeMap::from([
         (
             "from_x".to_string(),
             JsonSchema::Number {
@@ -250,7 +326,7 @@ pub fn create_gui_drag_tool() -> ToolSpec {
                 ),
             },
         ),
-    ]), true);
+    ]), true));
 
     ToolSpec::Function(ResponsesApiTool {
         name: "gui_drag".to_string(),
@@ -274,7 +350,7 @@ pub fn create_gui_drag_tool() -> ToolSpec {
 }
 
 pub fn create_gui_scroll_tool() -> ToolSpec {
-    let properties = with_capture_selection_properties(BTreeMap::from([
+    let properties = with_post_action_evidence_properties(with_capture_selection_properties(BTreeMap::from([
         (
             "delta_y".to_string(),
             JsonSchema::Number {
@@ -329,7 +405,7 @@ pub fn create_gui_scroll_tool() -> ToolSpec {
                 ),
             },
         ),
-    ]), true);
+    ]), true));
 
     ToolSpec::Function(ResponsesApiTool {
         name: "gui_scroll".to_string(),
@@ -347,7 +423,7 @@ pub fn create_gui_scroll_tool() -> ToolSpec {
 }
 
 pub fn create_gui_type_tool() -> ToolSpec {
-    let properties = with_capture_selection_properties(BTreeMap::from([
+    let properties = with_post_action_evidence_properties(with_capture_selection_properties(BTreeMap::from([
         (
             "text".to_string(),
             JsonSchema::String {
@@ -415,7 +491,7 @@ pub fn create_gui_type_tool() -> ToolSpec {
                 ),
             },
         ),
-    ]), true);
+    ]), true));
 
     ToolSpec::Function(ResponsesApiTool {
         name: "gui_type".to_string(),
@@ -434,7 +510,7 @@ pub fn create_gui_type_tool() -> ToolSpec {
 }
 
 pub fn create_gui_key_tool() -> ToolSpec {
-    let properties = with_capture_selection_properties(
+    let properties = with_post_action_evidence_properties(with_capture_selection_properties(
         BTreeMap::from([
             (
                 "key".to_string(),
@@ -476,7 +552,7 @@ pub fn create_gui_key_tool() -> ToolSpec {
             ),
         ]),
         true,
-    );
+    ));
 
     ToolSpec::Function(ResponsesApiTool {
         name: "gui_key".to_string(),

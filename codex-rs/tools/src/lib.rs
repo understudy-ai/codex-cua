@@ -46,6 +46,7 @@ pub use gui_tool::create_gui_move_tool;
 pub use gui_tool::create_gui_observe_tool;
 pub use gui_tool::create_gui_scroll_tool;
 pub use gui_tool::create_gui_type_tool;
+pub use gui_tool::create_gui_wait_tool;
 pub use js_repl_tool::create_js_repl_reset_tool;
 pub use js_repl_tool::create_js_repl_tool;
 pub use json_schema::AdditionalProperties;

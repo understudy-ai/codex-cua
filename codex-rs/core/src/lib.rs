@@ -42,6 +42,7 @@ mod flags;
 #[cfg(test)]
 mod git_info_tests;
 mod guardian;
+mod gui_instructions;
 mod hook_runtime;
 pub mod instructions;
 pub mod landlock;

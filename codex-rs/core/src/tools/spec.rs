@@ -58,6 +58,7 @@ use codex_tools::create_gui_move_tool;
 use codex_tools::create_gui_observe_tool;
 use codex_tools::create_gui_scroll_tool;
 use codex_tools::create_gui_type_tool;
+use codex_tools::create_gui_wait_tool;
 use codex_tools::create_js_repl_reset_tool;
 use codex_tools::create_js_repl_tool;
 use codex_tools::create_list_agents_tool;
@@ -784,6 +785,12 @@ pub(crate) fn build_specs_with_discoverable_tools(
         );
         push_tool_spec(
             &mut builder,
+            create_gui_wait_tool(),
+            /*supports_parallel_tool_calls*/ false,
+            config.code_mode_enabled,
+        );
+        push_tool_spec(
+            &mut builder,
             create_gui_click_tool(),
             /*supports_parallel_tool_calls*/ false,
             config.code_mode_enabled,
@@ -819,6 +826,7 @@ pub(crate) fn build_specs_with_discoverable_tools(
             config.code_mode_enabled,
         );
         builder.register_handler("gui_observe", gui_handler.clone());
+        builder.register_handler("gui_wait", gui_handler.clone());
         builder.register_handler("gui_click", gui_handler.clone());
         builder.register_handler("gui_drag", gui_handler.clone());
         builder.register_handler("gui_scroll", gui_handler.clone());
