@@ -10,6 +10,7 @@ use codex_app_server_protocol::ThreadTokenUsage;
 use codex_app_server_protocol::TurnStatus;
 use codex_core::WireApi;
 use codex_core::config::Config;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::num_format::format_with_separators;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_protocol::protocol::SessionConfiguredEvent;
@@ -206,6 +207,44 @@ impl EventProcessorWithHumanOutput {
             _ => {}
         }
     }
+
+    fn render_raw_response_item_completed(&self, item: &ResponseItem) {
+        match item {
+            ResponseItem::FunctionCall {
+                name, namespace, ..
+            } => {
+                let label = namespace
+                    .as_deref()
+                    .map(|namespace| format!("{namespace}/{name}"))
+                    .unwrap_or_else(|| name.clone());
+                eprintln!(
+                    "{} {} {}",
+                    "tool:".style(self.bold),
+                    label.style(self.cyan),
+                    "started".style(self.dimmed)
+                );
+            }
+            ResponseItem::FunctionCallOutput { call_id, output } => {
+                let status_text = if output.success == Some(false) {
+                    "failed".style(self.red)
+                } else {
+                    "completed".style(self.green)
+                };
+                eprintln!(
+                    "{} {} {}",
+                    "tool call:".style(self.bold),
+                    call_id.style(self.cyan),
+                    format!("({status_text})").style(self.dimmed)
+                );
+                if let Some(text) = output.body.to_text()
+                    && !text.trim().is_empty()
+                {
+                    eprintln!("{}", text.style(self.dimmed));
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 impl EventProcessor for EventProcessorWithHumanOutput {
@@ -281,6 +320,10 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             }
             ServerNotification::ItemCompleted(notification) => {
                 self.render_item_completed(notification.item);
+                CodexStatus::Running
+            }
+            ServerNotification::RawResponseItemCompleted(notification) => {
+                self.render_raw_response_item_completed(&notification.item);
                 CodexStatus::Running
             }
             ServerNotification::ModelRerouted(notification) => {

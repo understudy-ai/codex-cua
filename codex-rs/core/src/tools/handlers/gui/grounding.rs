@@ -13,8 +13,9 @@ use image::DynamicImage;
 use image::GenericImageView;
 use image::ImageFormat;
 use image::Rgba;
+use serde::Deserialize;
+use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use super::CaptureArtifact;
@@ -638,7 +639,7 @@ pub(super) fn build_gui_grounding_refinement_prompt(
         },
         "single",
         &retry_notes,
-        false,
+        /*has_guide_image*/ false,
     )
 }
 
@@ -1559,13 +1560,13 @@ pub(super) async fn resolve_grounded_target(
     let mut final_raw: Option<JsonValue> = None;
     let mut final_validation: Option<(GroundingValidationResponse, JsonValue, String, usize)> =
         None;
-    let mut validation_zoom_context = false;
-    let mut validation_image_bytes_override: Option<Vec<u8>> = None;
-    let mut validation_state_override: Option<ObserveState> = None;
-    let mut validation_point_override: Option<HelperPoint> = None;
-    let mut validation_bbox_override: Option<GroundingBoundingBox> = None;
 
     for round in 1..=max_rounds {
+        let mut validation_zoom_context = false;
+        let mut validation_image_bytes_override: Option<Vec<u8>> = None;
+        let mut validation_state_override: Option<ObserveState> = None;
+        let mut validation_point_override: Option<HelperPoint> = None;
+        let mut validation_bbox_override: Option<GroundingBoundingBox> = None;
         let mut grounding_images = vec![ModelInputImage {
             bytes: &prepared_grounding_image.bytes,
             mime_type: prepared_grounding_image.mime_type,

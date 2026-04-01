@@ -14,14 +14,19 @@ use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadTokenUsage;
 use codex_app_server_protocol::TurnStatus;
 use codex_core::config::Config;
+use codex_protocol::models::FunctionCallOutputPayload;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::models::WebSearchAction;
 use codex_protocol::protocol::SessionConfiguredEvent;
+use serde_json::Value as JsonValue;
 use serde_json::json;
 
 pub use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
 use crate::event_processor::handle_last_message;
 use crate::exec_events::AgentMessageItem;
+use crate::exec_events::BuiltinToolCallItem;
+use crate::exec_events::BuiltinToolCallStatus;
 use crate::exec_events::CollabAgentState;
 use crate::exec_events::CollabAgentStatus;
 use crate::exec_events::CollabTool;
@@ -59,6 +64,7 @@ pub struct EventProcessorWithJsonOutput {
     last_message_path: Option<PathBuf>,
     next_item_id: AtomicU64,
     raw_to_exec_item_id: HashMap<String, String>,
+    running_builtin_tool_calls: HashMap<String, RunningBuiltinToolCall>,
     running_todo_list: Option<RunningTodoList>,
     last_total_token_usage: Option<ThreadTokenUsage>,
     last_critical_error: Option<ThreadErrorEvent>,
@@ -70,6 +76,14 @@ pub struct EventProcessorWithJsonOutput {
 struct RunningTodoList {
     item_id: String,
     items: Vec<TodoItem>,
+}
+
+#[derive(Debug, Clone)]
+struct RunningBuiltinToolCall {
+    item_id: String,
+    tool: String,
+    namespace: Option<String>,
+    arguments: JsonValue,
 }
 
 #[derive(Debug, PartialEq)]
@@ -84,6 +98,7 @@ impl EventProcessorWithJsonOutput {
             last_message_path,
             next_item_id: AtomicU64::new(0),
             raw_to_exec_item_id: HashMap::new(),
+            running_builtin_tool_calls: HashMap::new(),
             running_todo_list: None,
             last_total_token_usage: None,
             last_critical_error: None,
@@ -373,6 +388,78 @@ impl EventProcessorWithJsonOutput {
             .collect()
     }
 
+    fn parse_function_arguments(arguments: &str) -> JsonValue {
+        serde_json::from_str(arguments).unwrap_or_else(|_| JsonValue::String(arguments.to_string()))
+    }
+
+    fn serialize_function_output(output: &FunctionCallOutputPayload) -> JsonValue {
+        serde_json::to_value(&output.body).unwrap_or(JsonValue::Null)
+    }
+
+    fn map_raw_response_item_started(&mut self, item: ResponseItem) -> Option<ExecThreadItem> {
+        match item {
+            ResponseItem::FunctionCall {
+                name,
+                namespace,
+                arguments,
+                call_id,
+                ..
+            } => {
+                let item_id = self.next_item_id();
+                let arguments = Self::parse_function_arguments(&arguments);
+                self.running_builtin_tool_calls.insert(
+                    call_id.clone(),
+                    RunningBuiltinToolCall {
+                        item_id: item_id.clone(),
+                        tool: name.clone(),
+                        namespace: namespace.clone(),
+                        arguments: arguments.clone(),
+                    },
+                );
+                Some(ExecThreadItem {
+                    id: item_id,
+                    details: ThreadItemDetails::BuiltinToolCall(BuiltinToolCallItem {
+                        call_id,
+                        tool: name,
+                        namespace,
+                        arguments,
+                        output: None,
+                        success: None,
+                        status: BuiltinToolCallStatus::InProgress,
+                    }),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn map_raw_response_item_completed(&mut self, item: ResponseItem) -> Option<ExecThreadItem> {
+        match item {
+            ResponseItem::FunctionCallOutput { call_id, output } => {
+                let running = self.running_builtin_tool_calls.remove(&call_id)?;
+                let success = output.success;
+                let status = if success == Some(false) {
+                    BuiltinToolCallStatus::Failed
+                } else {
+                    BuiltinToolCallStatus::Completed
+                };
+                Some(ExecThreadItem {
+                    id: running.item_id,
+                    details: ThreadItemDetails::BuiltinToolCall(BuiltinToolCallItem {
+                        call_id,
+                        tool: running.tool,
+                        namespace: running.namespace,
+                        arguments: running.arguments,
+                        output: Some(Self::serialize_function_output(&output)),
+                        success,
+                        status,
+                    }),
+                })
+            }
+            _ => None,
+        }
+    }
+
     fn final_message_from_turn_items(items: &[ThreadItem]) -> Option<String> {
         items
             .iter()
@@ -471,6 +558,15 @@ impl EventProcessorWithJsonOutput {
                     {
                         self.final_message = Some(text.clone());
                     }
+                    events.push(ThreadEvent::ItemCompleted(ItemCompletedEvent { item }));
+                }
+                CodexStatus::Running
+            }
+            ServerNotification::RawResponseItemCompleted(notification) => {
+                if let Some(item) = self.map_raw_response_item_started(notification.item.clone()) {
+                    events.push(ThreadEvent::ItemStarted(ItemStartedEvent { item }));
+                }
+                if let Some(item) = self.map_raw_response_item_completed(notification.item) {
                     events.push(ThreadEvent::ItemCompleted(ItemCompletedEvent { item }));
                 }
                 CodexStatus::Running
@@ -623,6 +719,9 @@ impl EventProcessor for EventProcessorWithJsonOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_app_server_protocol::RawResponseItemCompletedNotification;
+    use codex_protocol::models::FunctionCallOutputPayload;
+    use codex_protocol::models::ResponseItem;
     use pretty_assertions::assert_eq;
     use tempfile::tempdir;
 
@@ -674,6 +773,87 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&output_path).expect("read output file"),
             "keep existing contents"
+        );
+    }
+
+    #[test]
+    fn emits_builtin_function_tool_call_events_from_raw_response_items() {
+        let mut processor = EventProcessorWithJsonOutput::new(None);
+
+        let started = processor.collect_thread_events(
+            ServerNotification::RawResponseItemCompleted(RawResponseItemCompletedNotification {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                item: ResponseItem::FunctionCall {
+                    id: None,
+                    name: "gui_observe".to_string(),
+                    namespace: Some("builtin".to_string()),
+                    arguments: r#"{"app":"TextEdit","capture_mode":"window"}"#.to_string(),
+                    call_id: "call-1".to_string(),
+                },
+            }),
+        );
+
+        assert_eq!(started.status, CodexStatus::Running);
+        assert_eq!(started.events.len(), 1);
+        let started_item = match &started.events[0] {
+            ThreadEvent::ItemStarted(ItemStartedEvent { item }) => item,
+            other => panic!("expected item.started event, got {other:?}"),
+        };
+        assert_eq!(started_item.id, "item_0");
+        assert_eq!(
+            started_item.details,
+            ThreadItemDetails::BuiltinToolCall(BuiltinToolCallItem {
+                call_id: "call-1".to_string(),
+                tool: "gui_observe".to_string(),
+                namespace: Some("builtin".to_string()),
+                arguments: json!({
+                    "app": "TextEdit",
+                    "capture_mode": "window",
+                }),
+                output: None,
+                success: None,
+                status: BuiltinToolCallStatus::InProgress,
+            })
+        );
+
+        let completed = processor.collect_thread_events(
+            ServerNotification::RawResponseItemCompleted(RawResponseItemCompletedNotification {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                item: ResponseItem::FunctionCallOutput {
+                    call_id: "call-1".to_string(),
+                    output: FunctionCallOutputPayload {
+                        body: codex_protocol::models::FunctionCallOutputBody::Text(
+                            "{\"code\":\"observed\"}".to_string(),
+                        ),
+                        success: Some(true),
+                    },
+                },
+            }),
+        );
+
+        assert_eq!(completed.status, CodexStatus::Running);
+        assert_eq!(completed.events.len(), 1);
+        let completed_item = match &completed.events[0] {
+            ThreadEvent::ItemCompleted(ItemCompletedEvent { item }) => item,
+            other => panic!("expected item.completed event, got {other:?}"),
+        };
+        assert_eq!(completed_item.id, "item_0");
+        assert_eq!(
+            completed_item.details,
+            ThreadItemDetails::BuiltinToolCall(BuiltinToolCallItem {
+                call_id: "call-1".to_string(),
+                tool: "gui_observe".to_string(),
+                namespace: Some("builtin".to_string()),
+                arguments: json!({
+                    "app": "TextEdit",
+                    "capture_mode": "window",
+                }),
+                output: Some(json!("{\"code\":\"observed\"}")),
+                success: Some(true),
+                status: BuiltinToolCallStatus::Completed,
+            })
         );
     }
 }

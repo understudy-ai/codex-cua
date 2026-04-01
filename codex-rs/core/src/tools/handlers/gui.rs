@@ -15,7 +15,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
 use tokio::time::Duration;
+use tokio::time::Instant;
 use tokio::time::sleep;
+use tokio::time::timeout;
 
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
@@ -57,6 +59,7 @@ const DEFAULT_GUI_WAIT_INTERVAL_MS: i64 = 350;
 const WAIT_CONFIRMATION_COUNT: i64 = 2;
 const DEFAULT_POST_ACTION_SETTLE_MS: i64 = 3000;
 const DEFAULT_POST_TYPE_SETTLE_MS: i64 = 500;
+const DEFAULT_TYPE_FOCUS_SETTLE_MS: i64 = 180;
 const DEFAULT_TARGETED_SCROLL_DISTANCE: &str = "medium";
 const DEFAULT_TARGETLESS_SCROLL_DISTANCE: &str = "page";
 
@@ -312,6 +315,7 @@ struct ResolvedTarget {
 struct TargetProbe {
     capture_state: ObserveState,
     target: Option<ResolvedTarget>,
+    timed_out: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -440,12 +444,6 @@ impl GuiHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<GuiToolOutput, FunctionCallError> {
-        if !supports_image_input(&invocation) {
-            return Err(FunctionCallError::RespondToModel(
-                GUI_IMAGE_UNSUPPORTED_MESSAGE.to_string(),
-            ));
-        }
-
         let args = parse_function_args::<ObserveArgs>(&invocation.payload)?;
         let window_selection = normalize_window_selection(
             args.window_title.as_deref(),
@@ -454,15 +452,18 @@ impl GuiHandler {
         let semantic_target = normalize_optional_string(args.target.as_deref());
         let location_hint = normalize_optional_string(args.location_hint.as_deref());
         let scope = normalize_optional_string(args.scope.as_deref());
-        enforce_gui_tool_capability(&invocation, "gui_observe", semantic_target.is_some())?;
+        let attach_image = prepare_gui_observe_request(
+            &invocation,
+            semantic_target.is_some(),
+            args.return_image,
+        )?;
         let observation = observe_platform(
             args.app.as_deref(),
-            true,
+            /*activate_app*/ true,
             args.capture_mode.as_deref(),
             window_selection.as_ref(),
             args.app.as_deref().is_some(),
         )?;
-        let image_url = data_url_png(&observation.image_bytes);
         let state = observation.state;
         self.observe_state
             .lock()
@@ -471,8 +472,7 @@ impl GuiHandler {
                 invocation.session.conversation_id.to_string(),
                 state.clone(),
             );
-        let attach_image = args.return_image.unwrap_or(true);
-        let image_output = attach_image.then_some(image_url);
+        let image_output = attach_image.then(|| data_url_png(&observation.image_bytes));
         let app_label = state
             .app_name
             .as_ref()
@@ -1314,6 +1314,22 @@ impl GuiHandler {
         let scope = normalize_optional_string(args.scope.as_deref());
         enforce_gui_tool_capability(&invocation, "gui_type", semantic_target.is_some())?;
         let strategy = normalize_optional_string(args.type_strategy.as_deref());
+        if let Some(strategy) = strategy.as_deref()
+            && !matches!(
+                strategy,
+                "clipboard_paste"
+                    | "physical_keys"
+                    | "system_events_paste"
+                    | "system_events_keystroke"
+                    | "system_events_keystroke_chars"
+            )
+        {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "gui_type.type_strategy only supports `clipboard_paste`, `physical_keys`, `system_events_paste`, `system_events_keystroke`, or `system_events_keystroke_chars`, got `{strategy}`"
+            )));
+        }
+        action_session.throw_if_emergency_stopped()?;
+
         let mut target_details = None;
         let mut executed_point = None;
         let mut pre_action_capture = None;
@@ -1344,16 +1360,20 @@ impl GuiHandler {
             })?;
             let details = build_target_resolution_details(target, &grounded);
             let resolved = grounded.resolved;
+            let focus_point = targeted_type_focus_point(&resolved);
             run_gui_event(
                 "click",
                 args.app.as_deref(),
                 &[
-                    ("CODEX_GUI_X", resolved.point.x),
-                    ("CODEX_GUI_Y", resolved.point.y),
+                    ("CODEX_GUI_X", focus_point.x),
+                    ("CODEX_GUI_Y", focus_point.y),
                 ],
                 &[],
             )?;
-            executed_point = Some((resolved.point.x, resolved.point.y));
+            action_session.throw_if_emergency_stopped()?;
+            sleep(Duration::from_millis(DEFAULT_TYPE_FOCUS_SETTLE_MS as u64)).await;
+            action_session.throw_if_emergency_stopped()?;
+            executed_point = Some((focus_point.x, focus_point.y));
             pre_action_capture = Some(build_capture_details_from_state(&resolved.capture_state));
             target_details = Some(details);
         } else {
@@ -1362,22 +1382,8 @@ impl GuiHandler {
                 args.capture_mode.as_deref(),
                 window_selection.as_ref(),
             )?;
+            action_session.throw_if_emergency_stopped()?;
         }
-        if let Some(strategy) = strategy.as_deref()
-            && !matches!(
-                strategy,
-                "clipboard_paste"
-                    | "physical_keys"
-                    | "system_events_paste"
-                    | "system_events_keystroke"
-                    | "system_events_keystroke_chars"
-            )
-        {
-            return Err(FunctionCallError::RespondToModel(format!(
-                "gui_type.type_strategy only supports `clipboard_paste`, `physical_keys`, `system_events_paste`, `system_events_keystroke`, or `system_events_keystroke_chars`, got `{strategy}`"
-            )));
-        }
-        action_session.throw_if_emergency_stopped()?;
 
         let replace = args.replace.unwrap_or(true);
         let submit = args.submit.unwrap_or(false);
@@ -1782,6 +1788,55 @@ impl GuiHandler {
         Ok(TargetProbe {
             capture_state,
             target,
+            timed_out: false,
+        })
+    }
+
+    async fn probe_semantic_target_before_deadline(
+        &self,
+        invocation: &ToolInvocation,
+        request: GuiTargetRequest<'_>,
+        deadline: Instant,
+    ) -> Result<TargetProbe, FunctionCallError> {
+        let observation = observe_platform(
+            request.app,
+            true,
+            request.capture_mode,
+            request.window_selection,
+            request.app.is_some(),
+        )?;
+        let capture_state = observation.state;
+        let Some(remaining) = remaining_wait_budget_duration(deadline) else {
+            return Ok(TargetProbe {
+                capture_state,
+                target: None,
+                timed_out: true,
+            });
+        };
+        let target = match timeout(
+            remaining,
+            self.ground_target(
+                invocation,
+                request,
+                &capture_state,
+                &observation.image_bytes,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                return Ok(TargetProbe {
+                    capture_state,
+                    target: None,
+                    timed_out: true,
+                });
+            }
+        };
+        Ok(TargetProbe {
+            capture_state,
+            target,
+            timed_out: false,
         })
     }
 
@@ -1891,15 +1946,16 @@ impl GuiHandler {
         interval_ms: i64,
     ) -> Result<GuiTargetProbeResult, FunctionCallError> {
         let attach_image = supports_image_input(invocation);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
         let mut attempts = 0;
-        let mut elapsed_ms = 0;
         let initial_probe = self
-            .probe_semantic_target(
+            .probe_semantic_target_before_deadline(
                 invocation,
                 GuiTargetRequest {
                     capture_mode: fallback_probe_capture_mode(request.capture_mode, 1, request.app),
                     ..request
                 },
+                deadline,
             )
             .await?;
         let mut last_grounded = initial_probe.target.map(|resolved| GroundedGuiTarget {
@@ -1908,6 +1964,7 @@ impl GuiHandler {
         });
         attempts += 1;
         let mut current_state = initial_probe.capture_state;
+        let mut budget_exhausted = initial_probe.timed_out;
         let initial_satisfied = match state {
             "appear" => last_grounded.is_some(),
             "disappear" => last_grounded.is_none(),
@@ -1916,12 +1973,17 @@ impl GuiHandler {
         let mut consecutive_satisfied = if initial_satisfied { 1 } else { 0 };
         let mut matched = consecutive_satisfied >= WAIT_CONFIRMATION_COUNT;
 
-        while !matched && elapsed_ms < timeout_ms {
-            let sleep_ms = (timeout_ms - elapsed_ms).min(interval_ms);
+        while !matched && !budget_exhausted {
+            let Some(remaining_ms) = remaining_wait_budget_ms(deadline) else {
+                break;
+            };
+            let sleep_ms = remaining_ms.min(interval_ms);
             sleep(Duration::from_millis(sleep_ms as u64)).await;
-            elapsed_ms += sleep_ms;
+            let Some(_) = remaining_wait_budget_ms(deadline) else {
+                break;
+            };
             let probe = self
-                .probe_semantic_target(
+                .probe_semantic_target_before_deadline(
                     invocation,
                     GuiTargetRequest {
                         capture_mode: fallback_probe_capture_mode(
@@ -1931,6 +1993,7 @@ impl GuiHandler {
                         ),
                         ..request
                     },
+                    deadline,
                 )
                 .await?;
             current_state = probe.capture_state.clone();
@@ -1939,6 +2002,10 @@ impl GuiHandler {
                 resolved,
             });
             attempts += 1;
+            budget_exhausted = probe.timed_out;
+            if budget_exhausted {
+                break;
+            }
             let satisfied = match state {
                 "appear" => last_grounded.is_some(),
                 "disappear" => last_grounded.is_none(),
@@ -1996,6 +2063,15 @@ fn supports_image_input(invocation: &ToolInvocation) -> bool {
         .contains(&InputModality::Image)
 }
 
+fn prepare_gui_observe_request(
+    invocation: &ToolInvocation,
+    targeted: bool,
+    return_image: Option<bool>,
+) -> Result<bool, FunctionCallError> {
+    enforce_gui_tool_capability(invocation, "gui_observe", targeted)?;
+    Ok(return_image.unwrap_or(true) && supports_image_input(invocation))
+}
+
 fn normalize_wait_target_state(state: Option<&str>) -> Result<&'static str, FunctionCallError> {
     match state.map(str::trim).filter(|value| !value.is_empty()) {
         None => Ok("appear"),
@@ -2021,6 +2097,19 @@ fn normalize_grounding_mode(
         Some(other) => Err(FunctionCallError::RespondToModel(format!(
             "{action}.grounding_mode only supports `single` or `complex`, got `{other}`"
         ))),
+    }
+}
+
+fn remaining_wait_budget_ms(deadline: Instant) -> Option<i64> {
+    remaining_wait_budget_duration(deadline).map(|duration| duration.as_millis() as i64)
+}
+
+fn remaining_wait_budget_duration(deadline: Instant) -> Option<Duration> {
+    let now = Instant::now();
+    if now >= deadline {
+        None
+    } else {
+        Some(deadline.duration_since(now))
     }
 }
 
@@ -2160,11 +2249,27 @@ fn resolve_scroll_plan(
 
 fn scroll_delta_components(direction: ScrollDirection, amount: i64) -> (i64, i64) {
     match direction {
-        ScrollDirection::Up => (0, -amount),
-        ScrollDirection::Down => (0, amount),
+        ScrollDirection::Up => (0, amount),
+        ScrollDirection::Down => (0, -amount),
         ScrollDirection::Left => (-amount, 0),
         ScrollDirection::Right => (amount, 0),
     }
+}
+
+fn targeted_type_focus_point(resolved: &ResolvedTarget) -> HelperPoint {
+    let bounds = &resolved.bounds;
+    if bounds.width.is_finite()
+        && bounds.height.is_finite()
+        && bounds.width > 0.0
+        && bounds.height > 0.0
+    {
+        return HelperPoint {
+            x: bounds.x + (bounds.width / 2.0),
+            y: bounds.y + (bounds.height / 2.0),
+        };
+    }
+
+    resolved.point.clone()
 }
 
 fn scroll_direction_label(direction: ScrollDirection) -> &'static str {

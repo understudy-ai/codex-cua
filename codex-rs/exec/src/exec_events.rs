@@ -114,6 +114,10 @@ pub enum ThreadItemDetails {
     /// Represents a call to an MCP tool. The item starts when the invocation is
     /// dispatched and completes when the MCP server reports success or failure.
     McpToolCall(McpToolCallItem),
+    /// Represents a built-in function tool call such as native GUI tools. The
+    /// item starts when the model emits a function call and completes when the
+    /// corresponding function call output arrives.
+    BuiltinToolCall(BuiltinToolCallItem),
     /// Represents a call to a collab tool. The item starts when the collab tool is
     /// invoked and completes when the collab tool reports success or failure.
     CollabToolCall(CollabToolCallItem),
@@ -202,6 +206,16 @@ pub enum McpToolCallStatus {
     Failed,
 }
 
+/// The status of a built-in function tool call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum BuiltinToolCallStatus {
+    #[default]
+    InProgress,
+    Completed,
+    Failed,
+}
+
 /// The status of a collab tool call.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, TS)]
 #[serde(rename_all = "snake_case")]
@@ -283,6 +297,19 @@ pub struct McpToolCallItem {
     pub result: Option<McpToolCallItemResult>,
     pub error: Option<McpToolCallItemError>,
     pub status: McpToolCallStatus,
+}
+
+/// A call to a built-in function tool.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+pub struct BuiltinToolCallItem {
+    pub call_id: String,
+    pub tool: String,
+    pub namespace: Option<String>,
+    #[serde(default)]
+    pub arguments: JsonValue,
+    pub output: Option<JsonValue>,
+    pub success: Option<bool>,
+    pub status: BuiltinToolCallStatus,
 }
 
 /// A web search request.
