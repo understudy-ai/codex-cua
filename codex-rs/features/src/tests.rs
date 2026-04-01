@@ -151,6 +151,26 @@ fn image_generation_is_under_development() {
 }
 
 #[test]
+fn gui_tools_is_experimental_and_user_toggleable() {
+    let spec = Feature::GuiTools.info();
+    let stage = spec.stage;
+
+    assert!(matches!(stage, Stage::Experimental { .. }));
+    assert_eq!(stage.experimental_menu_name(), Some("Native GUI Tools"));
+    assert_eq!(
+        stage.experimental_menu_description(),
+        Some(
+            "Enable native macOS GUI screenshot, click, drag, scroll, typing, and keypress tools for direct desktop interaction."
+        )
+    );
+    assert_eq!(
+        stage.experimental_announcement(),
+        Some("NEW: Native GUI Tools are now available in /experimental on macOS.")
+    );
+    assert_eq!(Feature::GuiTools.default_enabled(), false);
+}
+
+#[test]
 fn tool_call_mcp_elicitation_is_stable_and_enabled_by_default() {
     assert_eq!(Feature::ToolCallMcpElicitation.stage(), Stage::Stable);
     assert_eq!(Feature::ToolCallMcpElicitation.default_enabled(), true);

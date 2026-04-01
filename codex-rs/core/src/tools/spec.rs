@@ -51,6 +51,13 @@ use codex_tools::create_close_agent_tool_v1;
 use codex_tools::create_close_agent_tool_v2;
 use codex_tools::create_code_mode_tool;
 use codex_tools::create_exec_command_tool;
+use codex_tools::create_gui_click_tool;
+use codex_tools::create_gui_drag_tool;
+use codex_tools::create_gui_key_tool;
+use codex_tools::create_gui_move_tool;
+use codex_tools::create_gui_observe_tool;
+use codex_tools::create_gui_scroll_tool;
+use codex_tools::create_gui_type_tool;
 use codex_tools::create_js_repl_reset_tool;
 use codex_tools::create_js_repl_tool;
 use codex_tools::create_list_agents_tool;
@@ -154,6 +161,7 @@ pub(crate) struct ToolsConfig {
     pub web_search_config: Option<WebSearchConfig>,
     pub web_search_tool_type: WebSearchToolType,
     pub image_gen_tool: bool,
+    pub gui_tools: bool,
     pub agent_roles: BTreeMap<String, AgentRoleConfig>,
     pub search_tool: bool,
     pub tool_suggest: bool,
@@ -227,6 +235,7 @@ impl ToolsConfig {
         let include_original_image_detail = can_request_original_image_detail(features, model_info);
         let include_image_gen_tool =
             features.enabled(Feature::ImageGeneration) && supports_image_generation(model_info);
+        let include_gui_tools = features.enabled(Feature::GuiTools);
         let exec_permission_approvals_enabled = features.enabled(Feature::ExecPermissionApprovals);
         let request_permissions_tool_enabled = features.enabled(Feature::RequestPermissionsTool);
         let shell_command_backend =
@@ -288,6 +297,7 @@ impl ToolsConfig {
             web_search_config: None,
             web_search_tool_type: model_info.web_search_tool_type,
             image_gen_tool: include_image_gen_tool,
+            gui_tools: include_gui_tools,
             agent_roles: BTreeMap::new(),
             search_tool: include_search_tool,
             tool_suggest: include_tool_suggest,
@@ -410,6 +420,7 @@ pub(crate) fn build_specs_with_discoverable_tools(
     use crate::tools::handlers::CodeModeExecuteHandler;
     use crate::tools::handlers::CodeModeWaitHandler;
     use crate::tools::handlers::DynamicToolHandler;
+    use crate::tools::handlers::GuiHandler;
     use crate::tools::handlers::JsReplHandler;
     use crate::tools::handlers::JsReplResetHandler;
     use crate::tools::handlers::ListDirHandler;
@@ -445,6 +456,7 @@ pub(crate) fn build_specs_with_discoverable_tools(
     let plan_handler = Arc::new(PlanHandler);
     let apply_patch_handler = Arc::new(ApplyPatchHandler);
     let dynamic_tool_handler = Arc::new(DynamicToolHandler);
+    let gui_handler = Arc::new(GuiHandler::default());
     let view_image_handler = Arc::new(ViewImageHandler);
     let mcp_handler = Arc::new(McpHandler);
     let mcp_resource_handler = Arc::new(McpResourceHandler);
@@ -761,6 +773,58 @@ pub(crate) fn build_specs_with_discoverable_tools(
             /*supports_parallel_tool_calls*/ false,
             config.code_mode_enabled,
         );
+    }
+
+    if config.gui_tools {
+        push_tool_spec(
+            &mut builder,
+            create_gui_observe_tool(),
+            /*supports_parallel_tool_calls*/ false,
+            config.code_mode_enabled,
+        );
+        push_tool_spec(
+            &mut builder,
+            create_gui_click_tool(),
+            /*supports_parallel_tool_calls*/ false,
+            config.code_mode_enabled,
+        );
+        push_tool_spec(
+            &mut builder,
+            create_gui_drag_tool(),
+            /*supports_parallel_tool_calls*/ false,
+            config.code_mode_enabled,
+        );
+        push_tool_spec(
+            &mut builder,
+            create_gui_scroll_tool(),
+            /*supports_parallel_tool_calls*/ false,
+            config.code_mode_enabled,
+        );
+        push_tool_spec(
+            &mut builder,
+            create_gui_type_tool(),
+            /*supports_parallel_tool_calls*/ false,
+            config.code_mode_enabled,
+        );
+        push_tool_spec(
+            &mut builder,
+            create_gui_key_tool(),
+            /*supports_parallel_tool_calls*/ false,
+            config.code_mode_enabled,
+        );
+        push_tool_spec(
+            &mut builder,
+            create_gui_move_tool(),
+            /*supports_parallel_tool_calls*/ false,
+            config.code_mode_enabled,
+        );
+        builder.register_handler("gui_observe", gui_handler.clone());
+        builder.register_handler("gui_click", gui_handler.clone());
+        builder.register_handler("gui_drag", gui_handler.clone());
+        builder.register_handler("gui_scroll", gui_handler.clone());
+        builder.register_handler("gui_type", gui_handler.clone());
+        builder.register_handler("gui_key", gui_handler.clone());
+        builder.register_handler("gui_move", gui_handler);
     }
 
     push_tool_spec(
