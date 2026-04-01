@@ -65,30 +65,6 @@ fn with_capture_selection_properties(
     properties
 }
 
-fn with_post_action_evidence_properties(
-    mut properties: BTreeMap<String, JsonSchema>,
-) -> BTreeMap<String, JsonSchema> {
-    properties.insert(
-        "post_action_settle_ms".to_string(),
-        JsonSchema::Number {
-            description: Some(
-                "How long to wait before capturing post-action evidence. Defaults vary by tool."
-                    .to_string(),
-            ),
-        },
-    );
-    properties.insert(
-        "return_image".to_string(),
-        JsonSchema::Boolean {
-            description: Some(
-                "Whether to attach a post-action evidence screenshot. Defaults to true when image inputs are supported."
-                    .to_string(),
-            ),
-        },
-    );
-    properties
-}
-
 fn with_target_properties(
     mut properties: BTreeMap<String, JsonSchema>,
     action_description: &str,
@@ -124,7 +100,7 @@ fn with_target_properties(
         JsonSchema::String {
             description: Some(string_enum_description(
                 &["single", "complex"],
-                "Optional grounding hint. `single` suits simple isolated controls; `complex` suits dense or ambiguous layouts.",
+                "Optional grounding hint. `single` suits simple isolated controls; `complex` enables the heavier validation and retry path for dense or ambiguous layouts.",
             )),
         },
     );
@@ -139,7 +115,7 @@ fn with_drag_target_properties(
         JsonSchema::String {
             description: Some(string_enum_description(
                 &["single", "complex"],
-                "Optional grounding hint shared by drag source and destination. `single` suits simple isolated controls; `complex` suits dense or ambiguous layouts.",
+                "Optional grounding hint shared by drag source and destination. `single` suits simple isolated controls; `complex` enables the heavier validation and retry path for dense or ambiguous layouts.",
             )),
         },
     );
@@ -208,7 +184,7 @@ pub fn create_gui_observe_tool() -> ToolSpec {
                     "app".to_string(),
                     JsonSchema::String {
                         description: Some(
-                            "Optional macOS application name to activate before capturing. Defaults to the current frontmost app."
+                            "Optional application name to activate before capturing. Defaults to the current frontmost app."
                                 .to_string(),
                         ),
                     },
@@ -230,7 +206,7 @@ pub fn create_gui_observe_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "gui_observe".to_string(),
-        description: "Capture a screenshot of the current macOS GUI. Use this before GUI actions to inspect state and obtain the coordinate space for other gui_* tools. Supports display-wide capture and focused-window capture, and can also resolve a semantic `target` within the observed GUI."
+        description: "Capture a screenshot of the current native GUI surface for visual inspection and follow-up GUI grounding. Supports display-wide capture and focused-window capture, and can also resolve a semantic `target` within the observed GUI."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -247,20 +223,11 @@ pub fn create_gui_wait_tool() -> ToolSpec {
     let properties = with_target_properties(with_capture_selection_properties(
         BTreeMap::from([
             (
-                "duration_ms".to_string(),
-                JsonSchema::Number {
-                    description: Some(
-                        "How long to wait before refreshing the GUI screenshot. Defaults to 1000."
-                            .to_string(),
-                    ),
-                },
-            ),
-            (
                 "state".to_string(),
                 JsonSchema::String {
                     description: Some(string_enum_description(
                         &["appear", "disappear"],
-                        "Only used when `target` is provided. Defaults to `appear`.",
+                        "Defaults to `appear`.",
                     )),
                 },
             ),
@@ -268,7 +235,7 @@ pub fn create_gui_wait_tool() -> ToolSpec {
                 "timeout_ms".to_string(),
                 JsonSchema::Number {
                     description: Some(
-                        "Maximum time to wait for `target` to satisfy `state`. Only used when `target` is provided. Defaults to 5000."
+                        "Maximum time to wait for `target` to satisfy `state`. Defaults to 8000."
                             .to_string(),
                     ),
                 },
@@ -277,7 +244,7 @@ pub fn create_gui_wait_tool() -> ToolSpec {
                 "interval_ms".to_string(),
                 JsonSchema::Number {
                     description: Some(
-                        "Polling interval between semantic target checks. Only used when `target` is provided. Defaults to 500."
+                        "Polling interval between semantic target checks. Defaults to 350."
                             .to_string(),
                     ),
                 },
@@ -286,16 +253,7 @@ pub fn create_gui_wait_tool() -> ToolSpec {
                 "app".to_string(),
                 JsonSchema::String {
                     description: Some(
-                        "Optional macOS application name to activate before refreshing the screenshot. Defaults to the current frontmost app."
-                            .to_string(),
-                    ),
-                },
-            ),
-            (
-                "return_image".to_string(),
-                JsonSchema::Boolean {
-                    description: Some(
-                        "Whether to attach the refreshed screenshot image. Defaults to true."
+                        "Optional application name to activate before refreshing the screenshot. Defaults to the current frontmost app."
                             .to_string(),
                     ),
                 },
@@ -306,13 +264,13 @@ pub fn create_gui_wait_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "gui_wait".to_string(),
-        description: "Wait briefly, then refresh the current macOS GUI screenshot so you can verify the next state after a GUI action. Reuses the previous gui_observe target when no explicit capture selection is provided, and can also wait for a semantic GUI target to appear or disappear."
+        description: "Repeatedly refresh the current native GUI screenshot until a semantic target appears or disappears. Uses consecutive confirmations for stability and reuses the previous gui_observe capture selection when no explicit capture selection is provided."
             .to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::Object {
             properties,
-            required: None,
+            required: Some(vec!["target".to_string()]),
             additional_properties: Some(false.into()),
         },
         output_schema: None,
@@ -321,26 +279,8 @@ pub fn create_gui_wait_tool() -> ToolSpec {
 
 pub fn create_gui_click_tool() -> ToolSpec {
     let properties = with_target_properties(
-        with_post_action_evidence_properties(with_capture_selection_properties(
+        with_capture_selection_properties(
             BTreeMap::from([
-                (
-                    "x".to_string(),
-                    JsonSchema::Number {
-                        description: Some(
-                            "Horizontal pixel coordinate measured from the top-left of the most recent gui_observe image."
-                                .to_string(),
-                        ),
-                    },
-                ),
-                (
-                    "y".to_string(),
-                    JsonSchema::Number {
-                        description: Some(
-                            "Vertical pixel coordinate measured from the top-left of the most recent gui_observe image."
-                                .to_string(),
-                        ),
-                    },
-                ),
                 (
                     "button".to_string(),
                     JsonSchema::String {
@@ -381,96 +321,7 @@ pub fn create_gui_click_tool() -> ToolSpec {
                     "app".to_string(),
                     JsonSchema::String {
                         description: Some(
-                            "Optional macOS application name to activate before clicking."
-                                .to_string(),
-                        ),
-                    },
-                ),
-            ]),
-            true,
-        )),
-        "clicking or hovering",
-    );
-
-    ToolSpec::Function(ResponsesApiTool {
-        name: "gui_click".to_string(),
-        description:
-            "Click, right-click, double-click, hover, or click-and-hold at a coordinate in the current macOS GUI. Coordinates are interpreted in the coordinate space returned by gui_observe, or you can provide `target` to resolve a semantic control first."
-                .to_string(),
-        strict: false,
-        defer_loading: None,
-        parameters: JsonSchema::Object {
-            properties,
-            required: None,
-            additional_properties: Some(false.into()),
-        },
-        output_schema: None,
-    })
-}
-
-pub fn create_gui_drag_tool() -> ToolSpec {
-    let properties = with_drag_target_properties(with_post_action_evidence_properties(
-        with_capture_selection_properties(
-            BTreeMap::from([
-                (
-                    "from_x".to_string(),
-                    JsonSchema::Number {
-                        description: Some(
-                            "Optional horizontal drag start coordinate measured from the top-left of the most recent gui_observe image."
-                                .to_string(),
-                        ),
-                    },
-                ),
-                (
-                    "from_y".to_string(),
-                    JsonSchema::Number {
-                        description: Some(
-                            "Optional vertical drag start coordinate measured from the top-left of the most recent gui_observe image."
-                                .to_string(),
-                        ),
-                    },
-                ),
-                (
-                    "to_x".to_string(),
-                    JsonSchema::Number {
-                        description: Some(
-                            "Optional horizontal drag destination coordinate measured from the top-left of the most recent gui_observe image."
-                                .to_string(),
-                        ),
-                    },
-                ),
-                (
-                    "to_y".to_string(),
-                    JsonSchema::Number {
-                        description: Some(
-                            "Optional vertical drag destination coordinate measured from the top-left of the most recent gui_observe image."
-                                .to_string(),
-                        ),
-                    },
-                ),
-                (
-                    "duration_ms".to_string(),
-                    JsonSchema::Number {
-                        description: Some(
-                            "Optional drag duration in milliseconds. Defaults to 450."
-                                .to_string(),
-                        ),
-                    },
-                ),
-                (
-                    "steps".to_string(),
-                    JsonSchema::Number {
-                        description: Some(
-                            "Optional number of interpolation steps. Defaults to 24."
-                                .to_string(),
-                        ),
-                    },
-                ),
-                (
-                    "app".to_string(),
-                    JsonSchema::String {
-                        description: Some(
-                            "Optional macOS application name to activate before dragging."
+                            "Optional application name to activate before clicking."
                                 .to_string(),
                         ),
                     },
@@ -478,18 +329,58 @@ pub fn create_gui_drag_tool() -> ToolSpec {
             ]),
             true,
         ),
-    ));
+        "clicking or hovering",
+    );
 
     ToolSpec::Function(ResponsesApiTool {
-        name: "gui_drag".to_string(),
+        name: "gui_click".to_string(),
         description:
-            "Drag between two points in the current macOS GUI. You can provide semantic `from_target` and `to_target`, or fall back to coordinate pairs measured in the coordinate space returned by gui_observe."
+            "Click, right-click, double-click, hover, or click-and-hold on a semantic target in the current native GUI."
                 .to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::Object {
             properties,
-            required: None,
+            required: Some(vec!["target".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+        output_schema: None,
+    })
+}
+
+pub fn create_gui_drag_tool() -> ToolSpec {
+    let properties = with_drag_target_properties(with_capture_selection_properties(
+        BTreeMap::from([
+            (
+                "duration_ms".to_string(),
+                JsonSchema::Number {
+                    description: Some(
+                        "Optional drag duration in milliseconds. Defaults to 450.".to_string(),
+                    ),
+                },
+            ),
+            (
+                "app".to_string(),
+                JsonSchema::String {
+                    description: Some(
+                        "Optional application name to activate before dragging.".to_string(),
+                    ),
+                },
+            ),
+        ]),
+        true,
+    ));
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "gui_drag".to_string(),
+        description:
+            "Drag between semantic `from_target` and `to_target` points in the current native GUI."
+                .to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["from_target".to_string(), "to_target".to_string()]),
             additional_properties: Some(false.into()),
         },
         output_schema: None,
@@ -498,68 +389,50 @@ pub fn create_gui_drag_tool() -> ToolSpec {
 
 pub fn create_gui_scroll_tool() -> ToolSpec {
     let properties = with_target_properties(
-        with_post_action_evidence_properties(with_capture_selection_properties(BTreeMap::from([
+        with_capture_selection_properties(BTreeMap::from([
             (
-                "delta_y".to_string(),
-                JsonSchema::Number {
-                    description: Some(
-                        "Vertical scroll amount. Positive values scroll down; negative values scroll up."
-                            .to_string(),
-                    ),
-                },
-            ),
-            (
-                "delta_x".to_string(),
-                JsonSchema::Number {
-                    description: Some(
-                        "Horizontal scroll amount. Positive values scroll right; negative values scroll left."
-                            .to_string(),
-                    ),
-                },
-            ),
-            (
-                "x".to_string(),
-                JsonSchema::Number {
-                    description: Some(
-                        "Optional horizontal pixel coordinate to move the cursor to before scrolling, measured from the top-left of the most recent gui_observe image."
-                            .to_string(),
-                    ),
-                },
-            ),
-            (
-                "y".to_string(),
-                JsonSchema::Number {
-                    description: Some(
-                        "Optional vertical pixel coordinate to move the cursor to before scrolling, measured from the top-left of the most recent gui_observe image."
-                            .to_string(),
-                    ),
-                },
-            ),
-            (
-                "unit".to_string(),
+                "direction".to_string(),
                 JsonSchema::String {
                     description: Some(string_enum_description(
-                        &["line", "pixel"],
-                        "Defaults to `line`.",
+                        &["up", "down", "left", "right"],
+                        "Scroll direction. Defaults to `down`.",
                     )),
+                },
+            ),
+            (
+                "distance".to_string(),
+                JsonSchema::String {
+                    description: Some(string_enum_description(
+                        &["small", "medium", "page"],
+                        "Semantic scroll distance. Defaults to `page` for targetless scrolls and `medium` for grounded scrolls.",
+                    )),
+                },
+            ),
+            (
+                "amount".to_string(),
+                JsonSchema::Number {
+                    description: Some(
+                        "Optional explicit legacy line-count override. When provided, it overrides `distance`."
+                            .to_string(),
+                    ),
                 },
             ),
             (
                 "app".to_string(),
                 JsonSchema::String {
                     description: Some(
-                        "Optional macOS application name to activate before scrolling."
+                        "Optional application name to activate before scrolling."
                             .to_string(),
                     ),
                 },
             ),
-        ]), true)),
+        ]), true),
         "scrolling",
     );
 
     ToolSpec::Function(ResponsesApiTool {
         name: "gui_scroll".to_string(),
-        description: "Scroll in the current macOS GUI. Provide at least one of delta_x or delta_y, and optionally supply `target` to scroll a semantic region without manual coordinates."
+        description: "Scroll in the current native GUI. Defaults to a targetless scroll on the current surface, or provide `target` to scroll a semantic region. Prefer `direction` with semantic `distance`; use `amount` only when you need an explicit legacy line count."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -574,9 +447,9 @@ pub fn create_gui_scroll_tool() -> ToolSpec {
 
 pub fn create_gui_type_tool() -> ToolSpec {
     let properties = with_target_properties(
-        with_post_action_evidence_properties(with_capture_selection_properties(BTreeMap::from([
+        with_capture_selection_properties(BTreeMap::from([
             (
-                "text".to_string(),
+                "value".to_string(),
                 JsonSchema::String {
                     description: Some("Literal text to type into the currently focused control."
                         .to_string()),
@@ -618,18 +491,17 @@ pub fn create_gui_type_tool() -> ToolSpec {
                 },
             ),
             (
-                "strategy".to_string(),
+                "type_strategy".to_string(),
                 JsonSchema::String {
                     description: Some(string_enum_description(
                         &[
-                            "unicode",
                             "clipboard_paste",
                             "physical_keys",
                             "system_events_paste",
                             "system_events_keystroke",
                             "system_events_keystroke_chars",
                         ],
-                        "Defaults to `unicode`.",
+                        "When omitted, the runtime chooses the default native typing path.",
                     )),
                 },
             ),
@@ -637,19 +509,19 @@ pub fn create_gui_type_tool() -> ToolSpec {
                 "app".to_string(),
                 JsonSchema::String {
                     description: Some(
-                        "Optional macOS application name to activate before typing."
+                        "Optional application name to activate before typing."
                             .to_string(),
                     ),
                 },
             ),
-        ]), true)),
+        ]), true),
         "typing into a semantic input target",
     );
 
     ToolSpec::Function(ResponsesApiTool {
         name: "gui_type".to_string(),
         description:
-            "Type text into the currently focused macOS GUI control. Typically use gui_click first to focus the desired field, or provide `target` so the tool focuses the semantic input target for you. Provide exactly one of `text`, `secret_env_var`, or `secret_command_env_var`."
+            "Type text into the currently focused native GUI control. Typically use gui_click first to focus the desired field, or provide `target` so the tool focuses the semantic input target for you. Provide exactly one of `value`, `secret_env_var`, or `secret_command_env_var`."
                 .to_string(),
         strict: false,
         defer_loading: None,
@@ -663,7 +535,7 @@ pub fn create_gui_type_tool() -> ToolSpec {
 }
 
 pub fn create_gui_key_tool() -> ToolSpec {
-    let properties = with_post_action_evidence_properties(with_capture_selection_properties(
+    let properties = with_capture_selection_properties(
         BTreeMap::from([
             (
                 "key".to_string(),
@@ -698,18 +570,18 @@ pub fn create_gui_key_tool() -> ToolSpec {
                 "app".to_string(),
                 JsonSchema::String {
                     description: Some(
-                        "Optional macOS application name to activate before pressing the key."
+                        "Optional application name to activate before pressing the key."
                             .to_string(),
                     ),
                 },
             ),
         ]),
         true,
-    ));
+    );
 
     ToolSpec::Function(ResponsesApiTool {
         name: "gui_key".to_string(),
-        description: "Press a key or hotkey in the current macOS GUI.".to_string(),
+        description: "Press a key or hotkey in the current native GUI.".to_string(),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::Object {
@@ -726,25 +598,20 @@ pub fn create_gui_move_tool() -> ToolSpec {
         (
             "x".to_string(),
             JsonSchema::Number {
-                description: Some(
-                    "Absolute macOS display X coordinate in logical points.".to_string(),
-                ),
+                description: Some("Absolute display X coordinate in logical points.".to_string()),
             },
         ),
         (
             "y".to_string(),
             JsonSchema::Number {
-                description: Some(
-                    "Absolute macOS display Y coordinate in logical points.".to_string(),
-                ),
+                description: Some("Absolute display Y coordinate in logical points.".to_string()),
             },
         ),
         (
             "app".to_string(),
             JsonSchema::String {
                 description: Some(
-                    "Optional macOS application name to activate before moving the pointer."
-                        .to_string(),
+                    "Optional application name to activate before moving the pointer.".to_string(),
                 ),
             },
         ),
@@ -752,7 +619,7 @@ pub fn create_gui_move_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "gui_move".to_string(),
-        description: "Move the macOS pointer to an absolute display coordinate in logical points."
+        description: "Move the pointer to an absolute display coordinate in logical points."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -781,17 +648,30 @@ mod tests {
 
     #[test]
     fn click_tool_exposes_semantic_target_properties() {
-        let properties = function_parameters(create_gui_click_tool());
+        let tool = create_gui_click_tool();
+        let properties = function_parameters(tool.clone());
 
         assert!(properties.contains_key("target"));
         assert!(properties.contains_key("location_hint"));
         assert!(properties.contains_key("scope"));
         assert!(properties.contains_key("grounding_mode"));
+        assert!(!properties.contains_key("x"));
+        assert!(!properties.contains_key("y"));
+        match tool {
+            ToolSpec::Function(tool) => {
+                let JsonSchema::Object { required, .. } = tool.parameters else {
+                    panic!("expected object schema");
+                };
+                assert_eq!(required, Some(vec!["target".to_string()]));
+            }
+            other => panic!("expected function tool, got {other:?}"),
+        }
     }
 
     #[test]
     fn wait_tool_exposes_target_wait_controls() {
-        let properties = function_parameters(create_gui_wait_tool());
+        let tool = create_gui_wait_tool();
+        let properties = function_parameters(tool.clone());
 
         assert!(properties.contains_key("target"));
         assert!(properties.contains_key("state"));
@@ -799,11 +679,23 @@ mod tests {
         assert!(properties.contains_key("interval_ms"));
         assert!(properties.contains_key("scope"));
         assert!(properties.contains_key("grounding_mode"));
+        assert!(!properties.contains_key("duration_ms"));
+        assert!(!properties.contains_key("return_image"));
+        match tool {
+            ToolSpec::Function(tool) => {
+                let JsonSchema::Object { required, .. } = tool.parameters else {
+                    panic!("expected object schema");
+                };
+                assert_eq!(required, Some(vec!["target".to_string()]));
+            }
+            other => panic!("expected function tool, got {other:?}"),
+        }
     }
 
     #[test]
     fn drag_tool_exposes_semantic_source_and_destination_properties() {
-        let properties = function_parameters(create_gui_drag_tool());
+        let tool = create_gui_drag_tool();
+        let properties = function_parameters(tool.clone());
 
         assert!(properties.contains_key("grounding_mode"));
         assert!(properties.contains_key("from_target"));
@@ -812,6 +704,23 @@ mod tests {
         assert!(properties.contains_key("to_target"));
         assert!(properties.contains_key("to_location_hint"));
         assert!(properties.contains_key("to_scope"));
+        assert!(!properties.contains_key("steps"));
+        assert!(!properties.contains_key("from_x"));
+        assert!(!properties.contains_key("from_y"));
+        assert!(!properties.contains_key("to_x"));
+        assert!(!properties.contains_key("to_y"));
+        match tool {
+            ToolSpec::Function(tool) => {
+                let JsonSchema::Object { required, .. } = tool.parameters else {
+                    panic!("expected object schema");
+                };
+                assert_eq!(
+                    required,
+                    Some(vec!["from_target".to_string(), "to_target".to_string()])
+                );
+            }
+            other => panic!("expected function tool, got {other:?}"),
+        }
     }
 
     #[test]
@@ -822,5 +731,34 @@ mod tests {
         assert!(properties.contains_key("location_hint"));
         assert!(properties.contains_key("scope"));
         assert!(properties.contains_key("grounding_mode"));
+    }
+
+    #[test]
+    fn scroll_tool_exposes_understudy_aligned_scroll_semantics() {
+        let properties = function_parameters(create_gui_scroll_tool());
+
+        assert!(properties.contains_key("direction"));
+        assert!(properties.contains_key("distance"));
+        assert!(properties.contains_key("amount"));
+        assert!(!properties.contains_key("delta_x"));
+        assert!(!properties.contains_key("delta_y"));
+        assert!(!properties.contains_key("unit"));
+        assert!(!properties.contains_key("x"));
+        assert!(!properties.contains_key("y"));
+    }
+
+    #[test]
+    fn type_tool_matches_understudy_native_contract_shape() {
+        let properties = function_parameters(create_gui_type_tool());
+
+        assert!(properties.contains_key("value"));
+        assert!(properties.contains_key("type_strategy"));
+        assert!(!properties.contains_key("text"));
+        assert!(!properties.contains_key("strategy"));
+        let JsonSchema::String { description } = &properties["type_strategy"] else {
+            panic!("expected string schema");
+        };
+        let description = description.as_deref().unwrap_or_default();
+        assert!(!description.contains("unicode"));
     }
 }

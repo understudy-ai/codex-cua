@@ -6,20 +6,14 @@ use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::openai_models::InputModality;
-use image::DynamicImage;
-use image::ImageFormat;
-use image::imageops::FilterType;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
-use sha1::Digest;
-use sha1::Sha1;
 use std::collections::HashMap;
-use std::io::Cursor;
+#[cfg(test)]
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
-use tempfile::tempdir;
 use tokio::time::Duration;
 use tokio::time::sleep;
 
@@ -31,18 +25,40 @@ use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
 
-const GUI_UNSUPPORTED_MESSAGE: &str = "Native GUI tools are currently supported on macOS only.";
+#[path = "gui/grounding.rs"]
+mod grounding;
+#[path = "gui/platform.rs"]
+mod platform;
+#[path = "gui/provider.rs"]
+mod provider;
+#[path = "gui/readiness.rs"]
+mod readiness;
+#[path = "gui/session.rs"]
+mod session;
+#[cfg(test)]
+#[path = "gui/tests.rs"]
+mod tests;
+
+use platform::PlatformObservation;
+use platform::default_gui_platform;
+use provider::GuiGroundingProvider;
+use provider::default_gui_grounding_provider;
+use readiness::enforce_gui_tool_capability;
+
+const GUI_UNSUPPORTED_MESSAGE: &str = "Native GUI tools are not supported on this platform yet.";
 const GUI_IMAGE_UNSUPPORTED_MESSAGE: &str =
     "Native GUI screenshot tools are not allowed because you do not support image inputs";
 const DEFAULT_DRAG_DURATION_MS: i64 = 450;
 const DEFAULT_DRAG_STEPS: i64 = 24;
 const DEFAULT_HOVER_SETTLE_MS: i64 = 200;
 const DEFAULT_CLICK_AND_HOLD_MS: i64 = 650;
-const DEFAULT_GUI_WAIT_MS: i64 = 1000;
-const DEFAULT_GUI_WAIT_TIMEOUT_MS: i64 = 5000;
-const DEFAULT_GUI_WAIT_INTERVAL_MS: i64 = 500;
-const DEFAULT_POST_ACTION_SETTLE_MS: i64 = 1200;
+const DEFAULT_GUI_WAIT_TIMEOUT_MS: i64 = 8000;
+const DEFAULT_GUI_WAIT_INTERVAL_MS: i64 = 350;
+const WAIT_CONFIRMATION_COUNT: i64 = 2;
+const DEFAULT_POST_ACTION_SETTLE_MS: i64 = 3000;
 const DEFAULT_POST_TYPE_SETTLE_MS: i64 = 500;
+const DEFAULT_TARGETED_SCROLL_DISTANCE: &str = "medium";
+const DEFAULT_TARGETLESS_SCROLL_DISTANCE: &str = "page";
 
 #[derive(Default)]
 pub struct GuiHandler {
@@ -51,16 +67,47 @@ pub struct GuiHandler {
 
 #[derive(Clone, Debug)]
 struct ObserveState {
-    capture_x: f64,
-    capture_y: f64,
-    width: u32,
-    height: u32,
+    capture: CaptureArtifact,
     app_name: Option<String>,
-    display_index: i64,
-    capture_mode: &'static str,
-    window_title: Option<String>,
-    window_count: Option<i64>,
-    window_capture_strategy: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct HostCaptureExclusionState {
+    applied: bool,
+    frontmost_excluded: bool,
+    adjusted: bool,
+    frontmost_app_name: Option<String>,
+    frontmost_bundle_id: Option<String>,
+    redaction_count: i64,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct CaptureArtifact {
+    pub(super) origin_x: f64,
+    pub(super) origin_y: f64,
+    pub(super) width: u32,
+    pub(super) height: u32,
+    pub(super) image_width: u32,
+    pub(super) image_height: u32,
+    pub(super) scale_x: f64,
+    pub(super) scale_y: f64,
+    pub(super) display_index: i64,
+    pub(super) capture_mode: &'static str,
+    pub(super) window_title: Option<String>,
+    pub(super) window_count: Option<i64>,
+    pub(super) window_capture_strategy: Option<String>,
+    pub(super) host_exclusion: HostCaptureExclusionState,
+}
+
+impl ObserveState {
+    fn capture_bounds(&self) -> HelperRect {
+        HelperRect {
+            x: self.capture.origin_x,
+            y: self.capture.origin_y,
+            width: self.capture.width as f64,
+            height: self.capture.height as f64,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -85,8 +132,6 @@ struct ObserveArgs {
 
 #[derive(Debug, Deserialize)]
 struct ClickArgs {
-    x: Option<f64>,
-    y: Option<f64>,
     target: Option<String>,
     location_hint: Option<String>,
     scope: Option<String>,
@@ -99,14 +144,11 @@ struct ClickArgs {
     window_title: Option<String>,
     window_selector: Option<WindowSelector>,
     app: Option<String>,
-    post_action_settle_ms: Option<i64>,
-    return_image: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
 struct WaitArgs {
-    duration_ms: Option<i64>,
-    target: Option<String>,
+    target: String,
     location_hint: Option<String>,
     scope: Option<String>,
     grounding_mode: Option<String>,
@@ -117,54 +159,42 @@ struct WaitArgs {
     window_title: Option<String>,
     window_selector: Option<WindowSelector>,
     app: Option<String>,
-    return_image: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
 struct DragArgs {
-    from_x: Option<f64>,
-    from_y: Option<f64>,
     from_target: Option<String>,
     from_location_hint: Option<String>,
     from_scope: Option<String>,
-    to_x: Option<f64>,
-    to_y: Option<f64>,
     to_target: Option<String>,
     to_location_hint: Option<String>,
     to_scope: Option<String>,
     grounding_mode: Option<String>,
     duration_ms: Option<i64>,
-    steps: Option<i64>,
     capture_mode: Option<String>,
     window_title: Option<String>,
     window_selector: Option<WindowSelector>,
     app: Option<String>,
-    post_action_settle_ms: Option<i64>,
-    return_image: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ScrollArgs {
-    delta_y: Option<i64>,
-    delta_x: Option<i64>,
+    direction: Option<String>,
+    distance: Option<String>,
+    amount: Option<i64>,
     target: Option<String>,
     location_hint: Option<String>,
     scope: Option<String>,
     grounding_mode: Option<String>,
-    x: Option<f64>,
-    y: Option<f64>,
-    unit: Option<String>,
     capture_mode: Option<String>,
     window_title: Option<String>,
     window_selector: Option<WindowSelector>,
     app: Option<String>,
-    post_action_settle_ms: Option<i64>,
-    return_image: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TypeArgs {
-    text: Option<String>,
+    value: Option<String>,
     secret_env_var: Option<String>,
     secret_command_env_var: Option<String>,
     target: Option<String>,
@@ -173,13 +203,11 @@ struct TypeArgs {
     grounding_mode: Option<String>,
     replace: Option<bool>,
     submit: Option<bool>,
-    strategy: Option<String>,
+    type_strategy: Option<String>,
     capture_mode: Option<String>,
     window_title: Option<String>,
     window_selector: Option<WindowSelector>,
     app: Option<String>,
-    post_action_settle_ms: Option<i64>,
-    return_image: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -191,8 +219,6 @@ struct KeyArgs {
     window_title: Option<String>,
     window_selector: Option<WindowSelector>,
     app: Option<String>,
-    post_action_settle_ms: Option<i64>,
-    return_image: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -213,6 +239,10 @@ struct HelperCaptureContext {
     window_bounds: Option<HelperRect>,
     window_count: Option<i64>,
     window_capture_strategy: Option<String>,
+    host_self_exclude_applied: Option<bool>,
+    host_frontmost_excluded: Option<bool>,
+    host_frontmost_app_name: Option<String>,
+    host_frontmost_bundle_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -242,27 +272,29 @@ struct ActionEvidence {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct HelperResolvedTarget {
-    app_name: Option<String>,
-    window_title: Option<String>,
-    matched_text: Option<String>,
-    role: Option<String>,
-    role_description: Option<String>,
-    identifier: Option<String>,
-    confidence: f64,
+#[serde(rename_all = "snake_case")]
+struct GroundingModelResponse {
+    status: String,
+    found: bool,
+    confidence: Option<f64>,
     reason: Option<String>,
-    point: HelperPoint,
-    bounds: HelperRect,
+    coordinate_space: Option<String>,
+    click_point: Option<HelperPoint>,
+    bbox: Option<GroundingBoundingBox>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct GroundingBoundingBox {
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
 }
 
 #[derive(Clone, Debug)]
 struct ResolvedTarget {
     window_title: Option<String>,
-    matched_text: Option<String>,
-    role: Option<String>,
-    role_description: Option<String>,
-    identifier: Option<String>,
+    provider: String,
     confidence: f64,
     reason: Option<String>,
     grounding_mode_requested: String,
@@ -271,6 +303,8 @@ struct ResolvedTarget {
     point: HelperPoint,
     bounds: HelperRect,
     local_point: Option<HelperPoint>,
+    local_bounds: Option<HelperRect>,
+    raw: Option<JsonValue>,
     capture_state: ObserveState,
 }
 
@@ -313,15 +347,29 @@ struct GuiTargetRequest<'a> {
 
 #[derive(Clone, Copy, Debug)]
 enum DragEndpoint<'a> {
-    Coordinates {
-        x: f64,
-        y: f64,
-    },
     Target {
         target: &'a str,
         location_hint: Option<&'a str>,
         scope: Option<&'a str>,
     },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ScrollDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResolvedGuiScrollPlan {
+    amount: i64,
+    distance_preset: &'static str,
+    unit: &'static str,
+    viewport_dimension: Option<i64>,
+    viewport_source: Option<&'static str>,
+    travel_fraction: Option<f64>,
 }
 
 pub struct GuiToolOutput {
@@ -330,8 +378,7 @@ pub struct GuiToolOutput {
     success: bool,
 }
 
-impl GuiToolOutput {
-}
+impl GuiToolOutput {}
 
 impl ToolOutput for GuiToolOutput {
     fn log_preview(&self) -> String {
@@ -372,12 +419,6 @@ impl ToolHandler for GuiHandler {
     }
 
     async fn handle(&self, invocation: ToolInvocation) -> Result<Self::Output, FunctionCallError> {
-        if !cfg!(target_os = "macos") {
-            return Err(FunctionCallError::RespondToModel(
-                GUI_UNSUPPORTED_MESSAGE.to_string(),
-            ));
-        }
-
         match invocation.tool_name.as_str() {
             "gui_observe" => self.handle_observe(invocation).await,
             "gui_wait" => self.handle_wait(invocation).await,
@@ -413,27 +454,16 @@ impl GuiHandler {
         let semantic_target = normalize_optional_string(args.target.as_deref());
         let location_hint = normalize_optional_string(args.location_hint.as_deref());
         let scope = normalize_optional_string(args.scope.as_deref());
-        let context = capture_context(args.app.as_deref(), true, window_selection.as_ref())?;
-        let capture = resolve_capture_target(
-            &context,
+        enforce_gui_tool_capability(&invocation, "gui_observe", semantic_target.is_some())?;
+        let observation = observe_platform(
+            args.app.as_deref(),
+            true,
             args.capture_mode.as_deref(),
-            window_selection.is_some(),
+            window_selection.as_ref(),
             args.app.as_deref().is_some(),
         )?;
-        let image_bytes = capture_region(&capture.bounds, capture.width, capture.height)?;
-        let image_url = data_url_png(&image_bytes);
-        let state = ObserveState {
-            capture_x: capture.bounds.x,
-            capture_y: capture.bounds.y,
-            width: capture.width,
-            height: capture.height,
-            app_name: context.app_name.clone(),
-            display_index: context.display.index,
-            capture_mode: capture.mode,
-            window_title: capture.window_title.clone(),
-            window_count: capture.window_count,
-            window_capture_strategy: capture.window_capture_strategy.clone(),
-        };
+        let image_url = data_url_png(&observation.image_bytes);
+        let state = observation.state;
         self.observe_state
             .lock()
             .expect("gui observe state poisoned")
@@ -448,30 +478,36 @@ impl GuiHandler {
             .as_ref()
             .map(|app| format!(" for app `{app}`"))
             .unwrap_or_default();
-        let subject = if state.capture_mode == "window" {
+        let subject = if state.capture.capture_mode == "window" {
             state
+                .capture
                 .window_title
                 .as_ref()
                 .map(|title| format!("window `{title}`"))
                 .unwrap_or_else(|| "window".to_string())
         } else {
-            format!("display {}", state.display_index)
+            format!("display {}", state.capture.display_index)
         };
         if let Some(target) = semantic_target.as_deref() {
-            let grounded = self.resolve_gui_target(GuiTargetRequest {
-                app: args.app.as_deref(),
-                capture_mode: args.capture_mode.as_deref(),
-                window_selection: window_selection.as_ref(),
-                target,
-                location_hint: location_hint.as_deref(),
-                scope: scope.as_deref(),
-                grounding_mode: args.grounding_mode.as_deref(),
-                action: "observe",
-                related_target: None,
-                related_scope: None,
-                related_location_hint: None,
-                related_point: None,
-            })?;
+            let grounded = self
+                .resolve_gui_target(
+                    &invocation,
+                    GuiTargetRequest {
+                        app: args.app.as_deref(),
+                        capture_mode: args.capture_mode.as_deref(),
+                        window_selection: window_selection.as_ref(),
+                        target,
+                        location_hint: location_hint.as_deref(),
+                        scope: scope.as_deref(),
+                        grounding_mode: args.grounding_mode.as_deref(),
+                        action: "observe",
+                        related_target: None,
+                        related_scope: None,
+                        related_location_hint: None,
+                        related_point: None,
+                    },
+                )
+                .await?;
             let Some(grounded) = grounded else {
                 let summary = format!(
                     "Captured macOS {subject}{app_label}, but could not resolve semantic GUI target `{target}` in the observed surface."
@@ -484,16 +520,16 @@ impl GuiHandler {
                     Some(serde_json::json!({
                         "error": format!("No confident semantic GUI target `{target}` was found."),
                         "target": target,
-                        "grounding_method": "accessibility",
+                        "grounding_method": "grounding",
                         "grounding_mode_requested": normalize_grounding_mode(args.grounding_mode.as_deref(), "observe")?,
-                        "grounding_mode_effective": "accessibility",
+                        "grounding_mode_effective": normalize_grounding_mode(args.grounding_mode.as_deref(), "observe")?,
                         "scope": scope,
                         "confidence": 0.0,
                     })),
                 ));
             };
             let summary = format!(
-                "Captured macOS {subject}{app_label} and resolved semantic GUI target `{target}`. Coordinates for gui_click/gui_drag/gui_scroll are still measured from the top-left of this image."
+                "Captured macOS {subject}{app_label} and resolved semantic GUI target `{target}` in the observed surface."
             );
             let mut extra = serde_json::Map::new();
             extra.insert(
@@ -510,11 +546,11 @@ impl GuiHandler {
         }
 
         let summary = format!(
-            "Captured macOS {subject}{app_label} at origin ({}, {}) with size {}x{}. Coordinates for gui_click/gui_drag/gui_scroll are measured from the top-left of this image.",
-            state.capture_x.round(),
-            state.capture_y.round(),
-            state.width,
-            state.height
+            "Captured macOS {subject}{app_label} at origin ({}, {}) with size {}x{} for visual inspection and follow-up GUI grounding.",
+            state.capture.origin_x.round(),
+            state.capture.origin_y.round(),
+            state.capture.width,
+            state.capture.height
         );
         Ok(self.build_gui_output(summary, state, image_output, true, None))
     }
@@ -530,16 +566,20 @@ impl GuiHandler {
         )?;
         let mut app = normalize_optional_string(args.app.as_deref());
         let mut capture_mode = normalize_optional_string(args.capture_mode.as_deref());
-        let target = normalize_optional_string(args.target.as_deref());
+        let target = normalize_optional_string(Some(args.target.as_str())).ok_or_else(|| {
+            FunctionCallError::RespondToModel("gui_wait requires a semantic `target`.".to_string())
+        })?;
         let location_hint = normalize_optional_string(args.location_hint.as_deref());
         let scope = normalize_optional_string(args.scope.as_deref());
+        enforce_gui_tool_capability(&invocation, "gui_wait", true)?;
         if app.is_none() && capture_mode.is_none() && window_selection.is_none() {
             if let Some(previous_state) = self.get_observe_state(&invocation) {
                 app = previous_state.app_name.clone();
-                capture_mode = Some(previous_state.capture_mode.to_string());
-                if previous_state.capture_mode == "window" {
+                capture_mode = Some(previous_state.capture.capture_mode.to_string());
+                if previous_state.capture.capture_mode == "window" {
                     window_selection =
                         previous_state
+                            .capture
                             .window_title
                             .as_ref()
                             .map(|title| WindowSelector {
@@ -551,164 +591,95 @@ impl GuiHandler {
             }
         }
 
-        let wait_ms = args.duration_ms.unwrap_or(DEFAULT_GUI_WAIT_MS);
-        if wait_ms < 0 {
+        let target_state = normalize_wait_target_state(args.state.as_deref())?;
+        let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_GUI_WAIT_TIMEOUT_MS);
+        let interval_ms = args.interval_ms.unwrap_or(DEFAULT_GUI_WAIT_INTERVAL_MS);
+        if timeout_ms <= 0 {
             return Err(FunctionCallError::RespondToModel(
-                "gui_wait.duration_ms must be zero or a positive integer".to_string(),
+                "gui_wait.timeout_ms must be a positive integer".to_string(),
             ));
         }
-        sleep(Duration::from_millis(wait_ms as u64)).await;
+        if interval_ms <= 0 {
+            return Err(FunctionCallError::RespondToModel(
+                "gui_wait.interval_ms must be a positive integer".to_string(),
+            ));
+        }
 
-        if let Some(target) = target {
-            let target_state = normalize_wait_target_state(args.state.as_deref())?;
-            let timeout_ms = args.timeout_ms.unwrap_or(DEFAULT_GUI_WAIT_TIMEOUT_MS);
-            let interval_ms = args.interval_ms.unwrap_or(DEFAULT_GUI_WAIT_INTERVAL_MS);
-            if timeout_ms <= 0 {
-                return Err(FunctionCallError::RespondToModel(
-                    "gui_wait.timeout_ms must be a positive integer".to_string(),
-                ));
-            }
-            if interval_ms <= 0 {
-                return Err(FunctionCallError::RespondToModel(
-                    "gui_wait.interval_ms must be a positive integer".to_string(),
-                ));
-            }
+        let probe = self
+            .probe_for_target(
+                &invocation,
+                GuiTargetRequest {
+                    app: app.as_deref(),
+                    capture_mode: capture_mode.as_deref(),
+                    window_selection: window_selection.as_ref(),
+                    target: &target,
+                    location_hint: location_hint.as_deref(),
+                    scope: scope.as_deref(),
+                    grounding_mode: args.grounding_mode.as_deref(),
+                    action: "wait",
+                    related_target: None,
+                    related_scope: None,
+                    related_location_hint: None,
+                    related_point: None,
+                },
+                target_state,
+                timeout_ms,
+                interval_ms,
+            )
+            .await?;
 
-            let probe = self
-                .probe_for_target(
-                    &invocation,
-                    GuiTargetRequest {
-                        app: app.as_deref(),
-                        capture_mode: capture_mode.as_deref(),
-                        window_selection: window_selection.as_ref(),
-                        target: &target,
-                        location_hint: location_hint.as_deref(),
-                        scope: scope.as_deref(),
-                        grounding_mode: args.grounding_mode.as_deref(),
-                        action: "wait",
-                        related_target: None,
-                        related_scope: None,
-                        related_location_hint: None,
-                        related_point: None,
-                    },
-                    target_state,
-                    timeout_ms,
-                    interval_ms,
-                    args.return_image,
-                )
-                .await?;
-
-            let summary = if probe.matched {
-                match (target_state, probe.grounded.as_ref()) {
-                    ("appear", Some(resolved)) => format!(
-                        "Waited {wait_ms}ms, then found GUI target `{target}` after {} semantic checks at global ({}, {}).{}",
-                        probe.attempts,
-                        resolved.resolved.point.x.round(),
-                        resolved.resolved.point.y.round(),
-                        if probe.image_url.is_some() {
-                            " Attached a refreshed GUI evidence screenshot."
-                        } else {
-                            ""
-                        }
-                    ),
-                    ("disappear", _) => format!(
-                        "Waited {wait_ms}ms, then confirmed GUI target `{target}` disappeared after {} semantic checks.{}",
-                        probe.attempts,
-                        if probe.image_url.is_some() {
-                            " Attached a refreshed GUI evidence screenshot."
-                        } else {
-                            ""
-                        }
-                    ),
-                    _ => unreachable!("validated wait target state"),
-                }
-            } else {
-                format!(
-                    "Timed out after {timeout_ms}ms waiting for GUI target `{target}` to {target_state}.{}",
+        let summary = if probe.matched {
+            match (target_state, probe.grounded.as_ref()) {
+                ("appear", Some(resolved)) => format!(
+                    "Confirmed GUI target `{target}` appeared after {} visual checks and {} consecutive confirmations at global ({}, {}).{}",
+                    probe.attempts,
+                    WAIT_CONFIRMATION_COUNT,
+                    resolved.resolved.point.x.round(),
+                    resolved.resolved.point.y.round(),
                     if probe.image_url.is_some() {
                         " Attached a refreshed GUI evidence screenshot."
                     } else {
                         ""
                     }
-                )
-            };
-
-            return Ok(self.build_gui_output(
-                summary,
-                probe.state,
-                probe.image_url,
-                probe.matched,
-                Some(serde_json::json!({
-                    "waited_ms": wait_ms,
-                    "timeout_ms": timeout_ms,
-                    "interval_ms": interval_ms,
-                    "target": target,
-                    "target_state": target_state,
-                    "attempts": probe.attempts,
-                    "target_found": probe.grounded.is_some(),
-                    "grounding_method": probe.grounded.as_ref().map(|grounded| grounded.grounding_method),
-                    "target_resolution": probe.grounded.as_ref().map(|grounded| build_target_resolution_details(&target, grounded)),
-                })),
-            ));
-        }
-
-        let context = capture_context(app.as_deref(), true, window_selection.as_ref())?;
-        let capture = resolve_capture_target(
-            &context,
-            capture_mode.as_deref(),
-            window_selection.is_some(),
-            app.as_deref().is_some(),
-        )?;
-        let image_bytes = capture_region(&capture.bounds, capture.width, capture.height)?;
-        let image_url = data_url_png(&image_bytes);
-        let state = ObserveState {
-            capture_x: capture.bounds.x,
-            capture_y: capture.bounds.y,
-            width: capture.width,
-            height: capture.height,
-            app_name: context.app_name.clone(),
-            display_index: context.display.index,
-            capture_mode: capture.mode,
-            window_title: capture.window_title.clone(),
-            window_count: capture.window_count,
-            window_capture_strategy: capture.window_capture_strategy.clone(),
-        };
-        self.observe_state
-            .lock()
-            .expect("gui observe state poisoned")
-            .insert(
-                invocation.session.conversation_id.to_string(),
-                state.clone(),
-            );
-
-        let app_label = state
-            .app_name
-            .as_ref()
-            .map(|app| format!(" for app `{app}`"))
-            .unwrap_or_default();
-        let subject = if state.capture_mode == "window" {
-            state
-                .window_title
-                .as_ref()
-                .map(|title| format!("window `{title}`"))
-                .unwrap_or_else(|| "window".to_string())
+                ),
+                ("disappear", _) => format!(
+                    "Confirmed GUI target `{target}` disappeared after {} visual checks and {} consecutive confirmations.{}",
+                    probe.attempts,
+                    WAIT_CONFIRMATION_COUNT,
+                    if probe.image_url.is_some() {
+                        " Attached a refreshed GUI evidence screenshot."
+                    } else {
+                        ""
+                    }
+                ),
+                _ => unreachable!("validated wait target state"),
+            }
         } else {
-            format!("display {}", state.display_index)
+            format!(
+                "Timed out after {timeout_ms}ms waiting for GUI target `{target}` to {target_state}.{}",
+                if probe.image_url.is_some() {
+                    " Attached a refreshed GUI evidence screenshot."
+                } else {
+                    ""
+                }
+            )
         };
-        let summary = format!(
-            "Waited {wait_ms}ms, then refreshed macOS {subject}{app_label} at origin ({}, {}) with size {}x{}. Coordinates for gui_click/gui_drag/gui_scroll are measured from the top-left of this image.",
-            state.capture_x.round(),
-            state.capture_y.round(),
-            state.width,
-            state.height
-        );
+
         Ok(self.build_gui_output(
             summary,
-            state,
-            Some(image_url),
-            true,
+            probe.state,
+            probe.image_url,
+            probe.matched,
             Some(serde_json::json!({
-                "waited_ms": wait_ms,
+                "timeout_ms": timeout_ms,
+                "interval_ms": interval_ms,
+                "target": target,
+                "target_state": target_state,
+                "attempts": probe.attempts,
+                "wait_confirmations_required": WAIT_CONFIRMATION_COUNT,
+                "target_found": probe.grounded.is_some(),
+                "grounding_method": probe.grounded.as_ref().map(|grounded| grounded.grounding_method),
+                "target_resolution": probe.grounded.as_ref().map(|grounded| build_target_resolution_details(&target, grounded)),
             })),
         ))
     }
@@ -717,6 +688,7 @@ impl GuiHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<GuiToolOutput, FunctionCallError> {
+        let action_session = session::begin_gui_action_session(&invocation, "gui_click", true)?;
         let args = parse_function_args::<ClickArgs>(&invocation.payload)?;
         let window_selection = normalize_window_selection(
             args.window_title.as_deref(),
@@ -725,93 +697,59 @@ impl GuiHandler {
         let semantic_target = normalize_optional_string(args.target.as_deref());
         let location_hint = normalize_optional_string(args.location_hint.as_deref());
         let scope = normalize_optional_string(args.scope.as_deref());
-        let (global_x, global_y, state, coordinate_summary, target_details) = if let Some(target) =
-            semantic_target.as_deref()
-        {
-            if args.x.is_some() || args.y.is_some() {
-                return Err(FunctionCallError::RespondToModel(
-                    "gui_click accepts either `x`/`y` or `target`, but not both".to_string(),
-                ));
-            }
-            let grounded = self.resolve_gui_target(GuiTargetRequest {
-                app: args.app.as_deref(),
-                capture_mode: args.capture_mode.as_deref(),
-                window_selection: window_selection.as_ref(),
-                target,
-                location_hint: location_hint.as_deref(),
-                scope: scope.as_deref(),
-                grounding_mode: args.grounding_mode.as_deref(),
-                action: "click",
-                related_target: None,
-                related_scope: None,
-                related_location_hint: None,
-                related_point: None,
-            })?;
-            let grounded = grounded.ok_or_else(|| {
-                FunctionCallError::RespondToModel(format!(
-                    "Could not resolve semantic GUI target `{target}`. Refine `location_hint` or fall back to gui_observe plus coordinates."
-                ))
-            })?;
-            let target_details = build_target_resolution_details(target, &grounded);
-            let resolved = grounded.resolved;
-            let coordinate_summary = resolved
-                .local_point
-                .as_ref()
-                .map(|point| {
-                    format!(
-                        "target `{target}` at image coordinate ({}, {})",
-                        point.x.round(),
-                        point.y.round()
-                    )
-                })
-                .unwrap_or_else(|| {
-                    format!(
-                        "target `{target}` at global coordinate ({}, {})",
-                        resolved.point.x.round(),
-                        resolved.point.y.round()
-                    )
-                });
-            (
-                resolved.point.x,
-                resolved.point.y,
-                resolved.capture_state,
-                coordinate_summary,
-                Some(target_details),
+        let target = semantic_target.as_deref().ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "gui_click requires a semantic `target`; absolute coordinate clicking is not supported."
+                    .to_string(),
             )
-        } else {
-            let (local_x, local_y) = match (args.x, args.y) {
-                (Some(x), Some(y)) => (x, y),
-                (None, None) => {
-                    return Err(FunctionCallError::RespondToModel(
-                        "gui_click requires either `x` and `y`, or `target`".to_string(),
-                    ));
-                }
-                _ => {
-                    return Err(FunctionCallError::RespondToModel(
-                        "gui_click requires both `x` and `y` when using coordinates".to_string(),
-                    ));
-                }
-            };
-            let (global_x, global_y, state) = self.resolve_global_point(
+        })?;
+        enforce_gui_tool_capability(&invocation, "gui_click", true)?;
+        let grounded = self
+            .resolve_gui_target(
                 &invocation,
-                args.app.as_deref(),
-                args.capture_mode.as_deref(),
-                window_selection.as_ref(),
-                local_x,
-                local_y,
-            )?;
-            (
-                global_x,
-                global_y,
-                state,
-                format!(
-                    "image coordinate ({}, {})",
-                    local_x.round(),
-                    local_y.round()
-                ),
-                None,
+                GuiTargetRequest {
+                    app: args.app.as_deref(),
+                    capture_mode: args.capture_mode.as_deref(),
+                    window_selection: window_selection.as_ref(),
+                    target,
+                    location_hint: location_hint.as_deref(),
+                    scope: scope.as_deref(),
+                    grounding_mode: args.grounding_mode.as_deref(),
+                    action: "click",
+                    related_target: None,
+                    related_scope: None,
+                    related_location_hint: None,
+                    related_point: None,
+                },
             )
-        };
+            .await?;
+        let grounded = grounded.ok_or_else(|| {
+            FunctionCallError::RespondToModel(format!(
+                "Could not resolve semantic GUI target `{target}`."
+            ))
+        })?;
+        let target_details = build_target_resolution_details(target, &grounded);
+        let resolved = grounded.resolved;
+        let coordinate_summary = resolved
+            .local_point
+            .as_ref()
+            .map(|point| {
+                format!(
+                    "target `{target}` at image coordinate ({}, {})",
+                    point.x.round(),
+                    point.y.round()
+                )
+            })
+            .unwrap_or_else(|| {
+                format!(
+                    "target `{target}` at global coordinate ({}, {})",
+                    resolved.point.x.round(),
+                    resolved.point.y.round()
+                )
+            });
+        let global_x = resolved.point.x;
+        let global_y = resolved.point.y;
+        let state = resolved.capture_state;
         let button = args.button.as_deref().unwrap_or("left");
         let clicks = args.clicks.unwrap_or(1);
         let hold_ms = args.hold_ms.unwrap_or(DEFAULT_CLICK_AND_HOLD_MS).max(1);
@@ -853,6 +791,7 @@ impl GuiHandler {
                 )));
             }
         };
+        action_session.throw_if_emergency_stopped()?;
 
         run_gui_event(
             event_mode,
@@ -863,6 +802,7 @@ impl GuiHandler {
                 ("CODEX_GUI_SETTLE_MS", settle_ms.to_string()),
             ],
         )?;
+        action_session.throw_if_emergency_stopped()?;
 
         let evidence = self
             .capture_evidence_image(
@@ -870,8 +810,6 @@ impl GuiHandler {
                 args.app.as_deref(),
                 args.capture_mode.as_deref(),
                 window_selection.as_ref(),
-                args.post_action_settle_ms,
-                args.return_image,
                 DEFAULT_POST_ACTION_SETTLE_MS,
             )
             .await?;
@@ -879,7 +817,7 @@ impl GuiHandler {
         let summary = format!(
             "{} at {coordinate_summary} on macOS {} {} (global {}, {}).{} Use gui_wait or gui_observe to verify the resulting UI state before the next risky action.",
             describe_click_action(button, clicks, args.hold_ms.is_some()),
-            state.capture_mode,
+            state.capture.capture_mode,
             describe_capture_subject(&state),
             global_x.round(),
             global_y.round(),
@@ -894,23 +832,12 @@ impl GuiHandler {
             "action_kind".to_string(),
             JsonValue::String(event_mode.to_string()),
         );
+        extra_details.insert("executed_point".to_string(), point_json(global_x, global_y));
+        extend_object_fields(&mut extra_details, target_details);
         extra_details.insert(
-            "executed_point".to_string(),
-            point_json(global_x, global_y),
+            "pre_action_capture".to_string(),
+            build_capture_details_from_state(&state),
         );
-        if let Some(target_details) = target_details {
-            extend_object_fields(&mut extra_details, target_details);
-            extra_details.insert(
-                "pre_action_capture".to_string(),
-                build_capture_details_from_state(&state),
-            );
-        } else {
-            extra_details.insert(
-                "grounding_method".to_string(),
-                JsonValue::String("absolute_coordinates".to_string()),
-            );
-            extra_details.insert("confidence".to_string(), JsonValue::from(1.0));
-        }
         Ok(self.build_gui_output(
             summary,
             evidence.state,
@@ -924,6 +851,7 @@ impl GuiHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<GuiToolOutput, FunctionCallError> {
+        let action_session = session::begin_gui_action_session(&invocation, "gui_drag", true)?;
         let args = parse_function_args::<DragArgs>(&invocation.payload)?;
         let window_selection = normalize_window_selection(
             args.window_title.as_deref(),
@@ -935,27 +863,20 @@ impl GuiHandler {
         let to_target = normalize_optional_string(args.to_target.as_deref());
         let to_location_hint = normalize_optional_string(args.to_location_hint.as_deref());
         let to_scope = normalize_optional_string(args.to_scope.as_deref());
+        enforce_gui_tool_capability(&invocation, "gui_drag", true)?;
         let source_endpoint = normalize_drag_endpoint(
             "source",
             "from_target",
-            "from_x",
-            "from_y",
             from_target.as_deref(),
             from_location_hint.as_deref(),
             from_scope.as_deref(),
-            args.from_x,
-            args.from_y,
         )?;
         let destination_endpoint = normalize_drag_endpoint(
             "destination",
             "to_target",
-            "to_x",
-            "to_y",
             to_target.as_deref(),
             to_location_hint.as_deref(),
             to_scope.as_deref(),
-            args.to_x,
-            args.to_y,
         )?;
         let (
             from_global_x,
@@ -965,46 +886,30 @@ impl GuiHandler {
             source_target_details,
             source_point,
         ) = match source_endpoint {
-            DragEndpoint::Coordinates { x, y } => {
-                let (global_x, global_y, state) = self.resolve_global_point(
-                    &invocation,
-                    args.app.as_deref(),
-                    args.capture_mode.as_deref(),
-                    window_selection.as_ref(),
-                    x,
-                    y,
-                )?;
-                (
-                    global_x,
-                    global_y,
-                    state,
-                    format!("image coordinate ({}, {})", x.round(), y.round()),
-                    None,
-                    HelperPoint {
-                        x: global_x,
-                        y: global_y,
-                    },
-                )
-            }
             DragEndpoint::Target {
                 target,
                 location_hint,
                 scope,
             } => {
-                let grounded = self.resolve_gui_target(GuiTargetRequest {
-                    app: args.app.as_deref(),
-                    capture_mode: args.capture_mode.as_deref(),
-                    window_selection: window_selection.as_ref(),
-                    target,
-                    location_hint,
-                    scope,
-                    grounding_mode: args.grounding_mode.as_deref(),
-                    action: "drag_source",
-                    related_target: to_target.as_deref(),
-                    related_scope: to_scope.as_deref(),
-                    related_location_hint: to_location_hint.as_deref(),
-                    related_point: None,
-                })?;
+                let grounded = self
+                    .resolve_gui_target(
+                        &invocation,
+                        GuiTargetRequest {
+                            app: args.app.as_deref(),
+                            capture_mode: args.capture_mode.as_deref(),
+                            window_selection: window_selection.as_ref(),
+                            target,
+                            location_hint,
+                            scope,
+                            grounding_mode: args.grounding_mode.as_deref(),
+                            action: "drag_source",
+                            related_target: to_target.as_deref(),
+                            related_scope: to_scope.as_deref(),
+                            related_location_hint: to_location_hint.as_deref(),
+                            related_point: None,
+                        },
+                    )
+                    .await?;
                 let grounded = grounded.ok_or_else(|| {
                     FunctionCallError::RespondToModel(format!(
                         "Could not resolve semantic GUI drag source `{target}`."
@@ -1042,41 +947,30 @@ impl GuiHandler {
         };
         let (to_global_x, to_global_y, to_summary, destination_target_details) =
             match destination_endpoint {
-                DragEndpoint::Coordinates { x, y } => {
-                    let (global_x, global_y, _) = self.resolve_global_point(
-                        &invocation,
-                        args.app.as_deref(),
-                        args.capture_mode.as_deref(),
-                        window_selection.as_ref(),
-                        x,
-                        y,
-                    )?;
-                    (
-                        global_x,
-                        global_y,
-                        format!("image coordinate ({}, {})", x.round(), y.round()),
-                        None,
-                    )
-                }
                 DragEndpoint::Target {
                     target,
                     location_hint,
                     scope,
                 } => {
-                    let grounded = self.resolve_gui_target(GuiTargetRequest {
-                        app: args.app.as_deref(),
-                        capture_mode: args.capture_mode.as_deref(),
-                        window_selection: window_selection.as_ref(),
-                        target,
-                        location_hint,
-                        scope,
-                        grounding_mode: args.grounding_mode.as_deref(),
-                        action: "drag_destination",
-                        related_target: from_target.as_deref(),
-                        related_scope: from_scope.as_deref(),
-                        related_location_hint: from_location_hint.as_deref(),
-                        related_point: Some(&source_point),
-                    })?;
+                    let grounded = self
+                        .resolve_gui_target(
+                            &invocation,
+                            GuiTargetRequest {
+                                app: args.app.as_deref(),
+                                capture_mode: args.capture_mode.as_deref(),
+                                window_selection: window_selection.as_ref(),
+                                target,
+                                location_hint,
+                                scope,
+                                grounding_mode: args.grounding_mode.as_deref(),
+                                action: "drag_destination",
+                                related_target: from_target.as_deref(),
+                                related_scope: from_scope.as_deref(),
+                                related_location_hint: from_location_hint.as_deref(),
+                                related_point: Some(&source_point),
+                            },
+                        )
+                        .await?;
                     let grounded = grounded.ok_or_else(|| {
                         FunctionCallError::RespondToModel(format!(
                             "Could not resolve semantic GUI drag destination `{target}`."
@@ -1110,7 +1004,8 @@ impl GuiHandler {
                 }
             };
         let duration_ms = args.duration_ms.unwrap_or(DEFAULT_DRAG_DURATION_MS).max(1);
-        let steps = args.steps.unwrap_or(DEFAULT_DRAG_STEPS).max(1);
+        let steps = DEFAULT_DRAG_STEPS;
+        action_session.throw_if_emergency_stopped()?;
 
         run_gui_event(
             "drag",
@@ -1126,6 +1021,7 @@ impl GuiHandler {
                 ("CODEX_GUI_STEPS", steps.to_string()),
             ],
         )?;
+        action_session.throw_if_emergency_stopped()?;
 
         let evidence = self
             .capture_evidence_image(
@@ -1133,14 +1029,12 @@ impl GuiHandler {
                 args.app.as_deref(),
                 args.capture_mode.as_deref(),
                 window_selection.as_ref(),
-                args.post_action_settle_ms,
-                args.return_image,
                 DEFAULT_POST_ACTION_SETTLE_MS,
             )
             .await?;
         let summary = format!(
             "Dragged from {from_summary} to {to_summary} on macOS {} {} (global {}, {} -> {}, {}).{} Use gui_wait or gui_observe to confirm the drop landed where you expected.",
-            state.capture_mode,
+            state.capture.capture_mode,
             describe_capture_subject(&state),
             from_global_x.round(),
             from_global_y.round(),
@@ -1153,7 +1047,10 @@ impl GuiHandler {
             }
         );
         let mut extra_details = serde_json::Map::new();
-        extra_details.insert("action_kind".to_string(), JsonValue::String("drag".to_string()));
+        extra_details.insert(
+            "action_kind".to_string(),
+            JsonValue::String("drag".to_string()),
+        );
         extra_details.insert(
             "executed_from_point".to_string(),
             point_json(from_global_x, from_global_y),
@@ -1168,12 +1065,6 @@ impl GuiHandler {
         );
         if let Some(source_target_details) = source_target_details {
             extend_object_fields(&mut extra_details, source_target_details);
-        } else {
-            extra_details.insert(
-                "grounding_method".to_string(),
-                JsonValue::String("absolute_coordinates".to_string()),
-            );
-            extra_details.insert("confidence".to_string(), JsonValue::from(1.0));
         }
         if let Some(destination_target_details) = destination_target_details {
             extra_details.insert(
@@ -1194,47 +1085,44 @@ impl GuiHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<GuiToolOutput, FunctionCallError> {
+        let action_session = session::begin_gui_action_session(&invocation, "gui_scroll", true)?;
         let args = parse_function_args::<ScrollArgs>(&invocation.payload)?;
         let window_selection = normalize_window_selection(
             args.window_title.as_deref(),
             args.window_selector.as_ref(),
         )?;
-        let delta_x = args.delta_x.unwrap_or(0);
-        let delta_y = args.delta_y.unwrap_or(0);
+        let direction = normalize_scroll_direction(args.direction.as_deref())?;
+        let distance = normalize_scroll_distance(args.distance.as_deref())?;
         let semantic_target = normalize_optional_string(args.target.as_deref());
         let location_hint = normalize_optional_string(args.location_hint.as_deref());
         let scope = normalize_optional_string(args.scope.as_deref());
-        if delta_x == 0 && delta_y == 0 {
-            return Err(FunctionCallError::RespondToModel(
-                "gui_scroll requires at least one of `delta_x` or `delta_y`".to_string(),
-            ));
-        }
+        enforce_gui_tool_capability(&invocation, "gui_scroll", semantic_target.is_some())?;
 
         let mut float_env = Vec::new();
         let mut state_for_summary = None;
         let mut target_details = None;
         let mut executed_point = None;
-        let mut used_absolute_coordinates = false;
+        let mut target_bounds = None;
         if let Some(target) = semantic_target.as_deref() {
-            if args.x.is_some() || args.y.is_some() {
-                return Err(FunctionCallError::RespondToModel(
-                    "gui_scroll accepts either `x`/`y` or `target`, but not both".to_string(),
-                ));
-            }
-            let grounded = self.resolve_gui_target(GuiTargetRequest {
-                app: args.app.as_deref(),
-                capture_mode: args.capture_mode.as_deref(),
-                window_selection: window_selection.as_ref(),
-                target,
-                location_hint: location_hint.as_deref(),
-                scope: scope.as_deref(),
-                grounding_mode: args.grounding_mode.as_deref(),
-                action: "scroll",
-                related_target: None,
-                related_scope: None,
-                related_location_hint: None,
-                related_point: None,
-            })?;
+            let grounded = self
+                .resolve_gui_target(
+                    &invocation,
+                    GuiTargetRequest {
+                        app: args.app.as_deref(),
+                        capture_mode: args.capture_mode.as_deref(),
+                        window_selection: window_selection.as_ref(),
+                        target,
+                        location_hint: location_hint.as_deref(),
+                        scope: scope.as_deref(),
+                        grounding_mode: args.grounding_mode.as_deref(),
+                        action: "scroll",
+                        related_target: None,
+                        related_scope: None,
+                        related_location_hint: None,
+                        related_point: None,
+                    },
+                )
+                .await?;
             let grounded = grounded.ok_or_else(|| {
                 FunctionCallError::RespondToModel(format!(
                     "Could not resolve semantic GUI target `{target}` for scrolling."
@@ -1245,35 +1133,58 @@ impl GuiHandler {
             float_env.push(("CODEX_GUI_X", resolved.point.x));
             float_env.push(("CODEX_GUI_Y", resolved.point.y));
             executed_point = Some((resolved.point.x, resolved.point.y));
+            target_bounds = Some(resolved.bounds.clone());
             state_for_summary = Some(resolved.capture_state);
             target_details = Some(details);
-        } else if let (Some(x), Some(y)) = (args.x, args.y) {
-            let (global_x, global_y, state) = self.resolve_global_point(
-                &invocation,
-                args.app.as_deref(),
+        } else if args.app.is_some() || args.capture_mode.is_some() || window_selection.is_some() {
+            let context = capture_context(args.app.as_deref(), false, window_selection.as_ref())?;
+            let capture = resolve_capture_target(
+                &context,
                 args.capture_mode.as_deref(),
-                window_selection.as_ref(),
-                x,
-                y,
+                window_selection.is_some(),
+                args.app.as_deref().is_some(),
             )?;
-            float_env.push(("CODEX_GUI_X", global_x));
-            float_env.push(("CODEX_GUI_Y", global_y));
-            executed_point = Some((global_x, global_y));
-            state_for_summary = Some(state);
-            used_absolute_coordinates = true;
-        } else if args.x.is_some() || args.y.is_some() {
-            return Err(FunctionCallError::RespondToModel(
-                "gui_scroll requires both `x` and `y` when specifying a scroll location"
-                    .to_string(),
-            ));
+            state_for_summary = Some(ObserveState {
+                capture: CaptureArtifact {
+                    origin_x: capture.bounds.x,
+                    origin_y: capture.bounds.y,
+                    width: capture.width,
+                    height: capture.height,
+                    image_width: capture.width,
+                    image_height: capture.height,
+                    scale_x: 1.0,
+                    scale_y: 1.0,
+                    display_index: context.display.index,
+                    capture_mode: capture.mode,
+                    window_title: capture.window_title,
+                    window_count: capture.window_count,
+                    window_capture_strategy: capture.window_capture_strategy,
+                    host_exclusion: HostCaptureExclusionState {
+                        applied: context.host_self_exclude_applied.unwrap_or(false),
+                        frontmost_excluded: context.host_frontmost_excluded.unwrap_or(false),
+                        adjusted: capture.host_self_exclude_adjusted,
+                        frontmost_app_name: context.host_frontmost_app_name.clone(),
+                        frontmost_bundle_id: context.host_frontmost_bundle_id.clone(),
+                        redaction_count: 0,
+                    },
+                },
+                app_name: context.app_name,
+            });
+        } else if let Some(previous_state) = self.get_observe_state(&invocation) {
+            state_for_summary = Some(previous_state);
         }
 
-        let unit = args.unit.as_deref().unwrap_or("line");
-        if unit != "line" && unit != "pixel" {
-            return Err(FunctionCallError::RespondToModel(format!(
-                "gui_scroll.unit only supports `line` or `pixel`, got `{unit}`"
-            )));
-        }
+        let capture_bounds = state_for_summary.as_ref().map(ObserveState::capture_bounds);
+        let scroll_plan = resolve_scroll_plan(
+            args.amount,
+            distance,
+            semantic_target.is_some(),
+            direction,
+            target_bounds.as_ref(),
+            capture_bounds.as_ref(),
+        );
+        let (delta_x, delta_y) = scroll_delta_components(direction, scroll_plan.amount);
+        action_session.throw_if_emergency_stopped()?;
 
         run_gui_event(
             "scroll",
@@ -1282,29 +1193,30 @@ impl GuiHandler {
             &[
                 ("CODEX_GUI_SCROLL_X", delta_x.to_string()),
                 ("CODEX_GUI_SCROLL_Y", delta_y.to_string()),
-                ("CODEX_GUI_SCROLL_UNIT", unit.to_string()),
+                ("CODEX_GUI_SCROLL_UNIT", scroll_plan.unit.to_string()),
             ],
         )?;
+        action_session.throw_if_emergency_stopped()?;
         let evidence = self
             .capture_evidence_image(
                 &invocation,
                 args.app.as_deref(),
                 args.capture_mode.as_deref(),
                 window_selection.as_ref(),
-                args.post_action_settle_ms,
-                args.return_image,
                 DEFAULT_POST_ACTION_SETTLE_MS,
             )
             .await?;
         let summary = format!(
-            "Scrolled macOS GUI with delta_x={} delta_y={} ({unit}){}.{} Refresh with gui_wait or gui_observe before grounding the next GUI action.",
-            delta_x,
-            delta_y,
+            "Scrolled macOS GUI {} using `{}` distance ({} {}).{}.{} Refresh with gui_wait or gui_observe before grounding the next GUI action.",
+            scroll_direction_label(direction),
+            scroll_plan.distance_preset,
+            scroll_plan.amount,
+            scroll_plan.unit,
             state_for_summary
                 .as_ref()
                 .map(|state| format!(
                     " on {} {}",
-                    state.capture_mode,
+                    state.capture.capture_mode,
                     describe_capture_subject(state)
                 ))
                 .unwrap_or_default(),
@@ -1319,6 +1231,40 @@ impl GuiHandler {
             "action_kind".to_string(),
             JsonValue::String("scroll".to_string()),
         );
+        extra_details.insert(
+            "scroll_direction".to_string(),
+            JsonValue::String(scroll_direction_label(direction).to_string()),
+        );
+        extra_details.insert(
+            "scroll_distance".to_string(),
+            JsonValue::String(scroll_plan.distance_preset.to_string()),
+        );
+        extra_details.insert(
+            "scroll_amount".to_string(),
+            JsonValue::from(scroll_plan.amount),
+        );
+        extra_details.insert(
+            "scroll_unit".to_string(),
+            JsonValue::String(scroll_plan.unit.to_string()),
+        );
+        if let Some(viewport_dimension) = scroll_plan.viewport_dimension {
+            extra_details.insert(
+                "scroll_viewport_dimension".to_string(),
+                JsonValue::from(viewport_dimension),
+            );
+        }
+        if let Some(viewport_source) = scroll_plan.viewport_source {
+            extra_details.insert(
+                "scroll_viewport_source".to_string(),
+                JsonValue::String(viewport_source.to_string()),
+            );
+        }
+        if let Some(travel_fraction) = scroll_plan.travel_fraction {
+            extra_details.insert(
+                "scroll_travel_fraction".to_string(),
+                JsonValue::from(travel_fraction),
+            );
+        }
         if let Some((x, y)) = executed_point {
             extra_details.insert("executed_point".to_string(), point_json(x, y));
         }
@@ -1330,18 +1276,18 @@ impl GuiHandler {
                     build_capture_details_from_state(state),
                 );
             }
-        } else if used_absolute_coordinates {
-            extra_details.insert(
-                "grounding_method".to_string(),
-                JsonValue::String("absolute_coordinates".to_string()),
-            );
-            extra_details.insert("confidence".to_string(), JsonValue::from(1.0));
         } else {
             extra_details.insert(
                 "grounding_method".to_string(),
                 JsonValue::String("targetless".to_string()),
             );
             extra_details.insert("confidence".to_string(), JsonValue::from(1.0));
+            if let Some(state) = state_for_summary.as_ref() {
+                extra_details.insert(
+                    "pre_action_capture".to_string(),
+                    build_capture_details_from_state(state),
+                );
+            }
         }
         Ok(self.build_gui_output(
             summary,
@@ -1356,34 +1302,41 @@ impl GuiHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<GuiToolOutput, FunctionCallError> {
+        let action_session = session::begin_gui_action_session(&invocation, "gui_type", true)?;
         let args = parse_function_args::<TypeArgs>(&invocation.payload)?;
         let window_selection = normalize_window_selection(
             args.window_title.as_deref(),
             args.window_selector.as_ref(),
         )?;
-        let text = resolve_type_text(&args)?;
+        let text = resolve_type_value(&args)?;
         let semantic_target = normalize_optional_string(args.target.as_deref());
         let location_hint = normalize_optional_string(args.location_hint.as_deref());
         let scope = normalize_optional_string(args.scope.as_deref());
-        let strategy = args.strategy.as_deref().unwrap_or("unicode");
+        enforce_gui_tool_capability(&invocation, "gui_type", semantic_target.is_some())?;
+        let strategy = normalize_optional_string(args.type_strategy.as_deref());
         let mut target_details = None;
         let mut executed_point = None;
         let mut pre_action_capture = None;
         if let Some(target) = semantic_target.as_deref() {
-            let grounded = self.resolve_gui_target(GuiTargetRequest {
-                app: args.app.as_deref(),
-                capture_mode: args.capture_mode.as_deref(),
-                window_selection: window_selection.as_ref(),
-                target,
-                location_hint: location_hint.as_deref(),
-                scope: scope.as_deref(),
-                grounding_mode: args.grounding_mode.as_deref(),
-                action: "type",
-                related_target: None,
-                related_scope: None,
-                related_location_hint: None,
-                related_point: None,
-            })?;
+            let grounded = self
+                .resolve_gui_target(
+                    &invocation,
+                    GuiTargetRequest {
+                        app: args.app.as_deref(),
+                        capture_mode: args.capture_mode.as_deref(),
+                        window_selection: window_selection.as_ref(),
+                        target,
+                        location_hint: location_hint.as_deref(),
+                        scope: scope.as_deref(),
+                        grounding_mode: args.grounding_mode.as_deref(),
+                        action: "type",
+                        related_target: None,
+                        related_scope: None,
+                        related_location_hint: None,
+                        related_point: None,
+                    },
+                )
+                .await?;
             let grounded = grounded.ok_or_else(|| {
                 FunctionCallError::RespondToModel(format!(
                     "Could not resolve semantic input target `{target}`."
@@ -1410,37 +1363,42 @@ impl GuiHandler {
                 window_selection.as_ref(),
             )?;
         }
-        if !matches!(
-            strategy,
-            "unicode"
-                | "clipboard_paste"
-                | "physical_keys"
-                | "system_events_paste"
-                | "system_events_keystroke"
-                | "system_events_keystroke_chars"
-        ) {
+        if let Some(strategy) = strategy.as_deref()
+            && !matches!(
+                strategy,
+                "clipboard_paste"
+                    | "physical_keys"
+                    | "system_events_paste"
+                    | "system_events_keystroke"
+                    | "system_events_keystroke_chars"
+            )
+        {
             return Err(FunctionCallError::RespondToModel(format!(
-                "gui_type.strategy only supports `unicode`, `clipboard_paste`, `physical_keys`, `system_events_paste`, `system_events_keystroke`, or `system_events_keystroke_chars`, got `{strategy}`"
+                "gui_type.type_strategy only supports `clipboard_paste`, `physical_keys`, `system_events_paste`, `system_events_keystroke`, or `system_events_keystroke_chars`, got `{strategy}`"
             )));
         }
+        action_session.throw_if_emergency_stopped()?;
 
-        if matches!(
-            strategy,
-            "system_events_paste" | "system_events_keystroke" | "system_events_keystroke_chars"
+        let replace = args.replace.unwrap_or(true);
+        let submit = args.submit.unwrap_or(false);
+        let effective_strategy = if matches!(
+            strategy.as_deref(),
+            Some("system_events_paste")
+                | Some("system_events_keystroke")
+                | Some("system_events_keystroke_chars")
         ) {
-            let replace = args.replace.unwrap_or(true);
-            let submit = args.submit.unwrap_or(false);
             run_system_events_type(
                 args.app.as_deref(),
                 window_selection.as_ref(),
                 &text,
                 replace,
                 submit,
-                strategy,
+                strategy
+                    .as_deref()
+                    .expect("system events strategy should be present"),
             )?;
-        } else {
-            let replace = args.replace.unwrap_or(true);
-            let submit = args.submit.unwrap_or(false);
+            strategy.clone()
+        } else if let Some(native_strategy) = strategy.as_deref() {
             run_gui_event(
                 "type_text",
                 args.app.as_deref(),
@@ -1455,10 +1413,47 @@ impl GuiHandler {
                         "CODEX_GUI_SUBMIT",
                         if submit { "1" } else { "0" }.to_string(),
                     ),
-                    ("CODEX_GUI_TYPE_STRATEGY", strategy.to_string()),
+                    ("CODEX_GUI_TYPE_STRATEGY", native_strategy.to_string()),
                 ],
             )?;
-        }
+            Some(native_strategy.to_string())
+        } else {
+            // Prefer the paste-based macOS typing path first, then fall back
+            // to native unicode injection if System Events is unavailable.
+            if run_system_events_type(
+                args.app.as_deref(),
+                window_selection.as_ref(),
+                &text,
+                replace,
+                submit,
+                "system_events_paste",
+            )
+            .is_err()
+            {
+                let native_strategy = "unicode";
+                run_gui_event(
+                    "type_text",
+                    args.app.as_deref(),
+                    &[],
+                    &[
+                        ("CODEX_GUI_TEXT", text.clone()),
+                        (
+                            "CODEX_GUI_REPLACE",
+                            if replace { "1" } else { "0" }.to_string(),
+                        ),
+                        (
+                            "CODEX_GUI_SUBMIT",
+                            if submit { "1" } else { "0" }.to_string(),
+                        ),
+                        ("CODEX_GUI_TYPE_STRATEGY", native_strategy.to_string()),
+                    ],
+                )?;
+                Some("unicode".to_string())
+            } else {
+                Some("system_events_paste".to_string())
+            }
+        };
+        action_session.throw_if_emergency_stopped()?;
 
         let evidence = self
             .capture_evidence_image(
@@ -1466,14 +1461,16 @@ impl GuiHandler {
                 args.app.as_deref(),
                 args.capture_mode.as_deref(),
                 window_selection.as_ref(),
-                args.post_action_settle_ms,
-                args.return_image,
                 DEFAULT_POST_TYPE_SETTLE_MS,
             )
             .await?;
         let summary = format!(
-            "Typed {} character(s) with strategy `{strategy}`{}.{} Use gui_wait or gui_observe to verify the field contents and any follow-on UI changes.",
+            "Typed {} character(s){}{}.{} Use gui_wait or gui_observe to verify the field contents and any follow-on UI changes.",
             text.chars().count(),
+            strategy
+                .as_ref()
+                .map(|value| format!(" with strategy `{value}`"))
+                .unwrap_or_default(),
             semantic_target
                 .as_ref()
                 .map(|target| format!(" into semantic target `{target}`"))
@@ -1487,8 +1484,20 @@ impl GuiHandler {
         let mut extra_details = serde_json::Map::new();
         extra_details.insert(
             "action_kind".to_string(),
-            JsonValue::String(strategy.to_string()),
+            JsonValue::String("type_text".to_string()),
         );
+        if let Some(strategy) = strategy {
+            extra_details.insert(
+                "type_strategy_requested".to_string(),
+                JsonValue::String(strategy),
+            );
+        }
+        if let Some(effective_strategy) = effective_strategy {
+            extra_details.insert(
+                "type_strategy_effective".to_string(),
+                JsonValue::String(effective_strategy),
+            );
+        }
         if let Some((x, y)) = executed_point {
             extra_details.insert("executed_point".to_string(), point_json(x, y));
         }
@@ -1517,6 +1526,7 @@ impl GuiHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<GuiToolOutput, FunctionCallError> {
+        let action_session = session::begin_gui_action_session(&invocation, "gui_key", true)?;
         let args = parse_function_args::<KeyArgs>(&invocation.payload)?;
         let window_selection = normalize_window_selection(
             args.window_title.as_deref(),
@@ -1524,6 +1534,7 @@ impl GuiHandler {
         )?;
         let repeat = args.repeat.unwrap_or(1).max(1);
         let mut modifiers = args.modifiers.unwrap_or_default();
+        enforce_gui_tool_capability(&invocation, "gui_key", false)?;
         let key_code = resolve_key_code(&args.key, &mut modifiers)?;
         let modifiers_env = modifiers.join(",");
         prepare_targeted_gui_action(
@@ -1531,6 +1542,7 @@ impl GuiHandler {
             args.capture_mode.as_deref(),
             window_selection.as_ref(),
         )?;
+        action_session.throw_if_emergency_stopped()?;
 
         run_gui_event(
             "key_press",
@@ -1542,6 +1554,7 @@ impl GuiHandler {
                 ("CODEX_GUI_MODIFIERS", modifiers_env.clone()),
             ],
         )?;
+        action_session.throw_if_emergency_stopped()?;
 
         let evidence = self
             .capture_evidence_image(
@@ -1549,8 +1562,6 @@ impl GuiHandler {
                 args.app.as_deref(),
                 args.capture_mode.as_deref(),
                 window_selection.as_ref(),
-                args.post_action_settle_ms,
-                args.return_image,
                 DEFAULT_POST_TYPE_SETTLE_MS,
             )
             .await?;
@@ -1587,13 +1598,17 @@ impl GuiHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<GuiToolOutput, FunctionCallError> {
+        let action_session = session::begin_gui_action_session(&invocation, "gui_move", true)?;
         let args = parse_function_args::<MoveArgs>(&invocation.payload)?;
+        enforce_gui_tool_capability(&invocation, "gui_move", false)?;
+        action_session.throw_if_emergency_stopped()?;
         run_gui_event(
             "move_cursor",
             args.app.as_deref(),
             &[("CODEX_GUI_X", args.x), ("CODEX_GUI_Y", args.y)],
             &[("CODEX_GUI_SETTLE_MS", DEFAULT_HOVER_SETTLE_MS.to_string())],
         )?;
+        action_session.throw_if_emergency_stopped()?;
 
         let summary = format!(
             "Moved the macOS pointer to absolute display coordinate ({}, {}).",
@@ -1619,54 +1634,6 @@ impl GuiHandler {
         })
     }
 
-    fn resolve_global_point(
-        &self,
-        invocation: &ToolInvocation,
-        app: Option<&str>,
-        capture_mode: Option<&str>,
-        window_selection: Option<&WindowSelector>,
-        local_x: f64,
-        local_y: f64,
-    ) -> Result<(f64, f64, ObserveState), FunctionCallError> {
-        let session_id = invocation.session.conversation_id.to_string();
-        let state = if app.is_none() && capture_mode.is_none() && window_selection.is_none() {
-            self.observe_state
-                .lock()
-                .expect("gui observe state poisoned")
-                .get(&session_id)
-                .cloned()
-        } else {
-            None
-        };
-
-        let state = match state {
-            Some(state) => state,
-            None => {
-                let context = capture_context(app, false, window_selection)?;
-                let capture = resolve_capture_target(
-                    &context,
-                    capture_mode,
-                    window_selection.is_some(),
-                    app.is_some(),
-                )?;
-                ObserveState {
-                    capture_x: capture.bounds.x,
-                    capture_y: capture.bounds.y,
-                    width: capture.width,
-                    height: capture.height,
-                    app_name: context.app_name,
-                    display_index: context.display.index,
-                    capture_mode: capture.mode,
-                    window_title: capture.window_title,
-                    window_count: capture.window_count,
-                    window_capture_strategy: capture.window_capture_strategy,
-                }
-            }
-        };
-
-        Ok((state.capture_x + local_x, state.capture_y + local_y, state))
-    }
-
     fn get_observe_state(&self, invocation: &ToolInvocation) -> Option<ObserveState> {
         self.observe_state
             .lock()
@@ -1681,11 +1648,9 @@ impl GuiHandler {
         app: Option<&str>,
         capture_mode: Option<&str>,
         window_selection: Option<&WindowSelector>,
-        settle_ms: Option<i64>,
-        return_image: Option<bool>,
         default_settle_ms: i64,
     ) -> Result<ActionEvidence, FunctionCallError> {
-        let attach_image = should_attach_image(invocation, return_image)?;
+        let attach_image = supports_image_input(invocation);
         let mut app = normalize_optional_string(app);
         let mut capture_mode = normalize_optional_string(capture_mode);
         let mut window_selection = window_selection.cloned();
@@ -1693,10 +1658,11 @@ impl GuiHandler {
         if app.is_none() && capture_mode.is_none() && window_selection.is_none() {
             if let Some(previous_state) = self.get_observe_state(invocation) {
                 app = previous_state.app_name.clone();
-                capture_mode = Some(previous_state.capture_mode.to_string());
-                if previous_state.capture_mode == "window" {
+                capture_mode = Some(previous_state.capture.capture_mode.to_string());
+                if previous_state.capture.capture_mode == "window" {
                     window_selection =
                         previous_state
+                            .capture
                             .window_title
                             .as_ref()
                             .map(|title| WindowSelector {
@@ -1708,43 +1674,22 @@ impl GuiHandler {
             }
         }
 
-        let settle_ms = settle_ms.unwrap_or(default_settle_ms);
-        if settle_ms < 0 {
-            return Err(FunctionCallError::RespondToModel(
-                "gui post_action_settle_ms must be zero or a positive integer".to_string(),
-            ));
-        }
-        sleep(Duration::from_millis(settle_ms as u64)).await;
+        sleep(Duration::from_millis(default_settle_ms as u64)).await;
 
-        let context = capture_context(app.as_deref(), true, window_selection.as_ref())?;
-        let capture = resolve_capture_target(
-            &context,
+        let observation = observe_platform(
+            app.as_deref(),
+            true,
             capture_mode.as_deref(),
-            window_selection.is_some(),
+            window_selection.as_ref(),
             app.as_deref().is_some(),
         )?;
         let image_bytes = if attach_image {
-            Some(capture_region(
-                &capture.bounds,
-                capture.width,
-                capture.height,
-            )?)
+            Some(observation.image_bytes.clone())
         } else {
             None
         };
         let image_url = image_bytes.as_deref().map(data_url_png);
-        let state = ObserveState {
-            capture_x: capture.bounds.x,
-            capture_y: capture.bounds.y,
-            width: capture.width,
-            height: capture.height,
-            app_name: context.app_name.clone(),
-            display_index: context.display.index,
-            capture_mode: capture.mode,
-            window_title: capture.window_title.clone(),
-            window_count: capture.window_count,
-            window_capture_strategy: capture.window_capture_strategy.clone(),
-        };
+        let state = observation.state;
         self.observe_state
             .lock()
             .expect("gui observe state poisoned")
@@ -1777,16 +1722,26 @@ impl GuiHandler {
         let mut code_result = serde_json::json!({
             "message": summary,
             "image_url": image_url,
-            "display_index": state.display_index,
-            "capture_mode": state.capture_mode,
-            "origin_x": state.capture_x,
-            "origin_y": state.capture_y,
-            "width": state.width,
-            "height": state.height,
+            "display_index": state.capture.display_index,
+            "capture_mode": state.capture.capture_mode,
+            "origin_x": state.capture.origin_x,
+            "origin_y": state.capture.origin_y,
+            "width": state.capture.width,
+            "height": state.capture.height,
+            "image_width": state.capture.image_width,
+            "image_height": state.capture.image_height,
+            "capture_scale_x": state.capture.scale_x,
+            "capture_scale_y": state.capture.scale_y,
             "app": state.app_name,
-            "window_title": state.window_title,
-            "window_count": state.window_count,
-            "window_capture_strategy": state.window_capture_strategy,
+            "window_title": state.capture.window_title,
+            "window_count": state.capture.window_count,
+            "window_capture_strategy": state.capture.window_capture_strategy,
+            "capture_host_self_exclude_applied": state.capture.host_exclusion.applied,
+            "capture_host_frontmost_excluded": state.capture.host_exclusion.frontmost_excluded,
+            "capture_host_self_exclude_adjusted": state.capture.host_exclusion.adjusted,
+            "capture_host_frontmost_app": state.capture.host_exclusion.frontmost_app_name,
+            "capture_host_frontmost_bundle_id": state.capture.host_exclusion.frontmost_bundle_id,
+            "capture_host_self_exclude_redaction_count": state.capture.host_exclusion.redaction_count,
         });
         if let Some(JsonValue::Object(extra)) = extra_details
             && let Some(base) = code_result.as_object_mut()
@@ -1803,72 +1758,110 @@ impl GuiHandler {
         }
     }
 
-    fn probe_semantic_target(
+    async fn probe_semantic_target(
         &self,
+        invocation: &ToolInvocation,
         request: GuiTargetRequest<'_>,
     ) -> Result<TargetProbe, FunctionCallError> {
-        let context = capture_context(request.app, true, request.window_selection)?;
-        let capture = resolve_capture_target(
-            &context,
+        let observation = observe_platform(
+            request.app,
+            true,
             request.capture_mode,
-            request.window_selection.is_some(),
+            request.window_selection,
             request.app.is_some(),
         )?;
-        let capture_state = ObserveState {
-            capture_x: capture.bounds.x,
-            capture_y: capture.bounds.y,
-            width: capture.width,
-            height: capture.height,
-            app_name: context.app_name.clone(),
-            display_index: context.display.index,
-            capture_mode: capture.mode,
-            window_title: capture.window_title.clone(),
-            window_count: capture.window_count,
-            window_capture_strategy: capture.window_capture_strategy.clone(),
-        };
-        let helper_target = resolve_semantic_target(request)?;
-        let grounding_mode =
-            normalize_grounding_mode(request.grounding_mode, request.action).map(str::to_string)?;
-        let target = helper_target.map(|resolved| ResolvedTarget {
-            window_title: resolved.window_title,
-            matched_text: resolved.matched_text,
-            role: resolved.role,
-            role_description: resolved.role_description,
-            identifier: resolved.identifier,
-            confidence: resolved.confidence,
-            reason: resolved.reason,
-            grounding_mode_requested: grounding_mode.clone(),
-            grounding_mode_effective: grounding_mode,
-            scope: request.scope.map(ToOwned::to_owned),
-            point: resolved.point.clone(),
-            bounds: resolved.bounds,
-            local_point: local_point_within_state(&capture_state, &resolved.point),
-            capture_state: capture_state.clone(),
-        });
+        let capture_state = observation.state;
+        let target = self
+            .ground_target(
+                invocation,
+                request,
+                &capture_state,
+                &observation.image_bytes,
+            )
+            .await?;
         Ok(TargetProbe {
             capture_state,
             target,
         })
     }
 
-    fn resolve_gui_target(
+    async fn resolve_gui_target(
         &self,
+        invocation: &ToolInvocation,
         request: GuiTargetRequest<'_>,
     ) -> Result<Option<GroundedGuiTarget>, FunctionCallError> {
-        let grounded = self
-            .ground_target(request)?
-            .map(|resolved| GroundedGuiTarget {
-                grounding_method: "accessibility",
+        let initial_probe = self
+            .probe_semantic_target(
+                invocation,
+                GuiTargetRequest {
+                    capture_mode: fallback_probe_capture_mode(
+                        request.capture_mode,
+                        /*attempt*/ 1,
+                        request.app,
+                    ),
+                    ..request
+                },
+            )
+            .await?;
+        if let Some(resolved) = initial_probe.target {
+            return Ok(Some(GroundedGuiTarget {
+                grounding_method: "grounding",
                 resolved,
-            });
-        Ok(grounded)
+            }));
+        }
+
+        let should_retry_with_display = request.capture_mode.is_none()
+            && request.app.is_some()
+            && initial_probe.capture_state.capture.capture_mode == "window";
+        if !should_retry_with_display {
+            return Ok(None);
+        }
+
+        let fallback_probe = self
+            .probe_semantic_target(
+                invocation,
+                GuiTargetRequest {
+                    capture_mode: fallback_probe_capture_mode(
+                        request.capture_mode,
+                        /*attempt*/ 2,
+                        request.app,
+                    ),
+                    ..request
+                },
+            )
+            .await?;
+        Ok(fallback_probe.target.map(|resolved| GroundedGuiTarget {
+            grounding_method: "grounding_display_fallback",
+            resolved,
+        }))
     }
 
-    fn ground_target(
+    async fn ground_target(
         &self,
+        invocation: &ToolInvocation,
         request: GuiTargetRequest<'_>,
+        capture_state: &ObserveState,
+        image_bytes: &[u8],
     ) -> Result<Option<ResolvedTarget>, FunctionCallError> {
-        Ok(self.probe_semantic_target(request)?.target)
+        if !supports_image_input(invocation) {
+            return Err(FunctionCallError::RespondToModel(
+                GUI_IMAGE_UNSUPPORTED_MESSAGE.to_string(),
+            ));
+        }
+
+        let image_bytes = if image_bytes.is_empty() {
+            let bounds = capture_state.capture_bounds();
+            capture_region(
+                &bounds,
+                capture_state.capture.image_width,
+                capture_state.capture.image_height,
+            )?
+        } else {
+            image_bytes.to_vec()
+        };
+        default_gui_grounding_provider()
+            .ground(invocation, request, capture_state, &image_bytes)
+            .await
     }
 
     async fn capture_evidence_image(
@@ -1877,8 +1870,6 @@ impl GuiHandler {
         app: Option<&str>,
         capture_mode: Option<&str>,
         window_selection: Option<&WindowSelector>,
-        settle_ms: Option<i64>,
-        return_image: Option<bool>,
         default_settle_ms: i64,
     ) -> Result<ActionEvidence, FunctionCallError> {
         self.capture_post_action_evidence(
@@ -1886,8 +1877,6 @@ impl GuiHandler {
             app,
             capture_mode,
             window_selection,
-            settle_ms,
-            return_image,
             default_settle_ms,
         )
         .await
@@ -1900,40 +1889,67 @@ impl GuiHandler {
         state: &'static str,
         timeout_ms: i64,
         interval_ms: i64,
-        return_image: Option<bool>,
     ) -> Result<GuiTargetProbeResult, FunctionCallError> {
-        let attach_image = should_attach_image(invocation, return_image)?;
+        let attach_image = supports_image_input(invocation);
         let mut attempts = 0;
         let mut elapsed_ms = 0;
-        let initial_probe = self.probe_semantic_target(request)?;
+        let initial_probe = self
+            .probe_semantic_target(
+                invocation,
+                GuiTargetRequest {
+                    capture_mode: fallback_probe_capture_mode(request.capture_mode, 1, request.app),
+                    ..request
+                },
+            )
+            .await?;
         let mut last_grounded = initial_probe.target.map(|resolved| GroundedGuiTarget {
-            grounding_method: "accessibility",
+            grounding_method: "grounding",
             resolved,
         });
         attempts += 1;
         let mut current_state = initial_probe.capture_state;
-        let mut matched = match state {
+        let initial_satisfied = match state {
             "appear" => last_grounded.is_some(),
             "disappear" => last_grounded.is_none(),
             _ => false,
         };
+        let mut consecutive_satisfied = if initial_satisfied { 1 } else { 0 };
+        let mut matched = consecutive_satisfied >= WAIT_CONFIRMATION_COUNT;
 
         while !matched && elapsed_ms < timeout_ms {
             let sleep_ms = (timeout_ms - elapsed_ms).min(interval_ms);
             sleep(Duration::from_millis(sleep_ms as u64)).await;
             elapsed_ms += sleep_ms;
-            let probe = self.probe_semantic_target(request)?;
+            let probe = self
+                .probe_semantic_target(
+                    invocation,
+                    GuiTargetRequest {
+                        capture_mode: fallback_probe_capture_mode(
+                            request.capture_mode,
+                            attempts + 1,
+                            request.app,
+                        ),
+                        ..request
+                    },
+                )
+                .await?;
             current_state = probe.capture_state.clone();
             last_grounded = probe.target.map(|resolved| GroundedGuiTarget {
-                grounding_method: "accessibility",
+                grounding_method: "grounding",
                 resolved,
             });
             attempts += 1;
-            matched = match state {
+            let satisfied = match state {
                 "appear" => last_grounded.is_some(),
                 "disappear" => last_grounded.is_none(),
                 _ => false,
             };
+            consecutive_satisfied = if satisfied {
+                consecutive_satisfied + 1
+            } else {
+                0
+            };
+            matched = consecutive_satisfied >= WAIT_CONFIRMATION_COUNT;
         }
 
         self.observe_state
@@ -1980,26 +1996,6 @@ fn supports_image_input(invocation: &ToolInvocation) -> bool {
         .contains(&InputModality::Image)
 }
 
-fn should_attach_image(
-    invocation: &ToolInvocation,
-    return_image: Option<bool>,
-) -> Result<bool, FunctionCallError> {
-    should_attach_image_with_support(supports_image_input(invocation), return_image)
-}
-
-fn should_attach_image_with_support(
-    image_supported: bool,
-    return_image: Option<bool>,
-) -> Result<bool, FunctionCallError> {
-    match return_image {
-        Some(true) if !image_supported => Err(FunctionCallError::RespondToModel(
-            GUI_IMAGE_UNSUPPORTED_MESSAGE.to_string(),
-        )),
-        Some(value) => Ok(value),
-        None => Ok(image_supported),
-    }
-}
-
 fn normalize_wait_target_state(state: Option<&str>) -> Result<&'static str, FunctionCallError> {
     match state.map(str::trim).filter(|value| !value.is_empty()) {
         None => Ok("appear"),
@@ -2013,54 +2009,190 @@ fn normalize_wait_target_state(state: Option<&str>) -> Result<&'static str, Func
 
 fn normalize_grounding_mode(
     grounding_mode: Option<&str>,
-    tool_name: &str,
+    action: &str,
 ) -> Result<&'static str, FunctionCallError> {
     match grounding_mode
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        None => Ok("single"),
+        None => Ok(default_grounding_mode_for_action(action)),
         Some("single") => Ok("single"),
         Some("complex") => Ok("complex"),
         Some(other) => Err(FunctionCallError::RespondToModel(format!(
-            "{tool_name}.grounding_mode only supports `single` or `complex`, got `{other}`"
+            "{action}.grounding_mode only supports `single` or `complex`, got `{other}`"
         ))),
+    }
+}
+
+fn default_grounding_mode_for_action(action: &str) -> &'static str {
+    match action {
+        "type" | "drag_source" | "drag_destination" => "complex",
+        _ => "single",
+    }
+}
+
+fn normalize_scroll_direction(
+    direction: Option<&str>,
+) -> Result<ScrollDirection, FunctionCallError> {
+    match direction
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("down")
+    {
+        "up" => Ok(ScrollDirection::Up),
+        "down" => Ok(ScrollDirection::Down),
+        "left" => Ok(ScrollDirection::Left),
+        "right" => Ok(ScrollDirection::Right),
+        other => Err(FunctionCallError::RespondToModel(format!(
+            "gui_scroll.direction only supports `up`, `down`, `left`, or `right`, got `{other}`"
+        ))),
+    }
+}
+
+fn normalize_scroll_distance(
+    distance: Option<&str>,
+) -> Result<Option<&'static str>, FunctionCallError> {
+    match distance.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(None),
+        Some("small") => Ok(Some("small")),
+        Some("medium") => Ok(Some("medium")),
+        Some("page") => Ok(Some("page")),
+        Some(other) => Err(FunctionCallError::RespondToModel(format!(
+            "gui_scroll.distance only supports `small`, `medium`, or `page`, got `{other}`"
+        ))),
+    }
+}
+
+fn scroll_direction_uses_horizontal_axis(direction: ScrollDirection) -> bool {
+    matches!(direction, ScrollDirection::Left | ScrollDirection::Right)
+}
+
+fn scroll_viewport_dimension_for_direction(rect: &HelperRect, direction: ScrollDirection) -> i64 {
+    if scroll_direction_uses_horizontal_axis(direction) {
+        rect.width.round().max(1.0) as i64
+    } else {
+        rect.height.round().max(1.0) as i64
+    }
+}
+
+fn scroll_distance_fraction(distance: &str) -> f64 {
+    match distance {
+        "small" => 0.25,
+        "medium" => 0.5,
+        "page" => 0.75,
+        _ => 0.5,
+    }
+}
+
+fn scroll_distance_line_amount(distance: &str) -> i64 {
+    match distance {
+        "small" => 3,
+        "medium" => 5,
+        "page" => 12,
+        _ => 5,
+    }
+}
+
+fn resolve_scroll_plan(
+    amount: Option<i64>,
+    distance: Option<&'static str>,
+    has_target: bool,
+    direction: ScrollDirection,
+    target_bounds: Option<&HelperRect>,
+    capture_bounds: Option<&HelperRect>,
+) -> ResolvedGuiScrollPlan {
+    if let Some(amount) = amount {
+        return ResolvedGuiScrollPlan {
+            amount: amount.clamp(1, 50),
+            distance_preset: "custom",
+            unit: "line",
+            viewport_dimension: None,
+            viewport_source: None,
+            travel_fraction: None,
+        };
+    }
+
+    let distance_preset = distance.unwrap_or(if has_target {
+        DEFAULT_TARGETED_SCROLL_DISTANCE
+    } else {
+        DEFAULT_TARGETLESS_SCROLL_DISTANCE
+    });
+
+    if let Some(bounds) = target_bounds {
+        let viewport_dimension = scroll_viewport_dimension_for_direction(bounds, direction);
+        let travel_fraction = scroll_distance_fraction(distance_preset);
+        return ResolvedGuiScrollPlan {
+            amount: (viewport_dimension as f64 * travel_fraction)
+                .round()
+                .clamp(1.0, 4000.0) as i64,
+            distance_preset,
+            unit: "pixel",
+            viewport_dimension: Some(viewport_dimension),
+            viewport_source: Some("target_box"),
+            travel_fraction: Some(travel_fraction),
+        };
+    }
+
+    if let Some(bounds) = capture_bounds {
+        let viewport_dimension = scroll_viewport_dimension_for_direction(bounds, direction);
+        let travel_fraction = scroll_distance_fraction(distance_preset);
+        return ResolvedGuiScrollPlan {
+            amount: (viewport_dimension as f64 * travel_fraction)
+                .round()
+                .clamp(1.0, 4000.0) as i64,
+            distance_preset,
+            unit: "pixel",
+            viewport_dimension: Some(viewport_dimension),
+            viewport_source: Some("capture_rect"),
+            travel_fraction: Some(travel_fraction),
+        };
+    }
+
+    ResolvedGuiScrollPlan {
+        amount: scroll_distance_line_amount(distance_preset),
+        distance_preset,
+        unit: "line",
+        viewport_dimension: None,
+        viewport_source: None,
+        travel_fraction: None,
+    }
+}
+
+fn scroll_delta_components(direction: ScrollDirection, amount: i64) -> (i64, i64) {
+    match direction {
+        ScrollDirection::Up => (0, -amount),
+        ScrollDirection::Down => (0, amount),
+        ScrollDirection::Left => (-amount, 0),
+        ScrollDirection::Right => (amount, 0),
+    }
+}
+
+fn scroll_direction_label(direction: ScrollDirection) -> &'static str {
+    match direction {
+        ScrollDirection::Up => "up",
+        ScrollDirection::Down => "down",
+        ScrollDirection::Left => "left",
+        ScrollDirection::Right => "right",
     }
 }
 
 fn normalize_drag_endpoint<'a>(
     endpoint_label: &str,
     target_field: &str,
-    x_field: &str,
-    y_field: &str,
     target: Option<&'a str>,
     location_hint: Option<&'a str>,
     scope: Option<&'a str>,
-    x: Option<f64>,
-    y: Option<f64>,
 ) -> Result<DragEndpoint<'a>, FunctionCallError> {
-    if let Some(target) = target {
-        if x.is_some() || y.is_some() {
-            return Err(FunctionCallError::RespondToModel(format!(
-                "gui_drag {endpoint_label} accepts either `{target_field}` or `{x_field}`/`{y_field}`, but not both"
-            )));
-        }
-        return Ok(DragEndpoint::Target {
-            target,
-            location_hint,
-            scope,
-        });
-    }
-
-    match (x, y) {
-        (Some(x), Some(y)) => Ok(DragEndpoint::Coordinates { x, y }),
-        (Some(_), None) | (None, Some(_)) => Err(FunctionCallError::RespondToModel(format!(
-            "gui_drag requires both `{x_field}` and `{y_field}` when using a coordinate {endpoint_label}"
-        ))),
-        (None, None) => Err(FunctionCallError::RespondToModel(format!(
-            "gui_drag requires either `{target_field}` or both `{x_field}` and `{y_field}` for the {endpoint_label}"
-        ))),
-    }
+    let Some(target) = target else {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "gui_drag requires `{target_field}` for the {endpoint_label}; absolute coordinate dragging is not supported."
+        )));
+    };
+    Ok(DragEndpoint::Target {
+        target,
+        location_hint,
+        scope,
+    })
 }
 
 fn build_target_resolution_details(target: &str, grounded: &GroundedGuiTarget) -> JsonValue {
@@ -2068,17 +2200,13 @@ fn build_target_resolution_details(target: &str, grounded: &GroundedGuiTarget) -
     serde_json::json!({
         "target": target,
         "grounding_method": grounded.grounding_method,
-        "grounding_provider": "native_accessibility",
+        "grounding_provider": resolved.provider,
         "grounding_mode_requested": resolved.grounding_mode_requested,
         "grounding_mode_effective": resolved.grounding_mode_effective,
-        "grounding_coordinate_space": "display_pixels",
+        "grounding_coordinate_space": "image_pixels",
         "confidence": resolved.confidence,
         "reason": resolved.reason,
         "scope": resolved.scope,
-        "matched_text": resolved.matched_text,
-        "target_role": resolved.role,
-        "target_role_description": resolved.role_description,
-        "target_identifier": resolved.identifier,
         "target_window_title": resolved.window_title,
         "grounding_display_point": {
             "x": resolved.point.x,
@@ -2090,6 +2218,12 @@ fn build_target_resolution_details(target: &str, grounded: &GroundedGuiTarget) -
             "width": resolved.bounds.width,
             "height": resolved.bounds.height,
         },
+        "grounding_image_box": resolved.local_bounds.as_ref().map(|bounds| serde_json::json!({
+            "x": bounds.x,
+            "y": bounds.y,
+            "width": bounds.width,
+            "height": bounds.height,
+        })),
         "target_global_point": {
             "x": resolved.point.x,
             "y": resolved.point.y,
@@ -2104,20 +2238,47 @@ fn build_target_resolution_details(target: &str, grounded: &GroundedGuiTarget) -
             "width": resolved.bounds.width,
             "height": resolved.bounds.height,
         },
+        "grounding_diagnostics": build_grounding_diagnostics(resolved.raw.as_ref()),
+        "raw_grounding": resolved.raw.clone(),
     })
+}
+
+fn build_grounding_diagnostics(raw_grounding: Option<&JsonValue>) -> Option<JsonValue> {
+    let JsonValue::Object(raw) = raw_grounding? else {
+        return None;
+    };
+
+    Some(serde_json::json!({
+        "selected_attempt": raw.get("selected_attempt"),
+        "rounds_attempted": raw.get("grounding_rounds_attempted"),
+        "validation_triggered": raw.get("grounding_validation_triggered"),
+        "model_image": raw.get("grounding_model_image"),
+        "validation": raw.get("validation"),
+        "round_artifacts": raw.get("grounding_round_artifacts"),
+    }))
 }
 
 fn build_capture_details_from_state(state: &ObserveState) -> JsonValue {
     serde_json::json!({
-        "capture_mode": state.capture_mode,
-        "origin_x": state.capture_x,
-        "origin_y": state.capture_y,
-        "width": state.width,
-        "height": state.height,
+        "capture_mode": state.capture.capture_mode,
+        "origin_x": state.capture.origin_x,
+        "origin_y": state.capture.origin_y,
+        "width": state.capture.width,
+        "height": state.capture.height,
+        "image_width": state.capture.image_width,
+        "image_height": state.capture.image_height,
+        "capture_scale_x": state.capture.scale_x,
+        "capture_scale_y": state.capture.scale_y,
         "app": state.app_name,
-        "window_title": state.window_title,
-        "window_count": state.window_count,
-        "window_capture_strategy": state.window_capture_strategy,
+        "window_title": state.capture.window_title,
+        "window_count": state.capture.window_count,
+        "window_capture_strategy": state.capture.window_capture_strategy,
+        "capture_host_self_exclude_applied": state.capture.host_exclusion.applied,
+        "capture_host_frontmost_excluded": state.capture.host_exclusion.frontmost_excluded,
+        "capture_host_self_exclude_adjusted": state.capture.host_exclusion.adjusted,
+        "capture_host_frontmost_app": state.capture.host_exclusion.frontmost_app_name,
+        "capture_host_frontmost_bundle_id": state.capture.host_exclusion.frontmost_bundle_id,
+        "capture_host_self_exclude_redaction_count": state.capture.host_exclusion.redaction_count,
     })
 }
 
@@ -2136,13 +2297,14 @@ fn extend_object_fields(target: &mut serde_json::Map<String, JsonValue>, value: 
     }
 }
 
+#[cfg(test)]
 fn local_point_within_state(state: &ObserveState, point: &HelperPoint) -> Option<HelperPoint> {
-    let local_x = point.x - state.capture_x;
-    let local_y = point.y - state.capture_y;
+    let local_x = point.x - state.capture.origin_x;
+    let local_y = point.y - state.capture.origin_y;
     if local_x >= 0.0
         && local_y >= 0.0
-        && local_x <= state.width as f64
-        && local_y <= state.height as f64
+        && local_x <= state.capture.width as f64
+        && local_y <= state.capture.height as f64
     {
         Some(HelperPoint {
             x: local_x,
@@ -2153,15 +2315,54 @@ fn local_point_within_state(state: &ObserveState, point: &HelperPoint) -> Option
     }
 }
 
+fn image_point_within_capture(state: &ObserveState, point: &HelperPoint) -> Option<HelperPoint> {
+    if point.x >= 0.0
+        && point.y >= 0.0
+        && point.x <= state.capture.image_width as f64
+        && point.y <= state.capture.image_height as f64
+    {
+        Some(point.clone())
+    } else {
+        None
+    }
+}
+
+fn local_rect_within_state(state: &ObserveState, rect: &HelperRect) -> Option<HelperRect> {
+    if rect.x >= 0.0
+        && rect.y >= 0.0
+        && rect.width > 0.0
+        && rect.height > 0.0
+        && rect.x + rect.width <= state.capture.image_width as f64
+        && rect.y + rect.height <= state.capture.image_height as f64
+    {
+        Some(rect.clone())
+    } else {
+        None
+    }
+}
+
 fn capture_image_url_for_state(state: &ObserveState) -> Result<String, FunctionCallError> {
-    let bounds = HelperRect {
-        x: state.capture_x,
-        y: state.capture_y,
-        width: state.width as f64,
-        height: state.height as f64,
+    let window_selection = if state.capture.capture_mode == "window" {
+        state
+            .capture
+            .window_title
+            .as_ref()
+            .map(|title| WindowSelector {
+                title: Some(title.clone()),
+                title_contains: None,
+                index: None,
+            })
+    } else {
+        None
     };
-    let image_bytes = capture_region(&bounds, state.width, state.height)?;
-    Ok(data_url_png(&image_bytes))
+    let observation = observe_platform(
+        state.app_name.as_deref(),
+        false,
+        Some(state.capture.capture_mode),
+        window_selection.as_ref(),
+        false,
+    )?;
+    Ok(data_url_png(&observation.image_bytes))
 }
 
 fn rounded_dimension(value: f64, label: &str) -> Result<u32, FunctionCallError> {
@@ -2180,6 +2381,7 @@ struct CaptureTarget {
     bounds: HelperRect,
     width: u32,
     height: u32,
+    host_self_exclude_adjusted: bool,
     window_title: Option<String>,
     window_count: Option<i64>,
     window_capture_strategy: Option<String>,
@@ -2242,6 +2444,21 @@ fn normalize_capture_mode(
     }
 }
 
+fn fallback_probe_capture_mode<'a>(
+    requested_capture_mode: Option<&'a str>,
+    attempt: i64,
+    app: Option<&str>,
+) -> Option<&'a str> {
+    if requested_capture_mode.is_some() {
+        return requested_capture_mode;
+    }
+    if attempt > 1 && app.is_some() {
+        Some("display")
+    } else {
+        None
+    }
+}
+
 fn resolve_capture_target(
     context: &HelperCaptureContext,
     capture_mode: Option<&str>,
@@ -2256,11 +2473,19 @@ fn resolve_capture_target(
         ));
     }
 
+    let host_self_exclude_adjusted = requested_mode.is_none()
+        && !window_selection_requested
+        && !prefer_window_when_available
+        && context.host_self_exclude_applied.unwrap_or(false)
+        && context.host_frontmost_excluded.unwrap_or(false)
+        && context.window_bounds.is_some();
+
     let use_window = match requested_mode {
         Some("window") => context.window_bounds.is_some(),
         Some("display") => false,
         None => {
             window_selection_requested
+                || host_self_exclude_adjusted
                 || (prefer_window_when_available && context.window_bounds.is_some())
         }
         Some(_) => false,
@@ -2284,6 +2509,7 @@ fn resolve_capture_target(
         bounds,
         width,
         height,
+        host_self_exclude_adjusted,
         window_title: if mode == "window" {
             context.window_title.clone()
         } else {
@@ -2307,107 +2533,7 @@ fn capture_context(
     activate_app: bool,
     window_selection: Option<&WindowSelector>,
 ) -> Result<HelperCaptureContext, FunctionCallError> {
-    let mut env = vec![(
-        "CODEX_GUI_ACTIVATE_APP",
-        if activate_app {
-            "1".to_string()
-        } else {
-            "0".to_string()
-        },
-    )];
-    if let Some(app) = app.filter(|app| !app.trim().is_empty()) {
-        env.push(("CODEX_GUI_APP", app.to_string()));
-    }
-    if let Some(window_selection) = window_selection {
-        if let Some(title) = &window_selection.title {
-            env.push(("CODEX_GUI_WINDOW_TITLE", title.clone()));
-        }
-        if let Some(title_contains) = &window_selection.title_contains {
-            env.push(("CODEX_GUI_WINDOW_TITLE_CONTAINS", title_contains.clone()));
-        }
-        if let Some(index) = window_selection.index {
-            env.push(("CODEX_GUI_WINDOW_INDEX", index.to_string()));
-        }
-    }
-
-    let output = run_helper("capture-context", &env)?;
-    serde_json::from_str::<HelperCaptureContext>(&output).map_err(|error| {
-        FunctionCallError::RespondToModel(format!(
-            "failed to decode native GUI capture context: {error}"
-        ))
-    })
-}
-
-fn resolve_semantic_target(
-    request: GuiTargetRequest<'_>,
-) -> Result<Option<HelperResolvedTarget>, FunctionCallError> {
-    let grounding_mode = normalize_grounding_mode(request.grounding_mode, request.action)?;
-    let mut env = vec![
-        ("CODEX_GUI_ACTIVATE_APP", "1".to_string()),
-        ("CODEX_GUI_TARGET", request.target.to_string()),
-        ("CODEX_GUI_GROUNDING_MODE", grounding_mode.to_string()),
-    ];
-    if let Some(app) = request.app.filter(|app| !app.trim().is_empty()) {
-        env.push(("CODEX_GUI_APP", app.to_string()));
-    }
-    if let Some(location_hint) = request
-        .location_hint
-        .filter(|value| !value.trim().is_empty())
-    {
-        env.push(("CODEX_GUI_LOCATION_HINT", location_hint.to_string()));
-    }
-    if let Some(scope) = request.scope.filter(|value| !value.trim().is_empty()) {
-        env.push(("CODEX_GUI_SCOPE", scope.to_string()));
-    }
-    env.push(("CODEX_GUI_ACTION", request.action.to_string()));
-    if let Some(related_target) = request
-        .related_target
-        .filter(|value| !value.trim().is_empty())
-    {
-        env.push(("CODEX_GUI_RELATED_TARGET", related_target.to_string()));
-    }
-    if let Some(related_scope) = request
-        .related_scope
-        .filter(|value| !value.trim().is_empty())
-    {
-        env.push(("CODEX_GUI_RELATED_SCOPE", related_scope.to_string()));
-    }
-    if let Some(related_location_hint) = request
-        .related_location_hint
-        .filter(|value| !value.trim().is_empty())
-    {
-        env.push((
-            "CODEX_GUI_RELATED_LOCATION_HINT",
-            related_location_hint.to_string(),
-        ));
-    }
-    if let Some(related_point) = request.related_point {
-        env.push(("CODEX_GUI_RELATED_X", related_point.x.to_string()));
-        env.push(("CODEX_GUI_RELATED_Y", related_point.y.to_string()));
-    }
-    if let Some(window_selection) = request.window_selection {
-        if let Some(title) = &window_selection.title {
-            env.push(("CODEX_GUI_WINDOW_TITLE", title.clone()));
-        }
-        if let Some(title_contains) = &window_selection.title_contains {
-            env.push(("CODEX_GUI_WINDOW_TITLE_CONTAINS", title_contains.clone()));
-        }
-        if let Some(index) = window_selection.index {
-            env.push(("CODEX_GUI_WINDOW_INDEX", index.to_string()));
-        }
-    }
-
-    let output = run_helper("resolve-target", &env)?;
-    if output.trim().is_empty() {
-        return Ok(None);
-    }
-    serde_json::from_str::<HelperResolvedTarget>(&output)
-        .map(Some)
-        .map_err(|error| {
-            FunctionCallError::RespondToModel(format!(
-                "failed to decode native GUI target resolution: {error}"
-            ))
-        })
+    default_gui_platform().capture_context(app, activate_app, window_selection)
 }
 
 fn run_gui_event(
@@ -2416,17 +2542,7 @@ fn run_gui_event(
     float_env: &[(&str, f64)],
     string_env: &[(&str, String)],
 ) -> Result<(), FunctionCallError> {
-    let mut env = vec![("CODEX_GUI_EVENT_MODE", event_mode.to_string())];
-    if let Some(app) = app.filter(|app| !app.trim().is_empty()) {
-        env.push(("CODEX_GUI_APP", app.to_string()));
-    }
-    for (key, value) in float_env {
-        env.push(((*key), value.to_string()));
-    }
-    for (key, value) in string_env {
-        env.push(((*key), value.clone()));
-    }
-    run_helper("event", &env).map(|_| ())
+    default_gui_platform().run_event(event_mode, app, float_env, string_env)
 }
 
 fn prepare_targeted_gui_action(
@@ -2451,13 +2567,14 @@ fn prepare_targeted_gui_action(
 }
 
 fn describe_capture_subject(state: &ObserveState) -> String {
-    if state.capture_mode == "window" {
+    if state.capture.capture_mode == "window" {
         state
+            .capture
             .window_title
             .clone()
             .unwrap_or_else(|| "current window".to_string())
     } else {
-        format!("display {}", state.display_index)
+        format!("display {}", state.capture.display_index)
     }
 }
 
@@ -2477,96 +2594,35 @@ fn capture_region(
     target_width: u32,
     target_height: u32,
 ) -> Result<Vec<u8>, FunctionCallError> {
-    let dir = tempdir().map_err(|error| {
-        FunctionCallError::RespondToModel(format!(
-            "failed to create temporary directory for GUI screenshot: {error}"
-        ))
-    })?;
-    let image_path = dir.path().join("codex-gui-observe.png");
-    let region = format!(
-        "{},{},{},{}",
-        bounds.x.round(),
-        bounds.y.round(),
-        bounds.width.round(),
-        bounds.height.round()
-    );
-
-    let output = Command::new("screencapture")
-        .args(["-x", "-C", "-R", &region])
-        .arg(&image_path)
-        .output()
-        .map_err(|error| {
-            FunctionCallError::RespondToModel(format!("failed to execute `screencapture`: {error}"))
-        })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(FunctionCallError::RespondToModel(format!(
-            "macOS screenshot capture failed: {}",
-            stderr.trim()
-        )));
-    }
-
-    let bytes = std::fs::read(&image_path).map_err(|error| {
-        FunctionCallError::RespondToModel(format!("failed to read captured screenshot: {error}"))
-    })?;
-
-    resize_png_to_match_display(bytes, target_width, target_height)
+    default_gui_platform().capture_region(bounds, target_width, target_height)
 }
 
-fn resize_png_to_match_display(
-    bytes: Vec<u8>,
-    target_width: u32,
-    target_height: u32,
-) -> Result<Vec<u8>, FunctionCallError> {
-    let image = image::load_from_memory(&bytes).map_err(|error| {
-        FunctionCallError::RespondToModel(format!("failed to decode captured screenshot: {error}"))
-    })?;
-    if image.width() == target_width && image.height() == target_height {
-        return Ok(bytes);
-    }
+fn observe_platform(
+    app: Option<&str>,
+    activate_app: bool,
+    capture_mode: Option<&str>,
+    window_selection: Option<&WindowSelector>,
+    prefer_window_when_available: bool,
+) -> Result<PlatformObservation, FunctionCallError> {
+    default_gui_platform().observe(
+        app,
+        activate_app,
+        capture_mode,
+        window_selection,
+        prefer_window_when_available,
+    )
+}
 
-    let resized = DynamicImage::ImageRgba8(
-        image
-            .resize_exact(target_width, target_height, FilterType::Triangle)
-            .into_rgba8(),
-    );
-    let mut encoded = Cursor::new(Vec::new());
-    resized
-        .write_to(&mut encoded, ImageFormat::Png)
-        .map_err(|error| {
-            FunctionCallError::RespondToModel(format!(
-                "failed to encode resized GUI screenshot: {error}"
-            ))
-        })?;
-    Ok(encoded.into_inner())
+pub(super) fn data_url(bytes: &[u8], mime_type: &str) -> String {
+    format!("data:{mime_type};base64,{}", BASE64_STANDARD.encode(bytes))
 }
 
 fn data_url_png(bytes: &[u8]) -> String {
-    format!("data:image/png;base64,{}", BASE64_STANDARD.encode(bytes))
+    data_url(bytes, "image/png")
 }
 
-fn run_helper(command: &str, env: &[(&str, String)]) -> Result<String, FunctionCallError> {
-    let helper_path = resolve_helper_binary()?;
-    let mut cmd = Command::new(helper_path);
-    cmd.arg(command);
-    for (key, value) in env {
-        cmd.env(key, value);
-    }
-    let output = cmd.output().map_err(|error| {
-        FunctionCallError::RespondToModel(format!("failed to execute native GUI helper: {error}"))
-    })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(FunctionCallError::RespondToModel(format!(
-            "native GUI helper failed: {}",
-            stderr.trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn resolve_type_text(args: &TypeArgs) -> Result<String, FunctionCallError> {
-    let literal_text = args.text.clone();
+fn resolve_type_value(args: &TypeArgs) -> Result<String, FunctionCallError> {
+    let literal_text = args.value.clone();
     let secret_env_var = normalize_optional_string(args.secret_env_var.as_deref());
     let secret_command_env_var = normalize_optional_string(args.secret_command_env_var.as_deref());
     let configured_source_count = [
@@ -2579,7 +2635,7 @@ fn resolve_type_text(args: &TypeArgs) -> Result<String, FunctionCallError> {
     .count();
     if configured_source_count != 1 {
         return Err(FunctionCallError::RespondToModel(
-            "gui_type requires exactly one of `text`, `secret_env_var`, or `secret_command_env_var`"
+            "gui_type requires exactly one of `value`, `secret_env_var`, or `secret_command_env_var`"
                 .to_string(),
         ));
     }
@@ -2629,27 +2685,6 @@ fn resolve_type_text(args: &TypeArgs) -> Result<String, FunctionCallError> {
     Ok(text)
 }
 
-fn run_apple_script(script: &str, env: &[(&str, String)]) -> Result<String, FunctionCallError> {
-    let mut command = Command::new("osascript");
-    command.args(["-l", "AppleScript", "-e", script]);
-    for (key, value) in env {
-        command.env(key, value);
-    }
-    let output = command.output().map_err(|error| {
-        FunctionCallError::RespondToModel(format!(
-            "failed to execute `osascript` for GUI typing: {error}"
-        ))
-    })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(FunctionCallError::RespondToModel(format!(
-            "macOS System Events typing failed: {}",
-            stderr.trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
 fn run_system_events_type(
     app: Option<&str>,
     window_selection: Option<&WindowSelector>,
@@ -2658,82 +2693,19 @@ fn run_system_events_type(
     submit: bool,
     strategy: &str,
 ) -> Result<(), FunctionCallError> {
-    let mut env = Vec::new();
-    if let Some(app) = app.filter(|app| !app.trim().is_empty()) {
-        env.push(("CODEX_GUI_APP", app.to_string()));
-    }
-    if let Some(window_selection) = window_selection {
-        if let Some(title) = &window_selection.title {
-            env.push(("CODEX_GUI_WINDOW_TITLE", title.clone()));
-        }
-        if let Some(title_contains) = &window_selection.title_contains {
-            env.push(("CODEX_GUI_WINDOW_TITLE_CONTAINS", title_contains.clone()));
-        }
-        if let Some(index) = window_selection.index {
-            env.push(("CODEX_GUI_WINDOW_INDEX", index.to_string()));
-        }
-    }
-    env.push(("CODEX_GUI_TEXT", text.to_string()));
-    env.push((
-        "CODEX_GUI_REPLACE",
-        if replace { "1" } else { "0" }.to_string(),
-    ));
-    env.push((
-        "CODEX_GUI_SUBMIT",
-        if submit { "1" } else { "0" }.to_string(),
-    ));
-    env.push((
-        "CODEX_GUI_SYSTEM_EVENTS_TYPE_STRATEGY",
-        strategy.to_string(),
-    ));
-
-    run_apple_script(TYPE_SYSTEM_EVENTS_SCRIPT, &env).map(|_| ())
+    default_gui_platform().run_system_events_type(
+        app,
+        window_selection,
+        text,
+        replace,
+        submit,
+        strategy,
+    )
 }
 
+#[cfg(test)]
 fn resolve_helper_binary() -> Result<PathBuf, FunctionCallError> {
-    let mut hasher = Sha1::new();
-    hasher.update(HELPER_SOURCE.as_bytes());
-    let hash = format!("{:x}", hasher.finalize());
-    let helper_dir = std::env::temp_dir()
-        .join("codex-gui-native-helper")
-        .join(&hash[..16]);
-    let source_path = helper_dir.join("codex-gui-native-helper.swift");
-    let binary_path = helper_dir.join("codex-gui-native-helper");
-
-    if binary_path.exists() {
-        return Ok(binary_path);
-    }
-
-    std::fs::create_dir_all(&helper_dir).map_err(|error| {
-        FunctionCallError::RespondToModel(format!(
-            "failed to create native GUI helper directory: {error}"
-        ))
-    })?;
-    std::fs::write(&source_path, HELPER_SOURCE).map_err(|error| {
-        FunctionCallError::RespondToModel(format!(
-            "failed to write native GUI helper source: {error}"
-        ))
-    })?;
-
-    let output = Command::new("swiftc")
-        .arg(&source_path)
-        .arg("-o")
-        .arg(&binary_path)
-        .output()
-        .map_err(|error| {
-            FunctionCallError::RespondToModel(format!(
-                "failed to run `swiftc` for native GUI helper: {error}"
-            ))
-        })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(FunctionCallError::RespondToModel(format!(
-            "failed to compile native GUI helper. Ensure Xcode Command Line Tools are installed and `swiftc` is available. {}",
-            stderr.trim()
-        )));
-    }
-
-    Ok(binary_path)
+    default_gui_platform().resolve_helper_binary()
 }
 
 fn resolve_key_code(key: &str, modifiers: &mut Vec<String>) -> Result<i64, FunctionCallError> {
@@ -2861,1559 +2833,4 @@ fn resolve_key_code(key: &str, modifiers: &mut Vec<String>) -> Result<i64, Funct
     }
 
     Ok(code)
-}
-
-static TYPE_SYSTEM_EVENTS_SCRIPT: &str = r##"
-on textContains(haystack, needle)
-	if needle is "" then return true
-	ignoring case
-		return (offset of needle in haystack) is not 0
-	end ignoring
-end textContains
-
-on matchingWindows(targetProc, exactTitle, titleContains)
-	set matches to {}
-	repeat with candidateWindow in windows of targetProc
-		set windowTitle to ""
-		try
-			set windowTitle to name of candidateWindow as text
-		end try
-		set exactMatch to true
-		if exactTitle is not "" then
-			ignoring case
-				set exactMatch to windowTitle is exactTitle
-			end ignoring
-		end if
-		set containsMatch to my textContains(windowTitle, titleContains)
-		if exactMatch and containsMatch then set end of matches to candidateWindow
-	end repeat
-	return matches
-end matchingWindows
-
-on focusRequestedWindow(targetProc, exactTitle, titleContains, windowIndexText)
-	if exactTitle is "" and titleContains is "" and windowIndexText is "" then return
-	set matches to my matchingWindows(targetProc, exactTitle, titleContains)
-	if (count of matches) is 0 then error "Window not found for the requested selection."
-	set targetWindow to item 1 of matches
-	if windowIndexText is not "" then
-		set requestedIndex to windowIndexText as integer
-		if requestedIndex < 1 or requestedIndex > (count of matches) then error "Requested window index is out of range."
-		set targetWindow to item requestedIndex of matches
-	end if
-	try
-		tell targetWindow to perform action "AXRaise"
-	end try
-	try
-		tell targetWindow to set value of attribute "AXMain" to true
-	end try
-	try
-		tell targetWindow to set value of attribute "AXFocused" to true
-	end try
-	delay 0.1
-end focusRequestedWindow
-
-on run argv
-	set requestedApp to system attribute "CODEX_GUI_APP"
-	set requestedWindowTitle to system attribute "CODEX_GUI_WINDOW_TITLE"
-	set requestedWindowTitleContains to system attribute "CODEX_GUI_WINDOW_TITLE_CONTAINS"
-	set requestedWindowIndex to system attribute "CODEX_GUI_WINDOW_INDEX"
-	set replaceText to system attribute "CODEX_GUI_REPLACE"
-	set submitText to system attribute "CODEX_GUI_SUBMIT"
-	set inputText to system attribute "CODEX_GUI_TEXT"
-	set typeStrategy to system attribute "CODEX_GUI_SYSTEM_EVENTS_TYPE_STRATEGY"
-
-	tell application "System Events"
-		if requestedApp is not "" then
-			if not (exists application process requestedApp) then error "Application process not found: " & requestedApp
-			set targetProc to application process requestedApp
-			set frontmost of targetProc to true
-			delay 0.1
-		else
-			set targetProc to first application process whose frontmost is true
-		end if
-		my focusRequestedWindow(targetProc, requestedWindowTitle, requestedWindowTitleContains, requestedWindowIndex)
-
-		if replaceText is "1" then
-			keystroke "a" using command down
-			delay 0.05
-		end if
-
-		if typeStrategy is "system_events_keystroke" then
-			keystroke inputText
-		else if typeStrategy is "system_events_keystroke_chars" then
-			repeat with currentCharacter in characters of inputText
-				set typedCharacter to contents of currentCharacter
-				if typedCharacter is return or typedCharacter is linefeed then
-					key code 36
-				else
-					keystroke typedCharacter
-				end if
-				delay 0.055
-			end repeat
-		else
-			set previousClipboard to missing value
-			set hadClipboard to false
-			try
-				set previousClipboard to the clipboard
-				set hadClipboard to true
-			end try
-			set the clipboard to inputText
-			delay 0.15
-			keystroke "v" using command down
-			delay 0.25
-			if hadClipboard then
-				try
-					set the clipboard to previousClipboard
-				end try
-			end if
-		end if
-
-		if submitText is "1" then key code 36
-		return "typed"
-	end tell
-end run
-"##;
-
-static HELPER_SOURCE: &str = r##"
-import Foundation
-import AppKit
-import ApplicationServices
-import CoreGraphics
-import Carbon.HIToolbox
-
-enum HelperError: Error, CustomStringConvertible {
-    case invalidCommand(String)
-    case invalidEnv(String)
-    case missingEnv(String)
-    case applicationNotFound(String)
-    case activationFailed(String)
-    case eventCreationFailed(String)
-
-    var description: String {
-        switch self {
-        case .invalidCommand(let value):
-            return "invalidCommand(\(value))"
-        case .invalidEnv(let key):
-            return "invalidEnv(\(key))"
-        case .missingEnv(let key):
-            return "missingEnv(\(key))"
-        case .applicationNotFound(let name):
-            return "applicationNotFound(\(name))"
-        case .activationFailed(let name):
-            return "activationFailed(\(name))"
-        case .eventCreationFailed(let detail):
-            return "eventCreationFailed(\(detail))"
-        }
-    }
-}
-
-struct Rect: Codable {
-    let x: Double
-    let y: Double
-    let width: Double
-    let height: Double
-}
-
-struct Point: Codable {
-    let x: Double
-    let y: Double
-}
-
-struct DisplayDescriptor: Codable {
-    let index: Int
-    let bounds: Rect
-}
-
-struct CaptureContext: Codable {
-    let appName: String?
-    let display: DisplayDescriptor
-    let cursor: Point
-    let windowId: Int?
-    let windowTitle: String?
-    let windowBounds: Rect?
-    let windowCount: Int?
-    let windowCaptureStrategy: String?
-}
-
-struct ResolvedTargetPayload: Codable {
-    let appName: String?
-    let windowTitle: String?
-    let matchedText: String?
-    let role: String?
-    let roleDescription: String?
-    let identifier: String?
-    let confidence: Double
-    let reason: String?
-    let point: Point
-    let bounds: Rect
-}
-
-struct WindowMatch {
-    let id: Int
-    let title: String?
-    let bounds: CGRect
-    let layer: Int
-}
-
-struct WindowSelection {
-    let primary: WindowMatch
-    let captureBounds: CGRect
-    let windowCount: Int
-    let captureStrategy: String
-}
-
-struct AccessibilityCandidate {
-    let element: AXUIElement
-    let bounds: CGRect
-    let matchedText: String?
-    let role: String?
-    let roleDescription: String?
-    let identifier: String?
-    let reason: String?
-    let score: Double
-}
-
-func env(_ key: String) -> String {
-    ProcessInfo.processInfo.environment[key] ?? ""
-}
-
-func trimmedEnv(_ key: String) -> String? {
-    let value = env(key).trimmingCharacters(in: .whitespacesAndNewlines)
-    return value.isEmpty ? nil : value
-}
-
-func normalizedText(_ value: String?) -> String? {
-    guard let value else { return nil }
-    let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    return normalized.isEmpty ? nil : normalized
-}
-
-func requiredDouble(_ key: String) throws -> Double {
-    let raw = env(key)
-    guard let value = Double(raw) else { throw HelperError.invalidEnv(key) }
-    return value
-}
-
-func requiredInt(_ key: String) throws -> Int {
-    let raw = env(key)
-    guard let value = Int(raw) else { throw HelperError.invalidEnv(key) }
-    return value
-}
-
-func requiredInt32(_ key: String) throws -> Int32 {
-    let raw = env(key)
-    guard let value = Int32(raw) else { throw HelperError.invalidEnv(key) }
-    return value
-}
-
-func optionalInt(_ key: String) -> Int? {
-    let raw = env(key)
-    guard !raw.isEmpty else { return nil }
-    return Int(raw)
-}
-
-func optionalDouble(_ key: String) -> Double? {
-    let raw = env(key)
-    guard !raw.isEmpty else { return nil }
-    return Double(raw)
-}
-
-func shouldActivateApp() -> Bool {
-    env("CODEX_GUI_ACTIVATE_APP") != "0"
-}
-
-func matchesAppName(_ app: NSRunningApplication, requestedName: String) -> Bool {
-    let normalized = requestedName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    if normalized.isEmpty { return false }
-    if app.localizedName?.lowercased() == normalized { return true }
-    if app.bundleIdentifier?.lowercased() == normalized { return true }
-    if app.bundleURL?.deletingPathExtension().lastPathComponent.lowercased() == normalized { return true }
-    return false
-}
-
-func findRunningApplication(named name: String) -> NSRunningApplication? {
-    let candidates = NSWorkspace.shared.runningApplications.filter { app in
-        matchesAppName(app, requestedName: name) && !app.isTerminated
-    }
-    if let active = candidates.first(where: { $0.isActive }) {
-        return active
-    }
-    return candidates.first
-}
-
-func resolveRequestedApplication(named name: String?) -> NSRunningApplication? {
-    guard let name else {
-        return NSWorkspace.shared.frontmostApplication
-    }
-    return findRunningApplication(named: name) ?? NSWorkspace.shared.frontmostApplication
-}
-
-func activateApplication(named name: String?) throws {
-    guard let name else { return }
-    if let frontmost = NSWorkspace.shared.frontmostApplication, matchesAppName(frontmost, requestedName: name) {
-        return
-    }
-    guard let app = findRunningApplication(named: name) else {
-        throw HelperError.applicationNotFound(name)
-    }
-    if !app.activate(options: [.activateIgnoringOtherApps]) {
-        throw HelperError.activationFailed(name)
-    }
-    usleep(100_000)
-}
-
-func rect(_ value: CGRect) -> Rect {
-    Rect(
-        x: value.origin.x.rounded(),
-        y: value.origin.y.rounded(),
-        width: value.size.width.rounded(),
-        height: value.size.height.rounded()
-    )
-}
-
-func point(_ value: CGPoint) -> Point {
-    Point(x: value.x.rounded(), y: value.y.rounded())
-}
-
-func activeDisplays() -> [(index: Int, bounds: CGRect)] {
-    var count: UInt32 = 0
-    CGGetActiveDisplayList(0, nil, &count)
-    var displayIDs = Array(repeating: CGDirectDisplayID(0), count: Int(count))
-    CGGetActiveDisplayList(count, &displayIDs, &count)
-    return Array(displayIDs.prefix(Int(count))).enumerated().map { item in
-        (index: item.offset + 1, bounds: CGDisplayBounds(item.element))
-    }
-}
-
-func displayForPoint(_ point: CGPoint, displays: [(index: Int, bounds: CGRect)]) -> (index: Int, bounds: CGRect) {
-    for display in displays where display.bounds.contains(point) {
-        return display
-    }
-    return displays.first ?? (index: 1, bounds: CGDisplayBounds(CGMainDisplayID()))
-}
-
-func matchingWindows(
-    ownerName: String?,
-    exactTitle: String?,
-    titleContains: String?
-) -> [WindowMatch] {
-    guard let windowInfo = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
-        return []
-    }
-    let normalizedExactTitle = normalizedText(exactTitle)
-    let normalizedContainsTitle = normalizedText(titleContains)
-    var matches: [WindowMatch] = []
-    for info in windowInfo {
-        let alpha = info[kCGWindowAlpha as String] as? Double ?? 1
-        let layer = info[kCGWindowLayer as String] as? Int ?? 0
-        let owner = info[kCGWindowOwnerName as String] as? String ?? ""
-        if alpha <= 0.01 {
-            continue
-        }
-        if let ownerName, owner != ownerName {
-            continue
-        }
-        guard let rawBounds = info[kCGWindowBounds as String] else {
-            continue
-        }
-        let boundsDict = rawBounds as! CFDictionary
-        guard
-            let bounds = CGRect(dictionaryRepresentation: boundsDict),
-            bounds.width >= 80,
-            bounds.height >= 80
-        else {
-            continue
-        }
-        let windowId = (info[kCGWindowNumber as String] as? NSNumber)?.intValue
-        let title = info[kCGWindowName as String] as? String
-        let normalizedTitle = normalizedText(title) ?? ""
-        if let normalizedExactTitle, normalizedTitle != normalizedExactTitle {
-            continue
-        }
-        if let normalizedContainsTitle, !normalizedTitle.contains(normalizedContainsTitle) {
-            continue
-        }
-        matches.append(WindowMatch(
-            id: windowId ?? 0,
-            title: title,
-            bounds: bounds.integral,
-            layer: layer
-        ))
-    }
-    return matches
-}
-
-func rankWindows(_ matches: [WindowMatch]) -> [WindowMatch] {
-    return matches.sorted { lhs, rhs in
-        let lhsPrimaryLayer = lhs.layer == 0 ? 0 : 1
-        let rhsPrimaryLayer = rhs.layer == 0 ? 0 : 1
-        if lhsPrimaryLayer != rhsPrimaryLayer {
-            return lhsPrimaryLayer < rhsPrimaryLayer
-        }
-        if lhs.layer != rhs.layer {
-            return lhs.layer < rhs.layer
-        }
-        let lhsArea = lhs.bounds.width * lhs.bounds.height
-        let rhsArea = rhs.bounds.width * rhs.bounds.height
-        if lhsArea != rhsArea {
-            return lhsArea > rhsArea
-        }
-        let lhsHasTitle = normalizedText(lhs.title) != nil
-        let rhsHasTitle = normalizedText(rhs.title) != nil
-        if lhsHasTitle != rhsHasTitle {
-            return lhsHasTitle && !rhsHasTitle
-        }
-        return lhs.id < rhs.id
-    }
-}
-
-func unionBounds(for matches: [WindowMatch]) -> CGRect? {
-    guard let first = matches.first else {
-        return nil
-    }
-    return matches.dropFirst().reduce(first.bounds) { partial, match in
-        partial.union(match.bounds)
-    }.integral
-}
-
-func selectedWindow(
-    ownerName: String?,
-    exactTitle: String?,
-    titleContains: String?,
-    index: Int?
-) -> WindowSelection? {
-    let matches = matchingWindows(
-        ownerName: ownerName,
-        exactTitle: exactTitle,
-        titleContains: titleContains
-    )
-    guard !matches.isEmpty else {
-        return nil
-    }
-    let hasExplicitSelection = normalizedText(exactTitle) != nil || normalizedText(titleContains) != nil || index != nil
-    let ranked = rankWindows(matches)
-    if let index, index > 0, index <= ranked.count {
-        let window = ranked[index - 1]
-        return WindowSelection(
-            primary: window,
-            captureBounds: window.bounds.integral,
-            windowCount: 1,
-            captureStrategy: "selected_window"
-        )
-    }
-    guard let primary = ranked.first else {
-        return nil
-    }
-    if hasExplicitSelection {
-        return WindowSelection(
-            primary: primary,
-            captureBounds: primary.bounds.integral,
-            windowCount: 1,
-            captureStrategy: "selected_window"
-        )
-    }
-    if matches.count == 1 {
-        return WindowSelection(
-            primary: primary,
-            captureBounds: primary.bounds.integral,
-            windowCount: 1,
-            captureStrategy: "main_window"
-        )
-    }
-    guard let combinedBounds = unionBounds(for: matches) else {
-        return nil
-    }
-    return WindowSelection(
-        primary: primary,
-        captureBounds: combinedBounds,
-        windowCount: matches.count,
-        captureStrategy: "app_union"
-    )
-}
-
-func axAttributeValue(_ element: AXUIElement, _ attribute: CFString) -> CFTypeRef? {
-    var value: CFTypeRef?
-    let result = AXUIElementCopyAttributeValue(element, attribute, &value)
-    guard result == .success else {
-        return nil
-    }
-    return value
-}
-
-func axElementAttribute(_ element: AXUIElement, _ attribute: CFString) -> AXUIElement? {
-    guard let value = axAttributeValue(element, attribute) else {
-        return nil
-    }
-    guard CFGetTypeID(value) == AXUIElementGetTypeID() else {
-        return nil
-    }
-    return unsafeBitCast(value, to: AXUIElement.self)
-}
-
-func axElementArrayAttribute(_ element: AXUIElement, _ attribute: CFString) -> [AXUIElement] {
-    guard let value = axAttributeValue(element, attribute) else {
-        return []
-    }
-    guard CFGetTypeID(value) == CFArrayGetTypeID() else {
-        return []
-    }
-    let values = value as! NSArray
-    return values.compactMap { item in
-        guard CFGetTypeID(item as CFTypeRef) == AXUIElementGetTypeID() else {
-            return nil
-        }
-        return unsafeBitCast(item, to: AXUIElement.self)
-    }
-}
-
-func axStringValue(_ value: CFTypeRef?) -> String? {
-    guard let value else { return nil }
-    if CFGetTypeID(value) == CFStringGetTypeID() {
-        let string = value as! String
-        return string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : string
-    }
-    return nil
-}
-
-func axStringAttribute(_ element: AXUIElement, _ attribute: CFString) -> String? {
-    axStringValue(axAttributeValue(element, attribute))
-}
-
-func axPointAttribute(_ element: AXUIElement, _ attribute: CFString) -> CGPoint? {
-    guard let value = axAttributeValue(element, attribute) else {
-        return nil
-    }
-    guard CFGetTypeID(value) == AXValueGetTypeID() else {
-        return nil
-    }
-    let axValue = unsafeBitCast(value, to: AXValue.self)
-    guard AXValueGetType(axValue) == .cgPoint else {
-        return nil
-    }
-    var point = CGPoint.zero
-    guard AXValueGetValue(axValue, .cgPoint, &point) else {
-        return nil
-    }
-    return point
-}
-
-func axSizeAttribute(_ element: AXUIElement, _ attribute: CFString) -> CGSize? {
-    guard let value = axAttributeValue(element, attribute) else {
-        return nil
-    }
-    guard CFGetTypeID(value) == AXValueGetTypeID() else {
-        return nil
-    }
-    let axValue = unsafeBitCast(value, to: AXValue.self)
-    guard AXValueGetType(axValue) == .cgSize else {
-        return nil
-    }
-    var size = CGSize.zero
-    guard AXValueGetValue(axValue, .cgSize, &size) else {
-        return nil
-    }
-    return size
-}
-
-func axBounds(_ element: AXUIElement) -> CGRect? {
-    guard let origin = axPointAttribute(element, kAXPositionAttribute as CFString),
-          let size = axSizeAttribute(element, kAXSizeAttribute as CFString),
-          size.width > 1,
-          size.height > 1 else {
-        return nil
-    }
-    return CGRect(origin: origin, size: size).integral
-}
-
-func tokenSet(_ value: String?) -> Set<String> {
-    guard let normalized = normalizedText(value) else {
-        return []
-    }
-    return Set(
-        normalized
-            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
-            .map(String.init)
-            .filter { !$0.isEmpty }
-    )
-}
-
-func candidateStrings(for element: AXUIElement) -> [(text: String, weight: Double)] {
-    var values: [(String, Double)] = []
-    if let title = axStringAttribute(element, kAXTitleAttribute as CFString) {
-        values.append((title, 1.0))
-    }
-    if let description = axStringAttribute(element, kAXDescriptionAttribute as CFString) {
-        values.append((description, 0.95))
-    }
-    if let identifier = axStringAttribute(element, kAXIdentifierAttribute as CFString) {
-        values.append((identifier, 0.85))
-    }
-    if let help = axStringAttribute(element, kAXHelpAttribute as CFString) {
-        values.append((help, 0.8))
-    }
-    if let roleDescription = axStringAttribute(element, kAXRoleDescriptionAttribute as CFString) {
-        values.append((roleDescription, 0.6))
-    }
-    if let role = axStringAttribute(element, kAXRoleAttribute as CFString) {
-        values.append((role, 0.55))
-    }
-    if let value = axStringAttribute(element, kAXValueAttribute as CFString) {
-        values.append((value, 0.9))
-    }
-    return values
-}
-
-func ancestorStrings(for element: AXUIElement, limit: Int = 3) -> [(text: String, weight: Double)] {
-    var results: [(String, Double)] = []
-    var current = axElementAttribute(element, kAXParentAttribute as CFString)
-    var depth = 0
-    while let parent = current, depth < limit {
-        let depthWeight = depth == 0 ? 0.7 : (depth == 1 ? 0.5 : 0.35)
-        for candidate in candidateStrings(for: parent) {
-            results.append((candidate.text, candidate.weight * depthWeight))
-        }
-        current = axElementAttribute(parent, kAXParentAttribute as CFString)
-        depth += 1
-    }
-    return results
-}
-
-func locationHintScore(_ hint: String?, bounds: CGRect, rootBounds: CGRect?) -> Double {
-    guard let hint = normalizedText(hint), let rootBounds, rootBounds.width > 0, rootBounds.height > 0 else {
-        return 0
-    }
-    let centerX = (bounds.midX - rootBounds.minX) / rootBounds.width
-    let centerY = (bounds.midY - rootBounds.minY) / rootBounds.height
-    var score = 0.0
-    if hint.contains("top") {
-        score += (1.0 - centerY) * 18
-    }
-    if hint.contains("bottom") {
-        score += centerY * 18
-    }
-    if hint.contains("left") {
-        score += (1.0 - centerX) * 18
-    }
-    if hint.contains("right") {
-        score += centerX * 18
-    }
-    if hint.contains("center") || hint.contains("middle") {
-        score += (1.0 - min(1.0, abs(centerX - 0.5) + abs(centerY - 0.5))) * 20
-    }
-    return score
-}
-
-func scopeScore(
-    _ scope: String?,
-    element: AXUIElement,
-    bounds: CGRect,
-    rootBounds: CGRect?
-) -> Double {
-    guard let scope = normalizedText(scope) else {
-        return 0
-    }
-    var bestScore = 0.0
-    for candidate in candidateStrings(for: element) {
-        let score = matchScore(target: scope, candidate: candidate.text, weight: candidate.weight * 0.7)
-        if score > bestScore {
-            bestScore = score
-        }
-    }
-    for candidate in ancestorStrings(for: element) {
-        let score = matchScore(target: scope, candidate: candidate.text, weight: candidate.weight)
-        if score > bestScore {
-            bestScore = score
-        }
-    }
-    return bestScore + (locationHintScore(scope, bounds: bounds, rootBounds: rootBounds) * 0.35)
-}
-
-func matchScore(target: String, candidate: String, weight: Double) -> Double {
-    let normalizedTarget = normalizedText(target) ?? ""
-    let normalizedCandidate = normalizedText(candidate) ?? ""
-    guard !normalizedTarget.isEmpty, !normalizedCandidate.isEmpty else {
-        return 0
-    }
-    if normalizedCandidate == normalizedTarget {
-        return 140 * weight
-    }
-    if normalizedCandidate.contains(normalizedTarget) {
-        return 110 * weight
-    }
-    if normalizedTarget.contains(normalizedCandidate) && normalizedCandidate.count >= 3 {
-        return 85 * weight
-    }
-    let targetTokens = tokenSet(normalizedTarget)
-    let candidateTokens = tokenSet(normalizedCandidate)
-    let overlap = targetTokens.intersection(candidateTokens).count
-    if overlap == 0 {
-        return 0
-    }
-    return Double(overlap) * 20 * weight
-}
-
-func selectedAXWindow(
-    appElement: AXUIElement,
-    exactTitle: String?,
-    titleContains: String?,
-    index: Int?
-) -> AXUIElement? {
-    let windows = axElementArrayAttribute(appElement, kAXWindowsAttribute as CFString)
-    guard !windows.isEmpty else {
-        return axElementAttribute(appElement, kAXFocusedWindowAttribute as CFString)
-    }
-    let normalizedExact = normalizedText(exactTitle)
-    let normalizedContains = normalizedText(titleContains)
-    let matches = windows.filter { window in
-        let title = normalizedText(axStringAttribute(window, kAXTitleAttribute as CFString)) ?? ""
-        if let normalizedExact, title != normalizedExact {
-            return false
-        }
-        if let normalizedContains, !title.contains(normalizedContains) {
-            return false
-        }
-        return true
-    }
-    let candidates = matches.isEmpty ? windows : matches
-    if let index, index > 0, index <= candidates.count {
-        return candidates[index - 1]
-    }
-    return candidates.first
-}
-
-func collectAccessibilityCandidates(
-    root: AXUIElement,
-    target: String,
-    scope: String?,
-    locationHint: String?,
-    rootBounds: CGRect?
-) -> [AccessibilityCandidate] {
-    var results: [AccessibilityCandidate] = []
-    var queue: [AXUIElement] = [root]
-    var visited: Set<Int> = []
-
-    while !queue.isEmpty {
-        let element = queue.removeFirst()
-        let identity = CFHash(element)
-        if visited.contains(identity) {
-            continue
-        }
-        visited.insert(identity)
-
-        let children = axElementArrayAttribute(element, kAXVisibleChildrenAttribute as CFString)
-        let fallbackChildren = children.isEmpty
-            ? axElementArrayAttribute(element, kAXChildrenAttribute as CFString)
-            : []
-        queue.append(contentsOf: children)
-        queue.append(contentsOf: fallbackChildren)
-
-        guard let bounds = axBounds(element) else {
-            continue
-        }
-
-        let strings = candidateStrings(for: element)
-        var bestScore = 0.0
-        var bestText: String?
-        for candidate in strings {
-            let score = matchScore(target: target, candidate: candidate.text, weight: candidate.weight)
-            if score > bestScore {
-                bestScore = score
-                bestText = candidate.text
-            }
-        }
-        if bestScore <= 0 {
-            continue
-        }
-
-        let finalScore =
-            bestScore
-            + scopeScore(scope, element: element, bounds: bounds, rootBounds: rootBounds)
-            + locationHintScore(locationHint, bounds: bounds, rootBounds: rootBounds)
-        results.append(
-            AccessibilityCandidate(
-                element: element,
-                bounds: bounds,
-                matchedText: bestText,
-                role: axStringAttribute(element, kAXRoleAttribute as CFString),
-                roleDescription: axStringAttribute(element, kAXRoleDescriptionAttribute as CFString),
-                identifier: axStringAttribute(element, kAXIdentifierAttribute as CFString),
-                reason: bestText.map { "Matched accessibility text `\($0)`" } ?? "Matched accessibility element",
-                score: finalScore
-            )
-        )
-    }
-
-    return results.sorted { lhs, rhs in
-        if lhs.score != rhs.score {
-            return lhs.score > rhs.score
-        }
-        let lhsArea = lhs.bounds.width * lhs.bounds.height
-        let rhsArea = rhs.bounds.width * rhs.bounds.height
-        if lhsArea != rhsArea {
-            return lhsArea < rhsArea
-        }
-        return lhs.bounds.minY < rhs.bounds.minY
-    }
-}
-
-func handleResolveTarget() throws {
-    let requestedApp = trimmedEnv("CODEX_GUI_APP")
-    let requestedWindowTitle = trimmedEnv("CODEX_GUI_WINDOW_TITLE")
-    let requestedWindowTitleContains = trimmedEnv("CODEX_GUI_WINDOW_TITLE_CONTAINS")
-    let requestedWindowIndex = optionalInt("CODEX_GUI_WINDOW_INDEX")
-    let target = trimmedEnv("CODEX_GUI_TARGET")
-    let scope = trimmedEnv("CODEX_GUI_SCOPE")
-    let locationHint = trimmedEnv("CODEX_GUI_LOCATION_HINT")
-    guard let target, !target.isEmpty else {
-        throw HelperError.missingEnv("CODEX_GUI_TARGET")
-    }
-    if shouldActivateApp() {
-        try activateApplication(named: requestedApp)
-    }
-    guard let resolvedApp = resolveRequestedApplication(named: requestedApp) else {
-        return
-    }
-    let appElement = AXUIElementCreateApplication(resolvedApp.processIdentifier)
-    let rootElement = selectedAXWindow(
-        appElement: appElement,
-        exactTitle: requestedWindowTitle,
-        titleContains: requestedWindowTitleContains,
-        index: requestedWindowIndex
-    ) ?? axElementAttribute(appElement, kAXFocusedWindowAttribute as CFString) ?? appElement
-    let rootBounds = axBounds(rootElement)
-    guard let candidate = collectAccessibilityCandidates(
-        root: rootElement,
-        target: target,
-        scope: scope,
-        locationHint: locationHint,
-        rootBounds: rootBounds
-    ).first else {
-        return
-    }
-    let normalizedConfidence = min(1.0, max(0.0, candidate.score / 160.0))
-    let payload = ResolvedTargetPayload(
-        appName: resolvedApp.localizedName ?? requestedApp,
-        windowTitle: axStringAttribute(rootElement, kAXTitleAttribute as CFString),
-        matchedText: candidate.matchedText,
-        role: candidate.role,
-        roleDescription: candidate.roleDescription,
-        identifier: candidate.identifier,
-        confidence: normalizedConfidence,
-        reason: candidate.reason,
-        point: point(CGPoint(x: candidate.bounds.midX, y: candidate.bounds.midY)),
-        bounds: rect(candidate.bounds)
-    )
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.sortedKeys]
-    let data = try encoder.encode(payload)
-    FileHandle.standardOutput.write(data)
-}
-
-func handleCaptureContext() throws {
-    let requestedApp = trimmedEnv("CODEX_GUI_APP")
-    let requestedWindowTitle = trimmedEnv("CODEX_GUI_WINDOW_TITLE")
-    let requestedWindowTitleContains = trimmedEnv("CODEX_GUI_WINDOW_TITLE_CONTAINS")
-    let requestedWindowIndex = optionalInt("CODEX_GUI_WINDOW_INDEX")
-    if shouldActivateApp() {
-        try activateApplication(named: requestedApp)
-    }
-    let resolvedApp = resolveRequestedApplication(named: requestedApp)
-    let targetApp = resolvedApp?.localizedName ?? requestedApp ?? NSWorkspace.shared.frontmostApplication?.localizedName
-    let cursorLocation = CGEvent(source: nil)?.location ?? .zero
-    let displays = activeDisplays()
-    let window = selectedWindow(
-        ownerName: targetApp,
-        exactTitle: requestedWindowTitle,
-        titleContains: requestedWindowTitleContains,
-        index: requestedWindowIndex
-    )
-    let anchorPoint = window.map { CGPoint(x: $0.primary.bounds.midX, y: $0.primary.bounds.midY) } ?? cursorLocation
-    let display = displayForPoint(anchorPoint, displays: displays)
-    let payload = CaptureContext(
-        appName: targetApp,
-        display: DisplayDescriptor(index: display.index, bounds: rect(display.bounds)),
-        cursor: point(cursorLocation),
-        windowId: window?.primary.id,
-        windowTitle: window?.primary.title,
-        windowBounds: window.map { rect($0.captureBounds) },
-        windowCount: window?.windowCount,
-        windowCaptureStrategy: window?.captureStrategy
-    )
-    let encoder = JSONEncoder()
-    encoder.outputFormatting = [.sortedKeys]
-    let data = try encoder.encode(payload)
-    FileHandle.standardOutput.write(data)
-}
-
-func makeMouseEvent(_ type: CGEventType, point: CGPoint, button: CGMouseButton = .left) throws -> CGEvent {
-    guard let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: point, mouseButton: button) else {
-        throw HelperError.eventCreationFailed("mouse_\(type.rawValue)")
-    }
-    return event
-}
-
-func post(_ event: CGEvent) {
-    event.post(tap: .cghidEventTap)
-}
-
-func moveCursor(to point: CGPoint) throws {
-    post(try makeMouseEvent(.mouseMoved, point: point))
-    usleep(30_000)
-}
-
-func leftDown(at point: CGPoint, clickState: Int64 = 1) throws {
-    let event = try makeMouseEvent(.leftMouseDown, point: point)
-    event.setIntegerValueField(.mouseEventClickState, value: clickState)
-    post(event)
-}
-
-func leftUp(at point: CGPoint, clickState: Int64 = 1) throws {
-    let event = try makeMouseEvent(.leftMouseUp, point: point)
-    event.setIntegerValueField(.mouseEventClickState, value: clickState)
-    post(event)
-}
-
-func rightDown(at point: CGPoint, clickState: Int64 = 1) throws {
-    let event = try makeMouseEvent(.rightMouseDown, point: point, button: .right)
-    event.setIntegerValueField(.mouseEventClickState, value: clickState)
-    post(event)
-}
-
-func rightUp(at point: CGPoint, clickState: Int64 = 1) throws {
-    let event = try makeMouseEvent(.rightMouseUp, point: point, button: .right)
-    event.setIntegerValueField(.mouseEventClickState, value: clickState)
-    post(event)
-}
-
-func drag(from start: CGPoint, to end: CGPoint, steps: Int, durationMs: Int) throws {
-    let stepCount = max(1, steps)
-    let sleepMicros = useconds_t(max(10_000, (durationMs * 1_000) / stepCount))
-    try moveCursor(to: start)
-    try leftDown(at: start)
-    usleep(50_000)
-    for index in 1...stepCount {
-        let progress = Double(index) / Double(stepCount)
-        let point = CGPoint(
-            x: start.x + ((end.x - start.x) * progress),
-            y: start.y + ((end.y - start.y) * progress)
-        )
-        post(try makeMouseEvent(.leftMouseDragged, point: point))
-        usleep(sleepMicros)
-    }
-    try leftUp(at: end)
-}
-
-func postKeyboardEvent(keyCode: CGKeyCode, keyDown: Bool, flags: CGEventFlags = []) throws {
-    guard let event = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: keyDown) else {
-        throw HelperError.eventCreationFailed("keyboard_\(keyCode)_\(keyDown ? "down" : "up")")
-    }
-    event.flags = flags
-    post(event)
-}
-
-let shiftKeyCode: CGKeyCode = 56
-let controlKeyCode: CGKeyCode = 59
-let optionKeyCode: CGKeyCode = 58
-let commandKeyCode: CGKeyCode = 55
-
-func modifierKeySequence(for flags: CGEventFlags) -> [(keyCode: CGKeyCode, mask: CGEventFlags)] {
-    var sequence: [(keyCode: CGKeyCode, mask: CGEventFlags)] = []
-    if flags.contains(.maskControl) { sequence.append((controlKeyCode, .maskControl)) }
-    if flags.contains(.maskAlternate) { sequence.append((optionKeyCode, .maskAlternate)) }
-    if flags.contains(.maskCommand) { sequence.append((commandKeyCode, .maskCommand)) }
-    if flags.contains(.maskShift) { sequence.append((shiftKeyCode, .maskShift)) }
-    return sequence
-}
-
-func pressKeyCode(_ keyCode: CGKeyCode, flags: CGEventFlags = []) throws {
-    let modifierSequence = modifierKeySequence(for: flags)
-    var activeFlags: CGEventFlags = []
-    for modifier in modifierSequence {
-        activeFlags.formUnion(modifier.mask)
-        try postKeyboardEvent(keyCode: modifier.keyCode, keyDown: true, flags: activeFlags)
-        usleep(20_000)
-    }
-    try postKeyboardEvent(keyCode: keyCode, keyDown: true, flags: flags)
-    usleep(20_000)
-    try postKeyboardEvent(keyCode: keyCode, keyDown: false, flags: flags)
-    for modifier in modifierSequence.reversed() {
-        activeFlags.subtract(modifier.mask)
-        try postKeyboardEvent(keyCode: modifier.keyCode, keyDown: false, flags: activeFlags.union(modifier.mask))
-        usleep(20_000)
-    }
-    usleep(20_000)
-}
-
-let preferredPhysicalTypingInputSourceIDs = [
-    "com.apple.keylayout.ABC",
-    "com.apple.keylayout.US"
-]
-
-func findInputSource(by id: String) -> TISInputSource? {
-    let properties = [kTISPropertyInputSourceID as String: id] as CFDictionary
-    guard let listRef = TISCreateInputSourceList(properties, false)?.takeRetainedValue() else {
-        return nil
-    }
-    let sources = listRef as NSArray
-    return sources.firstObject as! TISInputSource?
-}
-
-func selectPhysicalTypingInputSource() -> TISInputSource? {
-    let previous = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue()
-    for sourceID in preferredPhysicalTypingInputSourceIDs {
-        guard let source = findInputSource(by: sourceID) else { continue }
-        if TISSelectInputSource(source) == noErr {
-            usleep(250_000)
-            break
-        }
-    }
-    return previous
-}
-
-func restoreInputSource(_ source: TISInputSource?) {
-    guard let source else { return }
-    _ = TISSelectInputSource(source)
-    usleep(250_000)
-}
-
-let baseKeyCodes: [Character: CGKeyCode] = [
-    "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8, "v": 9,
-    "b": 11, "q": 12, "w": 13, "e": 14, "r": 15, "y": 16, "t": 17, "1": 18, "2": 19,
-    "3": 20, "4": 21, "6": 22, "5": 23, "=": 24, "9": 25, "7": 26, "-": 27, "8": 28,
-    "0": 29, "]": 30, "o": 31, "u": 32, "[": 33, "i": 34, "p": 35, "l": 37, "j": 38,
-    "'": 39, "k": 40, ";": 41, "\\": 42, ",": 43, "/": 44, "n": 45, "m": 46, ".": 47,
-    " ": 49
-]
-
-let shiftedKeyCodes: [Character: CGKeyCode] = [
-    "A": 0, "S": 1, "D": 2, "F": 3, "H": 4, "G": 5, "Z": 6, "X": 7, "C": 8, "V": 9,
-    "B": 11, "Q": 12, "W": 13, "E": 14, "R": 15, "Y": 16, "T": 17, "!": 18, "@": 19,
-    "#": 20, "$": 21, "^": 22, "%": 23, "+": 24, "(": 25, "&": 26, "_": 27, "*": 28,
-    ")": 29, "}": 30, "O": 31, "U": 32, "{": 33, "I": 34, "P": 35, "L": 37, "J": 38,
-    "\"": 39, "K": 40, ":": 41, "|": 42, "<": 43, "?": 44, "N": 45, "M": 46, ">": 47
-]
-
-func keyPressForCharacter(_ character: Character) throws -> (keyCode: CGKeyCode, flags: CGEventFlags) {
-    if let keyCode = baseKeyCodes[character] {
-        return (keyCode, [])
-    }
-    if let keyCode = shiftedKeyCodes[character] {
-        return (keyCode, .maskShift)
-    }
-    throw HelperError.eventCreationFailed("unsupported_physical_key_\(character)")
-}
-
-func typeUnicodeText(_ text: String) throws {
-    let utf16 = Array(text.utf16)
-    guard !utf16.isEmpty else { return }
-    guard
-        let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
-        let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false)
-    else {
-        throw HelperError.eventCreationFailed("unicode_text")
-    }
-    keyDown.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: utf16)
-    keyUp.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: utf16)
-    post(keyDown)
-    usleep(30_000)
-    post(keyUp)
-    usleep(30_000)
-}
-
-func typePhysicalKeyText(_ text: String) throws {
-    let previousInputSource = selectPhysicalTypingInputSource()
-    defer { restoreInputSource(previousInputSource) }
-    for character in text {
-        let keyPress = try keyPressForCharacter(character)
-        try pressKeyCode(keyPress.keyCode, flags: keyPress.flags)
-        usleep(90_000)
-    }
-}
-
-func pasteText(_ text: String) throws {
-    let pasteboard = NSPasteboard.general
-    let previousString = pasteboard.string(forType: .string)
-    pasteboard.clearContents()
-    guard pasteboard.setString(text, forType: .string) else {
-        throw HelperError.eventCreationFailed("pasteboard_set")
-    }
-    usleep(100_000)
-    try pressKeyCode(9, flags: .maskCommand)
-    usleep(150_000)
-    pasteboard.clearContents()
-    if let previousString {
-        _ = pasteboard.setString(previousString, forType: .string)
-    }
-}
-
-func parseModifierFlags(_ raw: String?) -> CGEventFlags {
-    guard let raw else { return [] }
-    var flags: CGEventFlags = []
-    for modifier in raw.split(separator: ",").map({ $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }) {
-        switch modifier {
-        case "command":
-            flags.insert(.maskCommand)
-        case "shift":
-            flags.insert(.maskShift)
-        case "option", "alt":
-            flags.insert(.maskAlternate)
-        case "control", "ctrl":
-            flags.insert(.maskControl)
-        default:
-            continue
-        }
-    }
-    return flags
-}
-
-func handleEvent() throws {
-    let requestedApp = trimmedEnv("CODEX_GUI_APP")
-    if shouldActivateApp() {
-        try activateApplication(named: requestedApp)
-    }
-
-    switch env("CODEX_GUI_EVENT_MODE") {
-    case "move_cursor":
-        let point = CGPoint(x: try requiredDouble("CODEX_GUI_X"), y: try requiredDouble("CODEX_GUI_Y"))
-        let settleMs = max(1, optionalInt("CODEX_GUI_SETTLE_MS") ?? 200)
-        try moveCursor(to: point)
-        usleep(useconds_t(settleMs * 1_000))
-        print("cg_move_cursor")
-    case "click":
-        let point = CGPoint(x: try requiredDouble("CODEX_GUI_X"), y: try requiredDouble("CODEX_GUI_Y"))
-        try moveCursor(to: point)
-        try leftDown(at: point)
-        usleep(30_000)
-        try leftUp(at: point)
-        print("cg_click")
-    case "click_and_hold":
-        let point = CGPoint(x: try requiredDouble("CODEX_GUI_X"), y: try requiredDouble("CODEX_GUI_Y"))
-        let holdMs = max(1, optionalInt("CODEX_GUI_HOLD_MS") ?? 650)
-        try moveCursor(to: point)
-        try leftDown(at: point)
-        usleep(useconds_t(holdMs * 1_000))
-        try leftUp(at: point)
-        print("cg_click_and_hold")
-    case "right_click":
-        let point = CGPoint(x: try requiredDouble("CODEX_GUI_X"), y: try requiredDouble("CODEX_GUI_Y"))
-        try moveCursor(to: point)
-        try rightDown(at: point)
-        usleep(30_000)
-        try rightUp(at: point)
-        print("cg_right_click")
-    case "double_click":
-        let point = CGPoint(x: try requiredDouble("CODEX_GUI_X"), y: try requiredDouble("CODEX_GUI_Y"))
-        try moveCursor(to: point)
-        for state in [Int64(1), Int64(2)] {
-            try leftDown(at: point, clickState: state)
-            usleep(30_000)
-            try leftUp(at: point, clickState: state)
-            usleep(80_000)
-        }
-        print("cg_double_click")
-    case "drag":
-        let start = CGPoint(x: try requiredDouble("CODEX_GUI_FROM_X"), y: try requiredDouble("CODEX_GUI_FROM_Y"))
-        let end = CGPoint(x: try requiredDouble("CODEX_GUI_TO_X"), y: try requiredDouble("CODEX_GUI_TO_Y"))
-        let durationMs = try requiredInt("CODEX_GUI_DURATION_MS")
-        let steps = try requiredInt("CODEX_GUI_STEPS")
-        try drag(from: start, to: end, steps: steps, durationMs: durationMs)
-        print("cg_drag")
-    case "scroll":
-        if let x = optionalDouble("CODEX_GUI_X"), let y = optionalDouble("CODEX_GUI_Y") {
-            try moveCursor(to: CGPoint(x: x, y: y))
-        }
-        let vertical = try requiredInt32("CODEX_GUI_SCROLL_Y")
-        let horizontal = try requiredInt32("CODEX_GUI_SCROLL_X")
-        let scrollUnit = trimmedEnv("CODEX_GUI_SCROLL_UNIT")
-        let units: CGScrollEventUnit = scrollUnit == "pixel" ? .pixel : .line
-        guard let event = CGEvent(
-            scrollWheelEvent2Source: nil,
-            units: units,
-            wheelCount: 2,
-            wheel1: vertical,
-            wheel2: horizontal,
-            wheel3: 0
-        ) else {
-            throw HelperError.eventCreationFailed("scroll")
-        }
-        post(event)
-        print("cg_scroll")
-    case "type_text":
-        let rawText = env("CODEX_GUI_TEXT")
-        let shouldReplace = env("CODEX_GUI_REPLACE") == "1"
-        let shouldSubmit = env("CODEX_GUI_SUBMIT") == "1"
-        let typeStrategy = trimmedEnv("CODEX_GUI_TYPE_STRATEGY") ?? "unicode"
-        if shouldReplace {
-            try pressKeyCode(0, flags: .maskCommand)
-        }
-        if typeStrategy == "clipboard_paste" {
-            try pasteText(rawText)
-        } else if typeStrategy == "physical_keys" {
-            try typePhysicalKeyText(rawText)
-        } else {
-            try typeUnicodeText(rawText)
-        }
-        if shouldSubmit {
-            try pressKeyCode(36)
-        }
-        print("cg_type_text")
-    case "key_press":
-        let keyCode = CGKeyCode(try requiredInt("CODEX_GUI_KEY_CODE"))
-        let repeatCount = max(1, optionalInt("CODEX_GUI_REPEAT") ?? 1)
-        let flags = parseModifierFlags(trimmedEnv("CODEX_GUI_MODIFIERS"))
-        for _ in 0..<repeatCount {
-            try pressKeyCode(keyCode, flags: flags)
-            usleep(30_000)
-        }
-        print("cg_key_press")
-    default:
-        throw HelperError.missingEnv("CODEX_GUI_EVENT_MODE")
-    }
-}
-
-do {
-    let command = CommandLine.arguments.dropFirst().first ?? ""
-    switch command {
-    case "capture-context":
-        try handleCaptureContext()
-    case "resolve-target":
-        try handleResolveTarget()
-    case "event":
-        try handleEvent()
-    default:
-        throw HelperError.invalidCommand(command)
-    }
-} catch {
-    fputs("Codex native GUI helper failed: \(error)\n", stderr)
-    exit(1)
-}
-"##;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalize_window_selection_merges_top_level_and_selector_fields() {
-        let selector = WindowSelector {
-            title: None,
-            title_contains: Some(" Settings ".to_string()),
-            index: Some(2),
-        };
-
-        let selection = normalize_window_selection(Some(" Preferences "), Some(&selector))
-            .expect("window selection should normalize")
-            .expect("window selection should exist");
-
-        assert_eq!(selection.title.as_deref(), Some("Preferences"));
-        assert_eq!(selection.title_contains.as_deref(), Some("Settings"));
-        assert_eq!(selection.index, Some(2));
-    }
-
-    #[test]
-    fn resolve_capture_target_uses_window_bounds_when_requested() {
-        let context = HelperCaptureContext {
-            app_name: Some("Notes".to_string()),
-            cursor: HelperPoint { x: 10.0, y: 20.0 },
-            display: HelperDisplayDescriptor {
-                index: 1,
-                bounds: HelperRect {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 1440.0,
-                    height: 900.0,
-                },
-            },
-            window_id: Some(42),
-            window_title: Some("Quick Note".to_string()),
-            window_bounds: Some(HelperRect {
-                x: 100.0,
-                y: 80.0,
-                width: 800.0,
-                height: 600.0,
-            }),
-            window_count: Some(3),
-            window_capture_strategy: Some("bounds".to_string()),
-        };
-
-        let capture =
-            resolve_capture_target(&context, Some("window"), true, true).expect("window capture");
-
-        assert_eq!(capture.mode, "window");
-        assert_eq!(capture.width, 800);
-        assert_eq!(capture.height, 600);
-        assert_eq!(capture.window_title.as_deref(), Some("Quick Note"));
-        assert_eq!(capture.window_count, Some(3));
-        assert_eq!(capture.window_capture_strategy.as_deref(), Some("bounds"));
-    }
-
-    #[test]
-    fn prepare_targeted_gui_action_is_noop_without_targeting() {
-        prepare_targeted_gui_action(None, None, None).expect("no-op targeted action");
-    }
-
-    #[test]
-    fn resolve_capture_target_prefers_window_for_in_app_work_when_available() {
-        let context = HelperCaptureContext {
-            app_name: Some("Notes".to_string()),
-            cursor: HelperPoint { x: 10.0, y: 20.0 },
-            display: HelperDisplayDescriptor {
-                index: 1,
-                bounds: HelperRect {
-                    x: 0.0,
-                    y: 0.0,
-                    width: 1440.0,
-                    height: 900.0,
-                },
-            },
-            window_id: Some(42),
-            window_title: Some("Quick Note".to_string()),
-            window_bounds: Some(HelperRect {
-                x: 100.0,
-                y: 80.0,
-                width: 800.0,
-                height: 600.0,
-            }),
-            window_count: Some(1),
-            window_capture_strategy: Some("bounds".to_string()),
-        };
-
-        let capture = resolve_capture_target(&context, None, false, true)
-            .expect("window should be preferred for in-app work");
-
-        assert_eq!(capture.mode, "window");
-        assert_eq!(capture.width, 800);
-        assert_eq!(capture.height, 600);
-    }
-
-    #[test]
-    fn gui_wait_reuses_previous_window_observe_target_when_not_overridden() {
-        let previous = ObserveState {
-            capture_x: 0.0,
-            capture_y: 0.0,
-            width: 800,
-            height: 600,
-            app_name: Some("Notes".to_string()),
-            display_index: 1,
-            capture_mode: "window",
-            window_title: Some("Quick Note".to_string()),
-            window_count: Some(1),
-            window_capture_strategy: Some("bounds".to_string()),
-        };
-
-        let mut app = None;
-        let mut capture_mode = None;
-        let mut window_selection = None;
-
-        if app.is_none() && capture_mode.is_none() && window_selection.is_none() {
-            app = previous.app_name.clone();
-            capture_mode = Some(previous.capture_mode.to_string());
-            if previous.capture_mode == "window" {
-                window_selection = previous.window_title.as_ref().map(|title| WindowSelector {
-                    title: Some(title.clone()),
-                    title_contains: None,
-                    index: None,
-                });
-            }
-        }
-
-        assert_eq!(app.as_deref(), Some("Notes"));
-        assert_eq!(capture_mode.as_deref(), Some("window"));
-        assert_eq!(
-            window_selection.and_then(|selection| selection.title),
-            Some("Quick Note".to_string())
-        );
-    }
-
-    #[test]
-    fn should_attach_image_defaults_to_supported_modalities() {
-        assert_eq!(should_attach_image_with_support(true, None).unwrap(), true);
-        assert_eq!(
-            should_attach_image_with_support(false, None).unwrap(),
-            false
-        );
-        assert_eq!(
-            should_attach_image_with_support(true, Some(false)).unwrap(),
-            false
-        );
-        assert!(should_attach_image_with_support(false, Some(true)).is_err());
-    }
-
-    #[test]
-    fn normalize_wait_target_state_defaults_and_validates() {
-        assert_eq!(normalize_wait_target_state(None).unwrap(), "appear");
-        assert_eq!(
-            normalize_wait_target_state(Some("disappear")).unwrap(),
-            "disappear"
-        );
-        assert!(normalize_wait_target_state(Some("later")).is_err());
-    }
-
-    #[test]
-    fn normalize_drag_endpoint_accepts_semantic_targets() {
-        let endpoint = normalize_drag_endpoint(
-            "source",
-            "from_target",
-            "from_x",
-            "from_y",
-            Some("Save button"),
-            Some("top right"),
-            Some("toolbar"),
-            None,
-            None,
-        )
-        .expect("target endpoint should normalize");
-
-        match endpoint {
-            DragEndpoint::Target {
-                target,
-                location_hint,
-                scope,
-            } => {
-                assert_eq!(target, "Save button");
-                assert_eq!(location_hint, Some("top right"));
-                assert_eq!(scope, Some("toolbar"));
-            }
-            DragEndpoint::Coordinates { .. } => {
-                panic!("expected semantic drag endpoint");
-            }
-        }
-    }
-
-    #[test]
-    fn normalize_drag_endpoint_rejects_mixed_target_and_coordinates() {
-        let error = normalize_drag_endpoint(
-            "destination",
-            "to_target",
-            "to_x",
-            "to_y",
-            Some("Sidebar"),
-            None,
-            None,
-            Some(10.0),
-            Some(20.0),
-        )
-        .expect_err("mixed endpoint should fail");
-
-        assert!(
-            error
-                .to_string()
-                .contains("either `to_target` or `to_x`/`to_y`, but not both")
-        );
-    }
-
-    #[test]
-    fn normalize_drag_endpoint_requires_complete_coordinate_pair() {
-        let error = normalize_drag_endpoint(
-            "source",
-            "from_target",
-            "from_x",
-            "from_y",
-            None,
-            None,
-            None,
-            Some(10.0),
-            None,
-        )
-        .expect_err("partial coordinate endpoint should fail");
-
-        assert!(
-            error
-                .to_string()
-                .contains("requires both `from_x` and `from_y`")
-        );
-    }
-
-    #[test]
-    fn normalize_grounding_mode_defaults_and_validates() {
-        assert_eq!(
-            normalize_grounding_mode(None, "gui_click").unwrap(),
-            "single"
-        );
-        assert_eq!(
-            normalize_grounding_mode(Some("complex"), "gui_click").unwrap(),
-            "complex"
-        );
-        assert!(normalize_grounding_mode(Some("dense"), "gui_click").is_err());
-    }
-
-    #[test]
-    fn local_point_within_state_reports_only_in_bounds_targets() {
-        let state = ObserveState {
-            capture_x: 100.0,
-            capture_y: 200.0,
-            width: 400,
-            height: 300,
-            app_name: Some("Notes".to_string()),
-            display_index: 1,
-            capture_mode: "window",
-            window_title: Some("Quick Note".to_string()),
-            window_count: Some(1),
-            window_capture_strategy: Some("selected_window".to_string()),
-        };
-
-        let in_bounds = local_point_within_state(&state, &HelperPoint { x: 125.0, y: 250.0 })
-            .expect("point should be within capture");
-        assert_eq!(in_bounds.x, 25.0);
-        assert_eq!(in_bounds.y, 50.0);
-        assert!(local_point_within_state(&state, &HelperPoint { x: 50.0, y: 250.0 }).is_none());
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    #[ignore = "manual macOS GUI smoke test requiring Screen Recording and Accessibility permissions"]
-    fn macos_gui_capture_smoke_test() {
-        let helper_path = resolve_helper_binary().expect("native GUI helper should compile");
-        assert!(helper_path.exists(), "helper binary should exist");
-
-        let context =
-            capture_context(None, false, None).expect("capture context should be available");
-        let capture = resolve_capture_target(&context, Some("display"), false, false)
-            .expect("display capture");
-        let image_bytes =
-            capture_region(&capture.bounds, capture.width, capture.height).expect("screenshot");
-
-        assert!(
-            !image_bytes.is_empty(),
-            "captured image should not be empty"
-        );
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    #[ignore = "manual macOS GUI smoke test requiring Accessibility permissions"]
-    fn macos_gui_move_cursor_smoke_test() {
-        let context =
-            capture_context(None, false, None).expect("capture context should be available");
-
-        run_gui_event(
-            "move_cursor",
-            None,
-            &[
-                ("CODEX_GUI_X", context.cursor.x),
-                ("CODEX_GUI_Y", context.cursor.y),
-            ],
-            &[("CODEX_GUI_SETTLE_MS", "1".to_string())],
-        )
-        .expect("move cursor event should succeed");
-    }
-
-    #[test]
-    #[cfg(target_os = "macos")]
-    #[ignore = "manual macOS GUI smoke test requiring Screen Recording and Accessibility permissions"]
-    fn macos_gui_wait_smoke_test() {
-        std::thread::sleep(std::time::Duration::from_millis(1));
-
-        let context =
-            capture_context(None, false, None).expect("capture context should be available");
-        let capture = resolve_capture_target(&context, Some("display"), false, false)
-            .expect("display capture");
-        let image_bytes =
-            capture_region(&capture.bounds, capture.width, capture.height).expect("screenshot");
-
-        assert!(
-            !image_bytes.is_empty(),
-            "refreshed image should not be empty"
-        );
-    }
 }
