@@ -268,6 +268,11 @@ impl ToolsConfig {
         self
     }
 
+    pub fn with_gui_coordinate_targeting(mut self, gui_coordinate_targeting: bool) -> Self {
+        self.gui_coordinate_targeting = gui_coordinate_targeting;
+        self
+    }
+
     pub fn for_code_mode_nested_tools(&self) -> Self {
         let mut nested = self.clone();
         nested.code_mode_enabled = false;

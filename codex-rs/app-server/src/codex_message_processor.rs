@@ -3666,6 +3666,7 @@ impl CodexMessageProcessor {
             base_instructions,
             developer_instructions,
             personality,
+            experimental_raw_events: _experimental_raw_events,
             persist_extended_history,
         } = params;
 
@@ -3764,7 +3765,7 @@ impl CodexMessageProcessor {
                     self.ensure_conversation_listener(
                         thread_id,
                         request_id.connection_id,
-                        /*raw_events_enabled*/ false,
+                        /*experimental_raw_events*/ false,
                         ApiVersion::V2,
                     )
                     .await,

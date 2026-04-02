@@ -1,5 +1,6 @@
 //! Session-wide mutable state.
 
+use codex_protocol::items::BuiltinToolCallItem;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_sandboxing::policy_transforms::merge_permission_profiles;
@@ -33,6 +34,7 @@ pub(crate) struct SessionState {
     pub(crate) active_connector_selection: HashSet<String>,
     pub(crate) pending_session_start_source: Option<codex_hooks::SessionStartSource>,
     granted_permissions: Option<PermissionProfile>,
+    visible_builtin_tool_calls: HashMap<String, BuiltinToolCallItem>,
 }
 
 impl SessionState {
@@ -51,6 +53,7 @@ impl SessionState {
             active_connector_selection: HashSet::new(),
             pending_session_start_source: None,
             granted_permissions: None,
+            visible_builtin_tool_calls: HashMap::new(),
         }
     }
 
@@ -213,6 +216,21 @@ impl SessionState {
 
     pub(crate) fn granted_permissions(&self) -> Option<PermissionProfile> {
         self.granted_permissions.clone()
+    }
+
+    pub(crate) fn record_visible_builtin_tool_call(
+        &mut self,
+        item: BuiltinToolCallItem,
+    ) -> Option<BuiltinToolCallItem> {
+        self.visible_builtin_tool_calls
+            .insert(item.call_id.clone(), item)
+    }
+
+    pub(crate) fn take_visible_builtin_tool_call(
+        &mut self,
+        call_id: &str,
+    ) -> Option<BuiltinToolCallItem> {
+        self.visible_builtin_tool_calls.remove(call_id)
     }
 }
 

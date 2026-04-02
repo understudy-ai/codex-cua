@@ -40,6 +40,7 @@ pub(crate) fn build_specs_with_discoverable_tools(
     use crate::tools::handlers::CodeModeExecuteHandler;
     use crate::tools::handlers::CodeModeWaitHandler;
     use crate::tools::handlers::DynamicToolHandler;
+    use crate::tools::handlers::GuiHandler;
     use crate::tools::handlers::JsReplHandler;
     use crate::tools::handlers::JsReplResetHandler;
     use crate::tools::handlers::ListDirHandler;
@@ -103,6 +104,7 @@ pub(crate) fn build_specs_with_discoverable_tools(
     let plan_handler = Arc::new(PlanHandler);
     let apply_patch_handler = Arc::new(ApplyPatchHandler);
     let dynamic_tool_handler = Arc::new(DynamicToolHandler);
+    let gui_handler = Arc::new(GuiHandler::default());
     let view_image_handler = Arc::new(ViewImageHandler);
     let mcp_handler = Arc::new(McpHandler);
     let mcp_resource_handler = Arc::new(McpResourceHandler);
@@ -153,6 +155,9 @@ pub(crate) fn build_specs_with_discoverable_tools(
             }
             ToolHandlerKind::DynamicTool => {
                 builder.register_handler(handler.name, dynamic_tool_handler.clone());
+            }
+            ToolHandlerKind::Gui => {
+                builder.register_handler(handler.name, gui_handler.clone());
             }
             ToolHandlerKind::JsRepl => {
                 builder.register_handler(handler.name, js_repl_handler.clone());
