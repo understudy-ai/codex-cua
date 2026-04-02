@@ -328,6 +328,7 @@ use crate::get_git_diff::get_git_diff;
 use crate::history_cell;
 #[cfg(test)]
 use crate::history_cell::AgentMessageCell;
+use crate::history_cell::BuiltinToolCallCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::McpToolCallCell;
 use crate::history_cell::PlainHistoryCell;
@@ -4537,6 +4538,71 @@ impl ChatWidget {
         self.had_work_activity = true;
     }
 
+    fn on_builtin_tool_call_begin(
+        &mut self,
+        call_id: String,
+        tool: String,
+        arguments: serde_json::Value,
+    ) {
+        self.flush_answer_stream_with_separator();
+        self.flush_active_cell();
+        self.active_cell = Some(Box::new(history_cell::new_active_builtin_tool_call(
+            call_id,
+            tool,
+            arguments,
+            self.config.animations,
+        )));
+        self.bump_active_cell_revision();
+        self.request_redraw();
+        self.had_work_activity = true;
+    }
+
+    fn try_complete_active_builtin_tool_call(
+        &mut self,
+        call_id: &str,
+        success: Option<bool>,
+        output: Option<&serde_json::Value>,
+    ) -> bool {
+        if let Some(cell) = self
+            .active_cell
+            .as_mut()
+            .and_then(|cell| cell.as_any_mut().downcast_mut::<BuiltinToolCallCell>())
+            && cell.call_id() == call_id
+        {
+            cell.complete(success, output);
+            self.bump_active_cell_revision();
+            return true;
+        }
+
+        false
+    }
+
+    fn on_builtin_tool_call_end(
+        &mut self,
+        call_id: String,
+        tool: String,
+        arguments: serde_json::Value,
+        success: Option<bool>,
+        output: Option<serde_json::Value>,
+    ) {
+        self.flush_answer_stream_with_separator();
+
+        if !self.try_complete_active_builtin_tool_call(&call_id, success, output.as_ref()) {
+            self.flush_active_cell();
+            let mut cell = history_cell::new_active_builtin_tool_call(
+                call_id,
+                tool,
+                arguments,
+                self.config.animations,
+            );
+            cell.complete(success, output.as_ref());
+            self.active_cell = Some(Box::new(cell));
+        }
+
+        self.flush_active_cell();
+        self.had_work_activity = true;
+    }
+
     pub(crate) fn new_with_app_event(common: ChatWidgetInit) -> Self {
         Self::new_with_op_target(common, CodexOpTarget::AppEvent)
     }
@@ -6198,6 +6264,23 @@ impl ChatWidget {
                     saved_path,
                 });
             }
+            ThreadItem::BuiltinToolCall {
+                call_id,
+                tool,
+                arguments,
+                output,
+                success,
+                status,
+                ..
+            } => match status {
+                codex_app_server_protocol::BuiltinToolCallStatus::InProgress => {
+                    self.on_builtin_tool_call_begin(call_id, tool, arguments);
+                }
+                codex_app_server_protocol::BuiltinToolCallStatus::Completed
+                | codex_app_server_protocol::BuiltinToolCallStatus::Failed => {
+                    self.on_builtin_tool_call_end(call_id, tool, arguments, success, output);
+                }
+            },
             ThreadItem::EnteredReviewMode { review, .. } => {
                 if from_replay {
                     self.enter_review_mode_with_hint(review, /*from_replay*/ true);
@@ -6331,6 +6414,7 @@ impl ChatWidget {
             ServerNotification::TurnCompleted(notification) => {
                 self.handle_turn_completed_notification(notification, replay_kind);
             }
+            ServerNotification::RawResponseItemCompleted(_) => {}
             ServerNotification::ItemStarted(notification) => {
                 self.handle_item_started_notification(notification, replay_kind.is_some());
             }
@@ -6514,7 +6598,6 @@ impl ChatWidget {
             | ServerNotification::ThreadStatusChanged(_)
             | ServerNotification::ThreadArchived(_)
             | ServerNotification::ThreadUnarchived(_)
-            | ServerNotification::RawResponseItemCompleted(_)
             | ServerNotification::CommandExecOutputDelta(_)
             | ServerNotification::McpToolCallProgress(_)
             | ServerNotification::McpServerOauthLoginCompleted(_)
@@ -6667,6 +6750,14 @@ impl ChatWidget {
             }
             ThreadItem::ImageGeneration { id, .. } => {
                 self.on_image_generation_begin(ImageGenerationBeginEvent { call_id: id });
+            }
+            ThreadItem::BuiltinToolCall {
+                call_id,
+                tool,
+                arguments,
+                ..
+            } => {
+                self.on_builtin_tool_call_begin(call_id, tool, arguments);
             }
             ThreadItem::CollabAgentToolCall {
                 id,
@@ -7227,6 +7318,8 @@ impl ChatWidget {
             if let Some(exec) = cell.as_any_mut().downcast_mut::<ExecCell>() {
                 exec.mark_failed();
             } else if let Some(tool) = cell.as_any_mut().downcast_mut::<McpToolCallCell>() {
+                tool.mark_failed();
+            } else if let Some(tool) = cell.as_any_mut().downcast_mut::<BuiltinToolCallCell>() {
                 tool.mark_failed();
             }
             self.add_boxed_history(cell);

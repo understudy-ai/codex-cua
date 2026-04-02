@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use codex_app_server_protocol::BuiltinToolCallStatus as AppServerBuiltinToolCallStatus;
 use codex_app_server_protocol::CollabAgentTool;
 use codex_app_server_protocol::CollabAgentToolCallStatus;
 use codex_app_server_protocol::CommandExecutionStatus;
@@ -22,6 +23,8 @@ pub use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
 use crate::event_processor::handle_last_message;
 use crate::exec_events::AgentMessageItem;
+use crate::exec_events::BuiltinToolCallItem;
+use crate::exec_events::BuiltinToolCallStatus;
 use crate::exec_events::CollabAgentState;
 use crate::exec_events::CollabAgentStatus;
 use crate::exec_events::CollabTool;
@@ -227,6 +230,35 @@ impl EventProcessorWithJsonOutput {
                     error: error.map(|error| McpToolCallItemError {
                         message: error.message,
                     }),
+                }),
+            }),
+            ThreadItem::BuiltinToolCall {
+                call_id,
+                tool,
+                namespace,
+                arguments,
+                output,
+                success,
+                status,
+                ..
+            } => Some(ExecThreadItem {
+                id: make_id(),
+                details: ThreadItemDetails::BuiltinToolCall(BuiltinToolCallItem {
+                    call_id,
+                    tool,
+                    namespace,
+                    arguments,
+                    output,
+                    success,
+                    status: match status {
+                        AppServerBuiltinToolCallStatus::InProgress => {
+                            BuiltinToolCallStatus::InProgress
+                        }
+                        AppServerBuiltinToolCallStatus::Completed => {
+                            BuiltinToolCallStatus::Completed
+                        }
+                        AppServerBuiltinToolCallStatus::Failed => BuiltinToolCallStatus::Failed,
+                    },
                 }),
             }),
             ThreadItem::CollabAgentToolCall {
@@ -475,6 +507,7 @@ impl EventProcessorWithJsonOutput {
                 }
                 CodexStatus::Running
             }
+            ServerNotification::RawResponseItemCompleted(_) => CodexStatus::Running,
             ServerNotification::ModelRerouted(notification) => {
                 events.push(ThreadEvent::ItemCompleted(ItemCompletedEvent {
                     item: ExecThreadItem {
@@ -674,6 +707,97 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&output_path).expect("read output file"),
             "keep existing contents"
+        );
+    }
+
+    #[test]
+    fn emits_builtin_function_tool_call_events_from_thread_items() {
+        let mut processor = EventProcessorWithJsonOutput::new(None);
+
+        let started = processor.collect_thread_events(ServerNotification::ItemStarted(
+            codex_app_server_protocol::ItemStartedNotification {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                item: ThreadItem::BuiltinToolCall {
+                    id: "call-1".to_string(),
+                    call_id: "call-1".to_string(),
+                    tool: "gui_observe".to_string(),
+                    namespace: Some("builtin".to_string()),
+                    arguments: json!({
+                        "app": "TextEdit",
+                        "capture_mode": "window",
+                    }),
+                    output: None,
+                    success: None,
+                    status: codex_app_server_protocol::BuiltinToolCallStatus::InProgress,
+                },
+            },
+        ));
+
+        assert_eq!(started.status, CodexStatus::Running);
+        assert_eq!(started.events.len(), 1);
+        let started_item = match &started.events[0] {
+            ThreadEvent::ItemStarted(ItemStartedEvent { item }) => item,
+            other => panic!("expected item.started event, got {other:?}"),
+        };
+        assert_eq!(started_item.id, "item_0");
+        assert_eq!(
+            started_item.details,
+            ThreadItemDetails::BuiltinToolCall(BuiltinToolCallItem {
+                call_id: "call-1".to_string(),
+                tool: "gui_observe".to_string(),
+                namespace: Some("builtin".to_string()),
+                arguments: json!({
+                    "app": "TextEdit",
+                    "capture_mode": "window",
+                }),
+                output: None,
+                success: None,
+                status: BuiltinToolCallStatus::InProgress,
+            })
+        );
+
+        let completed = processor.collect_thread_events(ServerNotification::ItemCompleted(
+            codex_app_server_protocol::ItemCompletedNotification {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                item: ThreadItem::BuiltinToolCall {
+                    id: "call-1".to_string(),
+                    call_id: "call-1".to_string(),
+                    tool: "gui_observe".to_string(),
+                    namespace: Some("builtin".to_string()),
+                    arguments: json!({
+                        "app": "TextEdit",
+                        "capture_mode": "window",
+                    }),
+                    output: Some(json!("{\"code\":\"observed\"}")),
+                    success: Some(true),
+                    status: codex_app_server_protocol::BuiltinToolCallStatus::Completed,
+                },
+            },
+        ));
+
+        assert_eq!(completed.status, CodexStatus::Running);
+        assert_eq!(completed.events.len(), 1);
+        let completed_item = match &completed.events[0] {
+            ThreadEvent::ItemCompleted(ItemCompletedEvent { item }) => item,
+            other => panic!("expected item.completed event, got {other:?}"),
+        };
+        assert_eq!(completed_item.id, "item_0");
+        assert_eq!(
+            completed_item.details,
+            ThreadItemDetails::BuiltinToolCall(BuiltinToolCallItem {
+                call_id: "call-1".to_string(),
+                tool: "gui_observe".to_string(),
+                namespace: Some("builtin".to_string()),
+                arguments: json!({
+                    "app": "TextEdit",
+                    "capture_mode": "window",
+                }),
+                output: Some(json!("{\"code\":\"observed\"}")),
+                success: Some(true),
+                status: BuiltinToolCallStatus::Completed,
+            })
         );
     }
 }

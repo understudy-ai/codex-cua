@@ -1595,6 +1595,139 @@ pub(crate) fn new_active_mcp_tool_call(
     McpToolCallCell::new(call_id, invocation, animations_enabled)
 }
 
+#[derive(Debug)]
+pub(crate) struct BuiltinToolCallCell {
+    call_id: String,
+    tool: String,
+    arguments: serde_json::Value,
+    start_time: Instant,
+    success: Option<bool>,
+    output: Option<String>,
+    animations_enabled: bool,
+}
+
+impl BuiltinToolCallCell {
+    pub(crate) fn new(
+        call_id: String,
+        tool: String,
+        arguments: serde_json::Value,
+        animations_enabled: bool,
+    ) -> Self {
+        Self {
+            call_id,
+            tool,
+            arguments,
+            start_time: Instant::now(),
+            success: None,
+            output: None,
+            animations_enabled,
+        }
+    }
+
+    pub(crate) fn call_id(&self) -> &str {
+        &self.call_id
+    }
+
+    pub(crate) fn complete(&mut self, success: Option<bool>, output: Option<&serde_json::Value>) {
+        self.success = Some(!matches!(success, Some(false)));
+        self.output = output.and_then(builtin_tool_output_summary);
+    }
+
+    pub(crate) fn mark_failed(&mut self) {
+        self.success = Some(false);
+        if self.output.is_none() {
+            self.output = Some("interrupted".to_string());
+        }
+    }
+}
+
+impl HistoryCell for BuiltinToolCallCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        let bullet = match self.success {
+            Some(true) => "•".green().bold(),
+            Some(false) => "•".red().bold(),
+            None => spinner(Some(self.start_time), self.animations_enabled),
+        };
+        let header_text = if self.success.is_some() {
+            "Called"
+        } else {
+            "Calling"
+        };
+
+        let invocation_line =
+            line_to_static(&format_builtin_tool_invocation(&self.tool, &self.arguments));
+        let mut compact_spans = vec![bullet.clone(), " ".into(), header_text.bold(), " ".into()];
+        let mut compact_header = Line::from(compact_spans.clone());
+        let reserved = compact_header.width();
+        let inline_invocation =
+            invocation_line.width() <= (width as usize).saturating_sub(reserved);
+
+        if inline_invocation {
+            compact_header.extend(invocation_line.spans.clone());
+            lines.push(compact_header);
+        } else {
+            compact_spans.pop();
+            lines.push(Line::from(compact_spans));
+
+            let opts = RtOptions::new((width as usize).saturating_sub(4))
+                .initial_indent("".into())
+                .subsequent_indent("    ".into());
+            let wrapped = adaptive_wrap_line(&invocation_line, opts);
+            let body_lines: Vec<Line<'static>> = wrapped.iter().map(line_to_static).collect();
+            lines.extend(prefix_lines(body_lines, "  └ ".dim(), "    ".into()));
+        }
+
+        if let Some(output) = &self.output {
+            let detail_wrap_width = (width as usize).saturating_sub(4).max(1);
+            let detail_text =
+                format_and_truncate_tool_result(output, TOOL_CALL_MAX_LINES, detail_wrap_width);
+            let detail_lines = detail_text
+                .split('\n')
+                .flat_map(|segment| {
+                    let line = Line::from(segment.to_string().dim());
+                    adaptive_wrap_line(
+                        &line,
+                        RtOptions::new(detail_wrap_width)
+                            .initial_indent("".into())
+                            .subsequent_indent("    ".into()),
+                    )
+                    .iter()
+                    .map(line_to_static)
+                    .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+
+            if !detail_lines.is_empty() {
+                let initial_prefix: Span<'static> = if inline_invocation {
+                    "  └ ".dim()
+                } else {
+                    "    ".into()
+                };
+                lines.extend(prefix_lines(detail_lines, initial_prefix, "    ".into()));
+            }
+        }
+
+        lines
+    }
+
+    fn transcript_animation_tick(&self) -> Option<u64> {
+        if !self.animations_enabled || self.success.is_some() {
+            return None;
+        }
+        Some((self.start_time.elapsed().as_millis() / 50) as u64)
+    }
+}
+
+pub(crate) fn new_active_builtin_tool_call(
+    call_id: String,
+    tool: String,
+    arguments: serde_json::Value,
+    animations_enabled: bool,
+) -> BuiltinToolCallCell {
+    BuiltinToolCallCell::new(call_id, tool, arguments, animations_enabled)
+}
+
 fn web_search_header(completed: bool) -> &'static str {
     if completed {
         "Searched"
@@ -2760,6 +2893,33 @@ fn format_mcp_invocation<'a>(invocation: McpInvocation) -> Line<'a> {
         ")".into(),
     ];
     invocation_spans.into()
+}
+
+fn format_builtin_tool_invocation<'a>(tool: &str, arguments: &serde_json::Value) -> Line<'a> {
+    let args_str = serde_json::to_string(arguments).unwrap_or_else(|_| arguments.to_string());
+    vec![
+        tool.to_string().cyan(),
+        "(".into(),
+        args_str.dim(),
+        ")".into(),
+    ]
+    .into()
+}
+
+fn builtin_tool_output_summary(output: &serde_json::Value) -> Option<String> {
+    match output {
+        serde_json::Value::String(text) if !text.trim().is_empty() => Some(text.clone()),
+        serde_json::Value::Array(items)
+            if items.iter().any(|item| {
+                item.get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|kind| kind == "input_image" || kind == "inputImage")
+            }) =>
+        {
+            Some("<image output>".to_string())
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

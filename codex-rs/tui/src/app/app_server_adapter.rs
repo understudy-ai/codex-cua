@@ -691,7 +691,10 @@ fn turn_snapshot_events(
             continue;
         };
         match item {
-            TurnItem::UserMessage(_) | TurnItem::Plan(_) | TurnItem::AgentMessage(_) => {
+            TurnItem::UserMessage(_)
+            | TurnItem::Plan(_)
+            | TurnItem::AgentMessage(_)
+            | TurnItem::BuiltinToolCall(_) => {
                 events.push(Event {
                     id: String::new(),
                     msg: EventMsg::ItemCompleted(ItemCompletedEvent {
@@ -828,6 +831,37 @@ fn thread_item_to_core(item: &ThreadItem) -> Option<TurnItem> {
             summary_text: summary.clone(),
             raw_content: content.clone(),
         })),
+        ThreadItem::BuiltinToolCall {
+            id,
+            call_id,
+            tool,
+            namespace,
+            arguments,
+            output,
+            success,
+            status,
+        } => Some(TurnItem::BuiltinToolCall(
+            codex_protocol::items::BuiltinToolCallItem {
+                id: id.clone(),
+                call_id: call_id.clone(),
+                tool: tool.clone(),
+                namespace: namespace.clone(),
+                arguments: arguments.clone(),
+                output: output.clone(),
+                success: *success,
+                status: match status {
+                    codex_app_server_protocol::BuiltinToolCallStatus::InProgress => {
+                        codex_protocol::items::BuiltinToolCallStatus::InProgress
+                    }
+                    codex_app_server_protocol::BuiltinToolCallStatus::Completed => {
+                        codex_protocol::items::BuiltinToolCallStatus::Completed
+                    }
+                    codex_app_server_protocol::BuiltinToolCallStatus::Failed => {
+                        codex_protocol::items::BuiltinToolCallStatus::Failed
+                    }
+                },
+            },
+        )),
         ThreadItem::WebSearch { id, query, action } => Some(TurnItem::WebSearch(WebSearchItem {
             id: id.clone(),
             query: query.clone(),

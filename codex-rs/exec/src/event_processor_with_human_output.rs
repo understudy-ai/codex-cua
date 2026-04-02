@@ -82,6 +82,14 @@ impl EventProcessorWithHumanOutput {
                     "started".style(self.dimmed)
                 );
             }
+            ThreadItem::BuiltinToolCall { tool, .. } => {
+                eprintln!(
+                    "{} {} {}",
+                    "tool:".style(self.bold),
+                    tool.style(self.cyan),
+                    "started".style(self.dimmed)
+                );
+            }
             ThreadItem::WebSearch { query, .. } => {
                 eprintln!("{} {}", "web search:".style(self.bold), query);
             }
@@ -197,6 +205,35 @@ impl EventProcessorWithHumanOutput {
                     eprintln!("{}", error.message.style(self.red));
                 }
             }
+            ThreadItem::BuiltinToolCall {
+                tool,
+                status,
+                output,
+                ..
+            } => {
+                let status_text = match status {
+                    codex_app_server_protocol::BuiltinToolCallStatus::Completed => {
+                        "completed".style(self.green)
+                    }
+                    codex_app_server_protocol::BuiltinToolCallStatus::Failed => {
+                        "failed".style(self.red)
+                    }
+                    codex_app_server_protocol::BuiltinToolCallStatus::InProgress => {
+                        "in_progress".style(self.dimmed)
+                    }
+                };
+                eprintln!(
+                    "{} {} {}",
+                    "tool:".style(self.bold),
+                    tool.style(self.cyan),
+                    format!("({status_text})").style(self.dimmed)
+                );
+                if let Some(output) = output.and_then(render_builtin_tool_output)
+                    && !output.trim().is_empty()
+                {
+                    eprintln!("{}", output.style(self.dimmed));
+                }
+            }
             ThreadItem::WebSearch { query, .. } => {
                 eprintln!("{} {}", "web search:".style(self.bold), query);
             }
@@ -283,6 +320,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 self.render_item_completed(notification.item);
                 CodexStatus::Running
             }
+            ServerNotification::RawResponseItemCompleted(_) => CodexStatus::Running,
             ServerNotification::ModelRerouted(notification) => {
                 eprintln!(
                     "{} {} -> {}",
@@ -412,6 +450,22 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 message
             );
         }
+    }
+}
+
+fn render_builtin_tool_output(output: serde_json::Value) -> Option<String> {
+    match output {
+        serde_json::Value::String(text) if !text.trim().is_empty() => Some(text),
+        serde_json::Value::Array(items)
+            if items.iter().any(|item| {
+                item.get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|kind| kind == "input_image" || kind == "inputImage")
+            }) =>
+        {
+            Some("<image output>".to_string())
+        }
+        _ => None,
     }
 }
 
