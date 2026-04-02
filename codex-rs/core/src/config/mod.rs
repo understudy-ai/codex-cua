@@ -228,6 +228,11 @@ pub struct Config {
     /// Effective service tier preference for new turns (`fast` or `flex`).
     pub service_tier: Option<ServiceTier>,
 
+    /// When enabled, GUI tools may expose direct coordinate arguments so the
+    /// main model can act from the latest observed screenshot without using a
+    /// separate grounding call.
+    pub gui_coordinate_targeting: bool,
+
     /// Model used specifically for review sessions.
     pub review_model: Option<String>,
 
@@ -1519,6 +1524,20 @@ pub struct ToolsToml {
     /// Enable the `view_image` tool that lets the agent attach local images.
     #[serde(default)]
     pub view_image: Option<bool>,
+
+    /// GUI tool behavior settings.
+    #[serde(default)]
+    pub gui: Option<GuiToolsToml>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct GuiToolsToml {
+    /// When `true`, `gui_click` and `gui_drag` may accept direct coordinates so
+    /// the main model can act from a previously observed screenshot instead of
+    /// delegating target resolution to the internal grounding round-trip.
+    #[serde(default)]
+    pub coordinate_targeting: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1961,6 +1980,25 @@ fn resolve_web_search_config(
     }
 }
 
+fn resolve_gui_coordinate_targeting(
+    config_toml: &ConfigToml,
+    config_profile: &ConfigProfile,
+) -> bool {
+    config_profile
+        .tools
+        .as_ref()
+        .and_then(|tools| tools.gui.as_ref())
+        .and_then(|gui| gui.coordinate_targeting)
+        .or_else(|| {
+            config_toml
+                .tools
+                .as_ref()
+                .and_then(|tools| tools.gui.as_ref())
+                .and_then(|gui| gui.coordinate_targeting)
+        })
+        .unwrap_or(false)
+}
+
 pub(crate) fn resolve_web_search_mode_for_turn(
     web_search_mode: &Constrained<WebSearchMode>,
     sandbox_policy: &SandboxPolicy,
@@ -2276,6 +2314,7 @@ impl Config {
         let web_search_mode = resolve_web_search_mode(&cfg, &config_profile, &features)
             .unwrap_or(WebSearchMode::Cached);
         let web_search_config = resolve_web_search_config(&cfg, &config_profile);
+        let gui_coordinate_targeting = resolve_gui_coordinate_targeting(&cfg, &config_profile);
 
         let agent_roles =
             agent_roles::load_agent_roles(&cfg, &config_layer_stack, &mut startup_warnings)?;
@@ -2586,6 +2625,7 @@ impl Config {
         let config = Self {
             model,
             service_tier,
+            gui_coordinate_targeting,
             review_model,
             model_context_window: cfg.model_context_window,
             model_auto_compact_token_limit: cfg.model_auto_compact_token_limit,
