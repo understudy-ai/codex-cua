@@ -1757,9 +1757,13 @@ impl GuiHandler {
 
         sleep(Duration::from_millis(default_settle_ms as u64)).await;
 
+        // Do not re-activate the app when capturing post-action evidence.
+        // The action (click/drag/type/etc.) already targeted the active app,
+        // and re-activation can reset transient UI state such as selected
+        // items, hover highlights, or chess piece selection.
         let observation = observe_platform(
             app.as_deref(),
-            true,
+            /*activate_app*/ false,
             capture_mode.as_deref(),
             window_selection.as_ref(),
             app.as_deref().is_some(),
@@ -1873,9 +1877,12 @@ impl GuiHandler {
         request: GuiTargetRequest<'_>,
         deadline: Instant,
     ) -> Result<TargetProbe, FunctionCallError> {
+        // Do not activate the app during polling probes.  The caller
+        // (gui_wait) may be checking whether a transient state persists
+        // and re-activation could dismiss it.
         let observation = observe_platform(
             request.app,
-            true,
+            /*activate_app*/ false,
             request.capture_mode,
             request.window_selection,
             request.app.is_some(),
