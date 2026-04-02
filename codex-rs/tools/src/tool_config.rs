@@ -109,6 +109,8 @@ pub struct ToolsConfig {
     pub agent_jobs_tools: bool,
     pub agent_jobs_worker_tools: bool,
     pub agent_type_description: String,
+    pub gui_tools: bool,
+    pub gui_coordinate_targeting: bool,
 }
 
 pub struct ToolsConfigParams<'a> {
@@ -223,6 +225,8 @@ impl ToolsConfig {
             agent_jobs_tools: include_agent_jobs,
             agent_jobs_worker_tools,
             agent_type_description: String::new(),
+            gui_tools: false,
+            gui_coordinate_targeting: false,
         }
     }
 
