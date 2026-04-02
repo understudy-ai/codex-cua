@@ -37,6 +37,10 @@ model?: string | null, modelProvider?: string | null, serviceTier?: ServiceTier 
  * and subsequent turns.
  */
 approvalsReviewer?: ApprovalsReviewer | null, sandbox?: SandboxMode | null, config?: { [key in string]?: JsonValue } | null, baseInstructions?: string | null, developerInstructions?: string | null, personality?: Personality | null, /**
+ * If true, opt into emitting raw Responses API items on the event stream
+ * after resuming this thread.
+ */
+experimentalRawEvents: boolean, /**
  * If true, persist additional rollout EventMsg variants required to
  * reconstruct a richer thread history on subsequent resume/fork/read.
  */

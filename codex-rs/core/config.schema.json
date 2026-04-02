@@ -398,6 +398,9 @@
             "guardian_approval": {
               "type": "boolean"
             },
+            "gui_tools": {
+              "type": "boolean"
+            },
             "image_detail_original": {
               "type": "boolean"
             },
@@ -698,6 +701,17 @@
         "rules",
         "sandbox_approval"
       ],
+      "type": "object"
+    },
+    "GuiToolsToml": {
+      "additionalProperties": false,
+      "properties": {
+        "coordinate_targeting": {
+          "default": null,
+          "description": "When `true`, `gui_click` and `gui_drag` may accept direct coordinates so the main model can act from a previously observed screenshot instead of delegating target resolution to the internal grounding round-trip.",
+          "type": "boolean"
+        }
+      },
       "type": "object"
     },
     "History": {
@@ -1684,6 +1698,15 @@
     "ToolsToml": {
       "additionalProperties": false,
       "properties": {
+        "gui": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/GuiToolsToml"
+            }
+          ],
+          "default": null,
+          "description": "GUI tool behavior settings."
+        },
         "view_image": {
           "default": null,
           "description": "Enable the `view_image` tool that lets the agent attach local images.",
@@ -2094,6 +2117,9 @@
           "type": "boolean"
         },
         "guardian_approval": {
+          "type": "boolean"
+        },
+        "gui_tools": {
           "type": "boolean"
         },
         "image_detail_original": {

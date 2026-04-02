@@ -154,6 +154,7 @@ impl ToolsConfig {
         let include_original_image_detail = can_request_original_image_detail(features, model_info);
         let include_image_gen_tool =
             features.enabled(Feature::ImageGeneration) && supports_image_generation(model_info);
+        let include_gui_tools = features.enabled(Feature::GuiTools);
         let exec_permission_approvals_enabled = features.enabled(Feature::ExecPermissionApprovals);
         let request_permissions_tool_enabled = features.enabled(Feature::RequestPermissionsTool);
         let shell_command_backend =
@@ -225,7 +226,7 @@ impl ToolsConfig {
             agent_jobs_tools: include_agent_jobs,
             agent_jobs_worker_tools,
             agent_type_description: String::new(),
-            gui_tools: false,
+            gui_tools: include_gui_tools,
             gui_coordinate_targeting: false,
         }
     }

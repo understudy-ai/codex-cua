@@ -234,6 +234,97 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
     );
 }
 
+#[tokio::test]
+async fn live_app_server_gui_builtin_tool_call_renders_history_from_thread_items() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.handle_server_notification(
+        ServerNotification::ItemStarted(codex_app_server_protocol::ItemStartedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item: ThreadItem::BuiltinToolCall {
+                id: "gui-call-1".to_string(),
+                call_id: "gui-call-1".to_string(),
+                tool: "gui_click".to_string(),
+                namespace: Some("builtin".to_string()),
+                arguments: serde_json::json!({"app":"Chrome","target":"Search"}),
+                output: None,
+                success: None,
+                status: codex_app_server_protocol::BuiltinToolCallStatus::InProgress,
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+
+    let active = lines_to_single_string(
+        &chat
+            .active_cell
+            .as_ref()
+            .expect("gui builtin tool call should create an active cell")
+            .display_lines(120),
+    );
+    assert!(
+        active.contains("Calling gui_click"),
+        "expected active builtin tool call cell, got {active:?}"
+    );
+    assert!(drain_insert_history(&mut rx).is_empty());
+
+    chat.handle_server_notification(
+        ServerNotification::ItemCompleted(codex_app_server_protocol::ItemCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item: ThreadItem::BuiltinToolCall {
+                id: "gui-call-1".to_string(),
+                call_id: "gui-call-1".to_string(),
+                tool: "gui_click".to_string(),
+                namespace: Some("builtin".to_string()),
+                arguments: serde_json::json!({"app":"Chrome","target":"Search"}),
+                output: Some(serde_json::json!("{\"status\":\"clicked\"}")),
+                success: Some(true),
+                status: codex_app_server_protocol::BuiltinToolCallStatus::Completed,
+            },
+        }),
+        /*replay_kind*/ None,
+    );
+
+    let cells = drain_insert_history(&mut rx);
+    assert_eq!(cells.len(), 1, "expected one completed builtin tool cell");
+    let rendered = lines_to_single_string(&cells[0]);
+    assert!(
+        rendered.contains("Called gui_click"),
+        "expected completed builtin tool call cell, got {rendered:?}"
+    );
+    assert!(
+        rendered.contains("\"status\": \"clicked\""),
+        "expected builtin tool output in rendered history, got {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn live_app_server_raw_response_builtin_tool_call_is_ignored() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.handle_server_notification(
+        ServerNotification::RawResponseItemCompleted(
+            codex_app_server_protocol::RawResponseItemCompletedNotification {
+                thread_id: "thread-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                item: codex_protocol::models::ResponseItem::FunctionCall {
+                    id: None,
+                    name: "gui_click".to_string(),
+                    namespace: Some("builtin".to_string()),
+                    arguments: r#"{"app":"Chrome","target":"Search"}"#.to_string(),
+                    call_id: "builtin-call-1".to_string(),
+                },
+            },
+        ),
+        /*replay_kind*/ None,
+    );
+
+    assert!(chat.active_cell.is_none());
+    assert!(drain_insert_history(&mut rx).is_empty());
+}
+
 #[test]
 fn app_server_patch_changes_to_core_preserves_diffs() {
     let changes = app_server_patch_changes_to_core(vec![FileUpdateChange {

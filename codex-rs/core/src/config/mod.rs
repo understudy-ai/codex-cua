@@ -1980,22 +1980,12 @@ fn resolve_web_search_config(
     }
 }
 
-fn resolve_gui_coordinate_targeting(
-    config_toml: &ConfigToml,
-    config_profile: &ConfigProfile,
-) -> bool {
-    config_profile
+fn resolve_gui_coordinate_targeting(config_toml: &ConfigToml) -> bool {
+    config_toml
         .tools
         .as_ref()
         .and_then(|tools| tools.gui.as_ref())
         .and_then(|gui| gui.coordinate_targeting)
-        .or_else(|| {
-            config_toml
-                .tools
-                .as_ref()
-                .and_then(|tools| tools.gui.as_ref())
-                .and_then(|gui| gui.coordinate_targeting)
-        })
         .unwrap_or(false)
 }
 
@@ -2314,7 +2304,7 @@ impl Config {
         let web_search_mode = resolve_web_search_mode(&cfg, &config_profile, &features)
             .unwrap_or(WebSearchMode::Cached);
         let web_search_config = resolve_web_search_config(&cfg, &config_profile);
-        let gui_coordinate_targeting = resolve_gui_coordinate_targeting(&cfg, &config_profile);
+        let gui_coordinate_targeting = resolve_gui_coordinate_targeting(&cfg);
 
         let agent_roles =
             agent_roles::load_agent_roles(&cfg, &config_layer_stack, &mut startup_warnings)?;

@@ -4,6 +4,7 @@
 import type { MessagePhase } from "../MessagePhase";
 import type { ReasoningEffort } from "../ReasoningEffort";
 import type { JsonValue } from "../serde_json/JsonValue";
+import type { BuiltinToolCallStatus } from "./BuiltinToolCallStatus";
 import type { CollabAgentState } from "./CollabAgentState";
 import type { CollabAgentTool } from "./CollabAgentTool";
 import type { CollabAgentToolCallStatus } from "./CollabAgentToolCallStatus";
@@ -56,7 +57,7 @@ durationMs: number | null, } | { "type": "fileChange", id: string, changes: Arra
 /**
  * The duration of the MCP tool call in milliseconds.
  */
-durationMs: number | null, } | { "type": "dynamicToolCall", id: string, tool: string, arguments: JsonValue, status: DynamicToolCallStatus, contentItems: Array<DynamicToolCallOutputContentItem> | null, success: boolean | null, 
+durationMs: number | null, } | { "type": "builtinToolCall", id: string, callId: string, tool: string, namespace?: string, arguments: JsonValue, output?: JsonValue, success?: boolean, status: BuiltinToolCallStatus, } | { "type": "dynamicToolCall", id: string, tool: string, arguments: JsonValue, status: DynamicToolCallStatus, contentItems: Array<DynamicToolCallOutputContentItem> | null, success: boolean | null, 
 /**
  * The duration of the dynamic tool call in milliseconds.
  */
