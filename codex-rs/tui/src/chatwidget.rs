@@ -6314,9 +6314,6 @@ impl ChatWidget {
                 reasoning_effort,
                 agents_states,
             }),
-            ThreadItem::BuiltinToolCall { .. } => {
-                // Handled by on_builtin_tool_call_begin/end in later commit.
-            }
             ThreadItem::DynamicToolCall { .. } => {}
         }
 

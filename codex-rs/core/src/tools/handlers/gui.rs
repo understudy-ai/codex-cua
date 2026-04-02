@@ -13,7 +13,7 @@ use std::collections::HashMap;
 #[cfg(test)]
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Mutex;
+use tokio::sync::Mutex;
 use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio::time::sleep;
@@ -479,7 +479,7 @@ impl GuiHandler {
         let state = observation.state;
         self.observe_state
             .lock()
-            .expect("gui observe state poisoned")
+            .await
             .insert(
                 invocation.session.conversation_id.to_string(),
                 state.clone(),
@@ -585,7 +585,7 @@ impl GuiHandler {
         let scope = normalize_optional_string(args.scope.as_deref());
         enforce_gui_tool_capability(&invocation, "gui_wait", true)?;
         if app.is_none() && capture_mode.is_none() && window_selection.is_none() {
-            if let Some(previous_state) = self.get_observe_state(&invocation) {
+            if let Some(previous_state) = self.get_observe_state(&invocation).await {
                 app = previous_state.app_name.clone();
                 capture_mode = Some(previous_state.capture.capture_mode.to_string());
                 if previous_state.capture.capture_mode == "window" {
@@ -1245,7 +1245,7 @@ impl GuiHandler {
                 },
                 app_name: context.app_name,
             });
-        } else if let Some(previous_state) = self.get_observe_state(&invocation) {
+        } else if let Some(previous_state) = self.get_observe_state(&invocation).await {
             state_for_summary = Some(previous_state);
         }
 
@@ -1715,10 +1715,10 @@ impl GuiHandler {
         })
     }
 
-    fn get_observe_state(&self, invocation: &ToolInvocation) -> Option<ObserveState> {
+    async fn get_observe_state(&self, invocation: &ToolInvocation) -> Option<ObserveState> {
         self.observe_state
             .lock()
-            .expect("gui observe state poisoned")
+            .await
             .get(&invocation.session.conversation_id.to_string())
             .cloned()
     }
@@ -1737,7 +1737,7 @@ impl GuiHandler {
         let mut window_selection = window_selection.cloned();
 
         if app.is_none() && capture_mode.is_none() && window_selection.is_none() {
-            if let Some(previous_state) = self.get_observe_state(invocation) {
+            if let Some(previous_state) = self.get_observe_state(invocation).await {
                 app = previous_state.app_name.clone();
                 capture_mode = Some(previous_state.capture.capture_mode.to_string());
                 if previous_state.capture.capture_mode == "window" {
@@ -1777,7 +1777,7 @@ impl GuiHandler {
         let state = observation.state;
         self.observe_state
             .lock()
-            .expect("gui observe state poisoned")
+            .await
             .insert(
                 invocation.session.conversation_id.to_string(),
                 state.clone(),
@@ -2103,7 +2103,7 @@ impl GuiHandler {
 
         self.observe_state
             .lock()
-            .expect("gui observe state poisoned")
+            .await
             .insert(
                 invocation.session.conversation_id.to_string(),
                 current_state.clone(),
@@ -2876,8 +2876,8 @@ fn resolve_type_value(args: &TypeArgs) -> Result<String, FunctionCallError> {
             "gui_type secret command env var `{secret_command_env_var}` is missing or empty"
         ))
     })?;
-    let output = Command::new("zsh")
-        .args(["-lc", &command])
+    let output = Command::new("/bin/sh")
+        .args(["-c", &command])
         .output()
         .map_err(|error| {
             FunctionCallError::RespondToModel(format!(

@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::Mutex as StdMutex;
+use std::time::Instant;
 
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
@@ -7,6 +9,10 @@ use super::GUI_UNSUPPORTED_MESSAGE;
 use super::platform::default_gui_platform;
 use super::platform::resolve_gui_platform_tool_capabilities;
 use super::supports_image_input;
+
+static READINESS_CACHE: std::sync::LazyLock<StdMutex<Option<(GuiEnvironmentReadinessSnapshot, Instant)>>> =
+    std::sync::LazyLock::new(|| StdMutex::new(None));
+const READINESS_CACHE_TTL_SECS: u64 = 30;
 
 const GUI_ACCESSIBILITY_REQUIRED_REASON: &str = "Accessibility permission is not granted, so GUI input actions (click, type, scroll, drag, etc.) are unavailable. GUI observation tools (gui_observe) may still work. Grant Accessibility permission in System Settings > Privacy & Security > Accessibility.";
 const GUI_GROUNDING_REQUIRED_REASON: &str = "Visual grounding is not configured, so grounding-based GUI actions (click, drag, etc.) are unavailable. Keyboard-only tool (gui_key) and targetless gui_type still work.";
@@ -72,7 +78,15 @@ pub(super) struct GuiRuntimeCapabilitySnapshot {
 }
 
 pub(super) fn resolve_gui_readiness_snapshot() -> GuiEnvironmentReadinessSnapshot {
-    default_gui_platform().readiness_snapshot()
+    let mut cache = READINESS_CACHE.lock().expect("readiness cache poisoned");
+    if let Some((snapshot, created_at)) = cache.as_ref() {
+        if created_at.elapsed().as_secs() < READINESS_CACHE_TTL_SECS {
+            return snapshot.clone();
+        }
+    }
+    let snapshot = default_gui_platform().readiness_snapshot();
+    *cache = Some((snapshot.clone(), Instant::now()));
+    snapshot
 }
 
 fn resolve_readiness_check_status(

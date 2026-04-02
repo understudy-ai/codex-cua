@@ -970,6 +970,14 @@ func typePhysicalKeyText(_ text: String) throws {
     }
 }
 
+/// Pastes `text` via the system clipboard and Cmd+V.
+///
+/// **Limitations:**
+/// - Only preserves `.string` clipboard content; images, files, and rich
+///   text on the clipboard before this call will be lost.
+/// - The 150ms delay after Cmd+V is a best-effort wait; slow applications
+///   may not process the paste in time, causing the restored clipboard to
+///   overwrite the paste.
 func pasteText(_ text: String) throws {
     let pasteboard = NSPasteboard.general
     let previousString = pasteboard.string(forType: .string)
