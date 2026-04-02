@@ -311,6 +311,11 @@ print(CGPreflightScreenCaptureAccess() ? "1" : "0")"#,
     }
 
     fn resolve_helper_binary(&self) -> Result<PathBuf, FunctionCallError> {
+        static CACHED_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        if let Some(path) = CACHED_PATH.get() {
+            return Ok(path.clone());
+        }
+
         let mut hasher = Sha1::new();
         hasher.update(HELPER_SOURCE.as_bytes());
         let hash = format!("{:x}", hasher.finalize());
@@ -321,6 +326,7 @@ print(CGPreflightScreenCaptureAccess() ? "1" : "0")"#,
         let binary_path = helper_dir.join("codex-gui-native-helper");
 
         if binary_path.exists() {
+            let _ = CACHED_PATH.set(binary_path.clone());
             return Ok(binary_path);
         }
 
@@ -335,10 +341,19 @@ print(CGPreflightScreenCaptureAccess() ? "1" : "0")"#,
             ))
         })?;
 
+        // Compile to a temporary path and atomically rename to avoid TOCTOU
+        // races when multiple GUI tool calls resolve concurrently.
+        let tmp_dir = tempdir().map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "failed to create temp dir for native GUI helper compilation: {error}"
+            ))
+        })?;
+        let tmp_binary = tmp_dir.path().join("codex-gui-native-helper");
+
         let output = Command::new("swiftc")
             .arg(&source_path)
             .arg("-o")
-            .arg(&binary_path)
+            .arg(&tmp_binary)
             .output()
             .map_err(|error| {
                 FunctionCallError::RespondToModel(format!(
@@ -353,6 +368,15 @@ print(CGPreflightScreenCaptureAccess() ? "1" : "0")"#,
             )));
         }
 
+        // Atomic rename; if another caller raced us, the last rename wins
+        // with a fully-formed binary.
+        std::fs::rename(&tmp_binary, &binary_path).map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "failed to install native GUI helper binary: {error}"
+            ))
+        })?;
+
+        let _ = CACHED_PATH.set(binary_path.clone());
         Ok(binary_path)
     }
 

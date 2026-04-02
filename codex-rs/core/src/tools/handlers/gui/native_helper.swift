@@ -627,29 +627,48 @@ func redactImageAtPath(_ imagePath: String, redactions: [CGRect]) throws {
     }
     let fileURL = URL(fileURLWithPath: imagePath)
     let imageData = try Data(contentsOf: fileURL)
-    guard let bitmap = NSBitmapImageRep(data: imageData) else {
-        throw HelperError.eventCreationFailed("redaction_bitmap_load")
-    }
-    let canvasSize = NSSize(width: bitmap.pixelsWide, height: bitmap.pixelsHigh)
-    guard let image = NSImage(data: imageData) else {
+    guard let dataProvider = CGDataProvider(data: imageData as CFData),
+          let cgImage = CGImage(
+              pngDataProviderSource: dataProvider,
+              decode: nil,
+              shouldInterpolate: true,
+              intent: .defaultIntent
+          )
+    else {
         throw HelperError.eventCreationFailed("redaction_image_load")
     }
-    let canvas = NSImage(size: canvasSize)
-    canvas.lockFocus()
-    defer { canvas.unlockFocus() }
-    image.draw(in: NSRect(origin: .zero, size: canvasSize))
-    NSColor(calibratedWhite: 0.97, alpha: 1.0).setFill()
-    for rect in redactions {
-        NSBezierPath(rect: rect).fill()
+    let width = cgImage.width
+    let height = cgImage.height
+    let colorSpace = cgImage.colorSpace ?? CGColorSpace(name: CGColorSpace.sRGB)!
+    let hasAlpha = cgImage.alphaInfo != .none && cgImage.alphaInfo != .noneSkipLast && cgImage.alphaInfo != .noneSkipFirst
+    let alphaInfo: CGImageAlphaInfo = hasAlpha ? .premultipliedLast : .noneSkipLast
+    guard let ctx = CGContext(
+        data: nil,
+        width: width,
+        height: height,
+        bitsPerComponent: 8,
+        bytesPerRow: 0,
+        space: colorSpace,
+        bitmapInfo: alphaInfo.rawValue
+    ) else {
+        throw HelperError.eventCreationFailed("redaction_context_create")
     }
-    guard
-        let tiffRepresentation = canvas.tiffRepresentation,
-        let outputBitmap = NSBitmapImageRep(data: tiffRepresentation),
-        let pngData = outputBitmap.representation(using: .png, properties: [:])
+    ctx.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+    ctx.setFillColor(CGColor(gray: 0.97, alpha: 1.0))
+    for rect in redactions {
+        ctx.fill(rect)
+    }
+    guard let outputImage = ctx.makeImage(),
+          let destination = CGImageDestinationCreateWithURL(
+              fileURL as CFURL, "public.png" as CFString, 1, nil
+          )
     else {
+        throw HelperError.eventCreationFailed("redaction_image_render")
+    }
+    CGImageDestinationAddImage(destination, outputImage, nil)
+    guard CGImageDestinationFinalize(destination) else {
         throw HelperError.eventCreationFailed("redaction_image_encode")
     }
-    try pngData.write(to: fileURL)
 }
 
 func handleRedactHostWindows() throws {
@@ -668,13 +687,20 @@ func handleRedactHostWindows() throws {
     }
     let fileURL = URL(fileURLWithPath: imagePath)
     let imageData = try Data(contentsOf: fileURL)
-    guard let bitmap = NSBitmapImageRep(data: imageData) else {
+    guard let dataProvider = CGDataProvider(data: imageData as CFData),
+          let cgImage = CGImage(
+              pngDataProviderSource: dataProvider,
+              decode: nil,
+              shouldInterpolate: true,
+              intent: .defaultIntent
+          )
+    else {
         throw HelperError.eventCreationFailed("redaction_bitmap_load")
     }
     let redactions = excludedWindowRedactionRects(
         captureBounds: captureBounds,
-        imagePixelWidth: bitmap.pixelsWide,
-        imagePixelHeight: bitmap.pixelsHigh,
+        imagePixelWidth: cgImage.width,
+        imagePixelHeight: cgImage.height,
         exclusions: exclusions
     )
     try redactImageAtPath(imagePath, redactions: redactions)

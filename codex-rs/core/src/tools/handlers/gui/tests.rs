@@ -885,11 +885,27 @@ fn image_space_helpers_validate_capture_relative_geometry() {
     .expect("rect should fit inside capture");
     assert_eq!(rect.width, 100.0);
     assert_eq!(rect.height, 80.0);
+    // Rect that extends past the right edge should be clamped, not rejected.
+    let clamped = local_rect_within_state(
+        &state,
+        &HelperRect {
+            x: 750.0,
+            y: 20.0,
+            width: 100.0,
+            height: 80.0,
+        },
+    )
+    .expect("rect with origin inside image should be clamped");
+    assert_eq!(clamped.x, 750.0);
+    assert_eq!(clamped.width, 50.0); // 800 - 750
+    assert_eq!(clamped.height, 80.0);
+
+    // Rect with origin completely outside the image should still be rejected.
     assert!(
         local_rect_within_state(
             &state,
             &HelperRect {
-                x: 750.0,
+                x: 850.0,
                 y: 20.0,
                 width: 100.0,
                 height: 80.0,

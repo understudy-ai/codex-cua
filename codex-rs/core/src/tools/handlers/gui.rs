@@ -2519,10 +2519,17 @@ fn local_rect_within_state(state: &ObserveState, rect: &HelperRect) -> Option<He
         && rect.y >= 0.0
         && rect.width > 0.0
         && rect.height > 0.0
-        && rect.x + rect.width <= state.capture.image_width as f64
-        && rect.y + rect.height <= state.capture.image_height as f64
+        && rect.x < state.capture.image_width as f64
+        && rect.y < state.capture.image_height as f64
     {
-        Some(rect.clone())
+        // Clamp the rect to image bounds so controls at window edges are
+        // still usable instead of being discarded entirely.
+        Some(HelperRect {
+            x: rect.x,
+            y: rect.y,
+            width: rect.width.min(state.capture.image_width as f64 - rect.x),
+            height: rect.height.min(state.capture.image_height as f64 - rect.y),
+        })
     } else {
         None
     }
