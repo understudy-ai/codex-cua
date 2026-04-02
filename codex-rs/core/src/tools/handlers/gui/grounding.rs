@@ -65,7 +65,7 @@ const MODEL_IMAGE_MAX_BYTES: usize = 4_718_592;
 const MODEL_IMAGE_MAX_WIDTH: u32 = 2000;
 const MODEL_IMAGE_MAX_HEIGHT: u32 = 2000;
 const MODEL_IMAGE_DEFAULT_JPEG_QUALITY: u8 = 80;
-const MODEL_IMAGE_JPEG_QUALITY_STEPS: [u8; 4] = [85, 70, 55, 40];
+const MODEL_IMAGE_JPEG_QUALITY_STEPS: [u8; 4] = [70, 55, 40, 25];
 const MODEL_IMAGE_SCALE_STEPS: [f64; 5] = [1.0, 0.75, 0.5, 0.35, 0.25];
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -626,8 +626,6 @@ pub(super) fn build_gui_grounding_refinement_prompt(
                 height: crop.crop_height,
                 image_width: crop.model_width,
                 image_height: crop.model_height,
-                scale_x: crop.model_scale_x,
-                scale_y: crop.model_scale_y,
                 display_index: capture_state.capture.display_index,
                 capture_mode: capture_state.capture.capture_mode,
                 window_title: capture_state.capture.window_title.clone(),
@@ -1111,23 +1109,12 @@ fn constrain_model_dimensions(width: u32, height: u32) -> (u32, u32) {
     if width == 0 || height == 0 {
         return (width, height);
     }
-    let mut target_width = width;
-    let mut target_height = height;
-    if target_width > MODEL_IMAGE_MAX_WIDTH {
-        target_height = (((target_height as f64) * (MODEL_IMAGE_MAX_WIDTH as f64))
-            / (target_width as f64))
-            .round()
-            .max(1.0) as u32;
-        target_width = MODEL_IMAGE_MAX_WIDTH;
-    }
-    if target_height > MODEL_IMAGE_MAX_HEIGHT {
-        target_width = (((target_width as f64) * (MODEL_IMAGE_MAX_HEIGHT as f64))
-            / (target_height as f64))
-            .round()
-            .max(1.0) as u32;
-        target_height = MODEL_IMAGE_MAX_HEIGHT;
-    }
-    (target_width.max(1), target_height.max(1))
+    let scale = (MODEL_IMAGE_MAX_WIDTH as f64 / width as f64)
+        .min(MODEL_IMAGE_MAX_HEIGHT as f64 / height as f64)
+        .min(1.0);
+    let w = ((width as f64 * scale).round() as u32).max(1);
+    let h = ((height as f64 * scale).round() as u32).max(1);
+    (w, h)
 }
 
 fn encode_image_to_jpeg(
@@ -1522,16 +1509,8 @@ fn translate_original_bbox_to_model(
 }
 
 pub(super) fn image_point_to_display(state: &ObserveState, point: &HelperPoint) -> HelperPoint {
-    let scale_x = if state.capture.scale_x.is_finite() && state.capture.scale_x > 0.0 {
-        state.capture.scale_x
-    } else {
-        1.0
-    };
-    let scale_y = if state.capture.scale_y.is_finite() && state.capture.scale_y > 0.0 {
-        state.capture.scale_y
-    } else {
-        1.0
-    };
+    let scale_x = state.capture.scale_x();
+    let scale_y = state.capture.scale_y();
     HelperPoint {
         x: state.capture.origin_x + (point.x / scale_x),
         y: state.capture.origin_y + (point.y / scale_y),
@@ -1539,16 +1518,8 @@ pub(super) fn image_point_to_display(state: &ObserveState, point: &HelperPoint) 
 }
 
 pub(super) fn image_rect_to_display(state: &ObserveState, rect: &HelperRect) -> HelperRect {
-    let scale_x = if state.capture.scale_x.is_finite() && state.capture.scale_x > 0.0 {
-        state.capture.scale_x
-    } else {
-        1.0
-    };
-    let scale_y = if state.capture.scale_y.is_finite() && state.capture.scale_y > 0.0 {
-        state.capture.scale_y
-    } else {
-        1.0
-    };
+    let scale_x = state.capture.scale_x();
+    let scale_y = state.capture.scale_y();
     HelperRect {
         x: state.capture.origin_x + (rect.x / scale_x),
         y: state.capture.origin_y + (rect.y / scale_y),
@@ -1570,8 +1541,8 @@ pub(super) async fn resolve_grounded_target(
         GroundingModelImageConfig {
             logical_width: Some(capture_state.capture.width),
             logical_height: Some(capture_state.capture.height),
-            scale_x: Some(capture_state.capture.scale_x),
-            scale_y: Some(capture_state.capture.scale_y),
+            scale_x: Some(capture_state.capture.scale_x()),
+            scale_y: Some(capture_state.capture.scale_y()),
             allow_logical_normalization: true,
         },
         "grounding image",
@@ -1796,8 +1767,6 @@ pub(super) async fn resolve_grounded_target(
                         height: refinement_crop.crop_height,
                         image_width: refinement_crop.model_width,
                         image_height: refinement_crop.model_height,
-                        scale_x: refinement_crop.model_scale_x,
-                        scale_y: refinement_crop.model_scale_y,
                         display_index: capture_state.capture.display_index,
                         capture_mode: capture_state.capture.capture_mode,
                         window_title: capture_state.capture.window_title.clone(),

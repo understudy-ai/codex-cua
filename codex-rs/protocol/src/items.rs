@@ -1,8 +1,10 @@
 use crate::memory_citation::MemoryCitation;
 use crate::models::ContentItem;
+use crate::models::FunctionCallOutputContentItem;
 use crate::models::MessagePhase;
 use crate::models::ResponseItem;
 use crate::models::WebSearchAction;
+use crate::models::function_call_output_content_items_to_text;
 use crate::protocol::AgentMessageEvent;
 use crate::protocol::AgentReasoningEvent;
 use crate::protocol::AgentReasoningRawContentEvent;
@@ -135,6 +137,34 @@ pub struct BuiltinToolCallItem {
     #[ts(optional)]
     pub success: Option<bool>,
     pub status: BuiltinToolCallStatus,
+}
+
+impl BuiltinToolCallItem {
+    /// Return a short human-readable summary of the tool output, if available.
+    pub fn output_summary(&self) -> Option<String> {
+        builtin_tool_output_summary(self.output.as_ref()?)
+    }
+}
+
+/// Summarize a builtin tool output value for display.
+pub fn builtin_tool_output_summary(output: &JsonValue) -> Option<String> {
+    match output {
+        JsonValue::String(text) if !text.trim().is_empty() => Some(text.clone()),
+        JsonValue::Array(items) => {
+            if items.iter().any(|item| {
+                item.get("type")
+                    .and_then(JsonValue::as_str)
+                    .is_some_and(|kind| kind == "input_image" || kind == "inputImage")
+            }) {
+                return Some("<image output>".to_string());
+            }
+
+            serde_json::from_value::<Vec<FunctionCallOutputContentItem>>(output.clone())
+                .ok()
+                .and_then(|items| function_call_output_content_items_to_text(&items))
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq)]
@@ -476,6 +506,32 @@ mod tests {
                 text: "Retry with tests.".to_string(),
                 hook_run_id: "hook-run-1".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn builtin_tool_output_summary_joins_structured_text_items() {
+        let output = serde_json::json!([
+            {"type": "input_text", "text": "first line"},
+            {"type": "input_text", "text": "second line"}
+        ]);
+
+        assert_eq!(
+            builtin_tool_output_summary(&output),
+            Some("first line\nsecond line".to_string())
+        );
+    }
+
+    #[test]
+    fn builtin_tool_output_summary_prefers_image_marker_for_image_items() {
+        let output = serde_json::json!([
+            {"type": "input_text", "text": "captured"},
+            {"type": "input_image", "image_url": "data:image/png;base64,abc"}
+        ]);
+
+        assert_eq!(
+            builtin_tool_output_summary(&output),
+            Some("<image output>".to_string())
         );
     }
 }

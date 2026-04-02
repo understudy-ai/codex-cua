@@ -64,7 +64,10 @@ impl FileGuiPhysicalResourceLock {
             ))
         })?;
 
-        for _ in 0..2 {
+        for attempt in 0..4 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(50 * (1 << attempt.min(3))));
+            }
             match OpenOptions::new().write(true).create_new(true).open(&path) {
                 Ok(mut file) => {
                     use std::io::Write;

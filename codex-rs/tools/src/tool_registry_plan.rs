@@ -1,4 +1,5 @@
 use crate::CommandToolOptions;
+use crate::GuiToolSchemaOptions;
 use crate::REQUEST_USER_INPUT_TOOL_NAME;
 use crate::ShellToolOptions;
 use crate::SpawnAgentToolOptions;
@@ -23,7 +24,6 @@ use crate::create_close_agent_tool_v1;
 use crate::create_close_agent_tool_v2;
 use crate::create_code_mode_tool;
 use crate::create_exec_command_tool;
-use crate::GuiToolSchemaOptions;
 use crate::create_gui_click_tool_with_options;
 use crate::create_gui_drag_tool_with_options;
 use crate::create_gui_key_tool;

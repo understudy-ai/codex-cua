@@ -38,7 +38,7 @@ mod readiness;
 #[path = "gui/session.rs"]
 mod session;
 #[cfg(test)]
-#[path = "gui/tests.rs"]
+#[path = "gui/tests/mod.rs"]
 mod tests;
 
 use platform::PlatformObservation;
@@ -47,6 +47,13 @@ use provider::GuiGroundingProvider;
 use provider::default_gui_grounding_provider;
 use readiness::enforce_gui_tool_capability;
 
+const PLATFORM_NAME: &str = if cfg!(target_os = "macos") {
+    "macOS"
+} else if cfg!(target_os = "windows") {
+    "Windows"
+} else {
+    "this platform"
+};
 const GUI_UNSUPPORTED_MESSAGE: &str = "Native GUI tools are not supported on this platform yet.";
 const GUI_IMAGE_UNSUPPORTED_MESSAGE: &str =
     "Native GUI screenshot tools are not allowed because you do not support image inputs";
@@ -63,6 +70,7 @@ const DEFAULT_TYPE_FOCUS_SETTLE_MS: i64 = 180;
 const DEFAULT_TARGETED_SCROLL_DISTANCE: &str = "medium";
 const DEFAULT_TARGETLESS_SCROLL_DISTANCE: &str = "page";
 const GUI_DIRECT_COORDINATE_PLACEHOLDER_MESSAGE: &str = "Direct coordinate GUI targeting is currently kept as an experimental placeholder only. Semantic grounding remains the supported path because the direct-coordinate benchmark accuracy is still poor.";
+const MAX_OBSERVE_STATE_ENTRIES: usize = 64;
 
 #[derive(Default)]
 pub struct GuiHandler {
@@ -85,6 +93,33 @@ pub(super) struct HostCaptureExclusionState {
     redaction_count: i64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CaptureMode {
+    Window,
+    Display,
+}
+
+impl CaptureMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            CaptureMode::Window => "window",
+            CaptureMode::Display => "display",
+        }
+    }
+}
+
+impl std::fmt::Display for CaptureMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for CaptureMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct CaptureArtifact {
     pub(super) origin_x: f64,
@@ -93,14 +128,30 @@ pub(super) struct CaptureArtifact {
     pub(super) height: u32,
     pub(super) image_width: u32,
     pub(super) image_height: u32,
-    pub(super) scale_x: f64,
-    pub(super) scale_y: f64,
     pub(super) display_index: i64,
-    pub(super) capture_mode: &'static str,
+    pub(super) capture_mode: CaptureMode,
     pub(super) window_title: Option<String>,
     pub(super) window_count: Option<i64>,
     pub(super) window_capture_strategy: Option<String>,
     pub(super) host_exclusion: HostCaptureExclusionState,
+}
+
+impl CaptureArtifact {
+    pub(super) fn scale_x(&self) -> f64 {
+        if self.width > 0 {
+            self.image_width as f64 / self.width as f64
+        } else {
+            1.0
+        }
+    }
+
+    pub(super) fn scale_y(&self) -> f64 {
+        if self.height > 0 {
+            self.image_height as f64 / self.height as f64
+        } else {
+            1.0
+        }
+    }
 }
 
 impl ObserveState {
@@ -455,6 +506,23 @@ impl ToolHandler for GuiHandler {
 }
 
 impl GuiHandler {
+    async fn set_observe_state(&self, conversation_id: &str, state: ObserveState) {
+        let mut map = self.observe_state.lock().await;
+        map.insert(conversation_id.to_string(), state);
+        if map.len() > MAX_OBSERVE_STATE_ENTRIES {
+            // Evict arbitrary excess entries to prevent unbounded growth.
+            let keys_to_remove: Vec<String> = map
+                .keys()
+                .filter(|k| k.as_str() != conversation_id)
+                .take(map.len() - MAX_OBSERVE_STATE_ENTRIES)
+                .cloned()
+                .collect();
+            for key in keys_to_remove {
+                map.remove(&key);
+            }
+        }
+    }
+
     async fn handle_observe(
         &self,
         invocation: ToolInvocation,
@@ -468,29 +536,29 @@ impl GuiHandler {
         let location_hint = normalize_optional_string(args.location_hint.as_deref());
         let scope = normalize_optional_string(args.scope.as_deref());
         let attach_image =
-            prepare_gui_observe_request(&invocation, semantic_target.is_some(), args.return_image)?;
+            prepare_gui_observe_request(&invocation, semantic_target.is_some(), args.return_image)
+                .await?;
         let observation = observe_platform(
             args.app.as_deref(),
             /*activate_app*/ true,
             args.capture_mode.as_deref(),
             window_selection.as_ref(),
             args.app.as_deref().is_some(),
-        )?;
+        )
+        .await?;
         let state = observation.state;
-        self.observe_state
-            .lock()
-            .await
-            .insert(
-                invocation.session.conversation_id.to_string(),
-                state.clone(),
-            );
+        self.set_observe_state(
+            &invocation.session.conversation_id.to_string(),
+            state.clone(),
+        )
+        .await;
         let image_output = attach_image.then(|| data_url_png(&observation.image_bytes));
         let app_label = state
             .app_name
             .as_ref()
             .map(|app| format!(" for app `{app}`"))
             .unwrap_or_default();
-        let subject = if state.capture.capture_mode == "window" {
+        let subject = if state.capture.capture_mode == CaptureMode::Window {
             state
                 .capture
                 .window_title
@@ -522,7 +590,8 @@ impl GuiHandler {
                 .await?;
             let Some(grounded) = grounded else {
                 let summary = format!(
-                    "Captured macOS {subject}{app_label}, but could not resolve semantic GUI target `{target}` in the observed surface."
+                    "Captured {platform} {subject}{app_label}, but could not resolve semantic GUI target `{target}` in the observed surface.",
+                    platform = PLATFORM_NAME
                 );
                 return Ok(self.build_gui_output(
                     summary,
@@ -541,7 +610,8 @@ impl GuiHandler {
                 ));
             };
             let summary = format!(
-                "Captured macOS {subject}{app_label} and resolved semantic GUI target `{target}` in the observed surface."
+                "Captured {platform} {subject}{app_label} and resolved semantic GUI target `{target}` in the observed surface.",
+                platform = PLATFORM_NAME
             );
             let mut extra = serde_json::Map::new();
             extra.insert(
@@ -558,11 +628,12 @@ impl GuiHandler {
         }
 
         let summary = format!(
-            "Captured macOS {subject}{app_label} at origin ({}, {}) with size {}x{} for visual inspection and follow-up GUI grounding.",
-            state.capture.origin_x.round(),
-            state.capture.origin_y.round(),
-            state.capture.width,
-            state.capture.height
+            "Captured {platform} {subject}{app_label} at origin ({origin_x}, {origin_y}) with size {width}x{height} for visual inspection and follow-up GUI grounding.",
+            platform = PLATFORM_NAME,
+            origin_x = state.capture.origin_x.round(),
+            origin_y = state.capture.origin_y.round(),
+            width = state.capture.width,
+            height = state.capture.height
         );
         Ok(self.build_gui_output(summary, state, image_output, true, None))
     }
@@ -583,12 +654,12 @@ impl GuiHandler {
         })?;
         let location_hint = normalize_optional_string(args.location_hint.as_deref());
         let scope = normalize_optional_string(args.scope.as_deref());
-        enforce_gui_tool_capability(&invocation, "gui_wait", true)?;
+        enforce_gui_tool_capability(&invocation, "gui_wait", true).await?;
         if app.is_none() && capture_mode.is_none() && window_selection.is_none() {
             if let Some(previous_state) = self.get_observe_state(&invocation).await {
                 app = previous_state.app_name.clone();
                 capture_mode = Some(previous_state.capture.capture_mode.to_string());
-                if previous_state.capture.capture_mode == "window" {
+                if previous_state.capture.capture_mode == CaptureMode::Window {
                     window_selection =
                         previous_state
                             .capture
@@ -725,7 +796,7 @@ impl GuiHandler {
         }
         if coordinate_point.is_some() {
             normalize_coordinate_space(args.coordinate_space.as_deref())?;
-            // gui_coordinate_targeting will be wired to config in a later commit.
+
             if !invocation.turn.tools_config.gui_coordinate_targeting {
                 return Err(FunctionCallError::RespondToModel(
                     "Direct coordinate GUI clicking is disabled by default. Enable `[tools.gui] coordinate_targeting = true` only if you intentionally want to keep the experimental placeholder path visible."
@@ -739,7 +810,7 @@ impl GuiHandler {
         let target = semantic_target.as_deref().ok_or_else(|| {
             FunctionCallError::RespondToModel("gui_click requires a semantic `target`.".to_string())
         })?;
-        enforce_gui_tool_capability(&invocation, "gui_click", true)?;
+        enforce_gui_tool_capability(&invocation, "gui_click", true).await?;
         let grounded = self
             .resolve_gui_target(
                 &invocation,
@@ -838,7 +909,8 @@ impl GuiHandler {
                 ("CODEX_GUI_HOLD_MS", hold_ms.to_string()),
                 ("CODEX_GUI_SETTLE_MS", settle_ms.to_string()),
             ],
-        )?;
+        )
+        .await?;
         action_session.throw_if_emergency_stopped()?;
 
         let evidence = self
@@ -852,13 +924,14 @@ impl GuiHandler {
             .await?;
 
         let summary = format!(
-            "{} at {coordinate_summary} on macOS {} {} (global {}, {}).{} Use gui_wait or gui_observe to verify the resulting UI state before the next risky action.",
-            describe_click_action(button, clicks, args.hold_ms.is_some()),
-            state.capture.capture_mode,
-            describe_capture_subject(&state),
-            global_x.round(),
-            global_y.round(),
-            if evidence.image_url.is_some() {
+            "{action} at {coordinate_summary} on {platform} {mode} {subject} (global {gx}, {gy}).{evidence_note} Use gui_wait or gui_observe to verify the resulting UI state before the next risky action.",
+            action = describe_click_action(button, clicks, args.hold_ms.is_some()),
+            mode = state.capture.capture_mode.as_str(),
+            platform = PLATFORM_NAME,
+            subject = describe_capture_subject(&state),
+            gx = global_x.round(),
+            gy = global_y.round(),
+            evidence_note = if evidence.image_url.is_some() {
                 " Attached a refreshed GUI evidence screenshot."
             } else {
                 ""
@@ -927,7 +1000,7 @@ impl GuiHandler {
         }
         if uses_direct_coordinates {
             normalize_coordinate_space(args.coordinate_space.as_deref())?;
-            // gui_coordinate_targeting will be wired to config in a later commit.
+
             if !invocation.turn.tools_config.gui_coordinate_targeting {
                 return Err(FunctionCallError::RespondToModel(
                     "Direct coordinate GUI dragging is disabled by default. Enable `[tools.gui] coordinate_targeting = true` only if you intentionally want to keep the experimental placeholder path visible."
@@ -938,7 +1011,7 @@ impl GuiHandler {
                 GUI_DIRECT_COORDINATE_PLACEHOLDER_MESSAGE.to_string(),
             ));
         }
-        enforce_gui_tool_capability(&invocation, "gui_drag", true)?;
+        enforce_gui_tool_capability(&invocation, "gui_drag", true).await?;
         let source_endpoint = normalize_drag_endpoint(
             "source",
             "from_target",
@@ -1095,7 +1168,8 @@ impl GuiHandler {
                 ("CODEX_GUI_DURATION_MS", duration_ms.to_string()),
                 ("CODEX_GUI_STEPS", steps.to_string()),
             ],
-        )?;
+        )
+        .await?;
         action_session.throw_if_emergency_stopped()?;
 
         let evidence = self
@@ -1108,14 +1182,15 @@ impl GuiHandler {
             )
             .await?;
         let summary = format!(
-            "Dragged from {from_summary} to {to_summary} on macOS {} {} (global {}, {} -> {}, {}).{} Use gui_wait or gui_observe to confirm the drop landed where you expected.",
-            state.capture.capture_mode,
-            describe_capture_subject(&state),
-            from_global_x.round(),
-            from_global_y.round(),
-            to_global_x.round(),
-            to_global_y.round(),
-            if evidence.image_url.is_some() {
+            "Dragged from {from_summary} to {to_summary} on {platform} {mode} {subject} (global {fx}, {fy} -> {tx}, {ty}).{evidence_note} Use gui_wait or gui_observe to confirm the drop landed where you expected.",
+            mode = state.capture.capture_mode.as_str(),
+            platform = PLATFORM_NAME,
+            subject = describe_capture_subject(&state),
+            fx = from_global_x.round(),
+            fy = from_global_y.round(),
+            tx = to_global_x.round(),
+            ty = to_global_y.round(),
+            evidence_note = if evidence.image_url.is_some() {
                 " Attached a refreshed GUI evidence screenshot."
             } else {
                 ""
@@ -1171,7 +1246,7 @@ impl GuiHandler {
         let semantic_target = normalize_optional_string(args.target.as_deref());
         let location_hint = normalize_optional_string(args.location_hint.as_deref());
         let scope = normalize_optional_string(args.scope.as_deref());
-        enforce_gui_tool_capability(&invocation, "gui_scroll", semantic_target.is_some())?;
+        enforce_gui_tool_capability(&invocation, "gui_scroll", semantic_target.is_some()).await?;
 
         let mut float_env = Vec::new();
         let mut state_for_summary = None;
@@ -1212,7 +1287,8 @@ impl GuiHandler {
             state_for_summary = Some(resolved.capture_state);
             target_details = Some(details);
         } else if args.app.is_some() || args.capture_mode.is_some() || window_selection.is_some() {
-            let context = capture_context(args.app.as_deref(), false, window_selection.as_ref())?;
+            let context =
+                capture_context(args.app.as_deref(), false, window_selection.as_ref()).await?;
             let capture = resolve_capture_target(
                 &context,
                 args.capture_mode.as_deref(),
@@ -1227,8 +1303,6 @@ impl GuiHandler {
                     height: capture.height,
                     image_width: capture.width,
                     image_height: capture.height,
-                    scale_x: 1.0,
-                    scale_y: 1.0,
                     display_index: context.display.index,
                     capture_mode: capture.mode,
                     window_title: capture.window_title,
@@ -1270,7 +1344,8 @@ impl GuiHandler {
                 ("CODEX_GUI_SCROLL_Y", delta_y.to_string()),
                 ("CODEX_GUI_SCROLL_UNIT", scroll_plan.unit.to_string()),
             ],
-        )?;
+        )
+        .await?;
         action_session.throw_if_emergency_stopped()?;
         let evidence = self
             .capture_evidence_image(
@@ -1282,12 +1357,13 @@ impl GuiHandler {
             )
             .await?;
         let summary = format!(
-            "Scrolled macOS GUI {} using `{}` distance ({} {}).{}.{} Refresh with gui_wait or gui_observe before grounding the next GUI action.",
-            scroll_direction_label(direction),
-            scroll_plan.distance_preset,
-            scroll_plan.amount,
-            scroll_plan.unit,
-            state_for_summary
+            "Scrolled {platform} GUI {dir} using `{preset}` distance ({amount} {unit}).{context}.{evidence_note} Refresh with gui_wait or gui_observe before grounding the next GUI action.",
+            platform = PLATFORM_NAME,
+            dir = scroll_direction_label(direction),
+            preset = scroll_plan.distance_preset,
+            amount = scroll_plan.amount,
+            unit = scroll_plan.unit,
+            context = state_for_summary
                 .as_ref()
                 .map(|state| format!(
                     " on {} {}",
@@ -1295,7 +1371,7 @@ impl GuiHandler {
                     describe_capture_subject(state)
                 ))
                 .unwrap_or_default(),
-            if evidence.image_url.is_some() {
+            evidence_note = if evidence.image_url.is_some() {
                 " Attached a refreshed GUI evidence screenshot."
             } else {
                 ""
@@ -1387,7 +1463,7 @@ impl GuiHandler {
         let semantic_target = normalize_optional_string(args.target.as_deref());
         let location_hint = normalize_optional_string(args.location_hint.as_deref());
         let scope = normalize_optional_string(args.scope.as_deref());
-        enforce_gui_tool_capability(&invocation, "gui_type", semantic_target.is_some())?;
+        enforce_gui_tool_capability(&invocation, "gui_type", semantic_target.is_some()).await?;
         let strategy = normalize_optional_string(args.type_strategy.as_deref());
         if let Some(strategy) = strategy.as_deref()
             && !matches!(
@@ -1444,7 +1520,8 @@ impl GuiHandler {
                     ("CODEX_GUI_Y", focus_point.y),
                 ],
                 &[],
-            )?;
+            )
+            .await?;
             action_session.throw_if_emergency_stopped()?;
             sleep(Duration::from_millis(DEFAULT_TYPE_FOCUS_SETTLE_MS as u64)).await;
             action_session.throw_if_emergency_stopped()?;
@@ -1456,7 +1533,8 @@ impl GuiHandler {
                 args.app.as_deref(),
                 args.capture_mode.as_deref(),
                 window_selection.as_ref(),
-            )?;
+            )
+            .await?;
             action_session.throw_if_emergency_stopped()?;
         }
 
@@ -1477,7 +1555,8 @@ impl GuiHandler {
                 strategy
                     .as_deref()
                     .expect("system events strategy should be present"),
-            )?;
+            )
+            .await?;
             strategy.clone()
         } else if let Some(native_strategy) = strategy.as_deref() {
             run_gui_event(
@@ -1496,7 +1575,8 @@ impl GuiHandler {
                     ),
                     ("CODEX_GUI_TYPE_STRATEGY", native_strategy.to_string()),
                 ],
-            )?;
+            )
+            .await?;
             Some(native_strategy.to_string())
         } else {
             // Prefer the paste-based macOS typing path first, then fall back
@@ -1509,6 +1589,7 @@ impl GuiHandler {
                 submit,
                 "system_events_paste",
             )
+            .await
             .is_err()
             {
                 let native_strategy = "unicode";
@@ -1528,7 +1609,8 @@ impl GuiHandler {
                         ),
                         ("CODEX_GUI_TYPE_STRATEGY", native_strategy.to_string()),
                     ],
-                )?;
+                )
+                .await?;
                 Some("unicode".to_string())
             } else {
                 Some("system_events_paste".to_string())
@@ -1615,14 +1697,15 @@ impl GuiHandler {
         )?;
         let repeat = args.repeat.unwrap_or(1).max(1);
         let mut modifiers = args.modifiers.unwrap_or_default();
-        enforce_gui_tool_capability(&invocation, "gui_key", false)?;
+        enforce_gui_tool_capability(&invocation, "gui_key", false).await?;
         let key_code = resolve_key_code(&args.key, &mut modifiers)?;
         let modifiers_env = modifiers.join(",");
         prepare_targeted_gui_action(
             args.app.as_deref(),
             args.capture_mode.as_deref(),
             window_selection.as_ref(),
-        )?;
+        )
+        .await?;
         action_session.throw_if_emergency_stopped()?;
 
         run_gui_event(
@@ -1634,7 +1717,8 @@ impl GuiHandler {
                 ("CODEX_GUI_REPEAT", repeat.to_string()),
                 ("CODEX_GUI_MODIFIERS", modifiers_env.clone()),
             ],
-        )?;
+        )
+        .await?;
         action_session.throw_if_emergency_stopped()?;
 
         let evidence = self
@@ -1681,20 +1765,22 @@ impl GuiHandler {
     ) -> Result<GuiToolOutput, FunctionCallError> {
         let action_session = session::begin_gui_action_session(&invocation, "gui_move", true)?;
         let args = parse_function_args::<MoveArgs>(&invocation.payload)?;
-        enforce_gui_tool_capability(&invocation, "gui_move", false)?;
+        enforce_gui_tool_capability(&invocation, "gui_move", false).await?;
         action_session.throw_if_emergency_stopped()?;
         run_gui_event(
             "move_cursor",
             args.app.as_deref(),
             &[("CODEX_GUI_X", args.x), ("CODEX_GUI_Y", args.y)],
             &[("CODEX_GUI_SETTLE_MS", DEFAULT_HOVER_SETTLE_MS.to_string())],
-        )?;
+        )
+        .await?;
         action_session.throw_if_emergency_stopped()?;
 
         let summary = format!(
-            "Moved the macOS pointer to absolute display coordinate ({}, {}).",
-            args.x.round(),
-            args.y.round()
+            "Moved the {platform} pointer to absolute display coordinate ({x}, {y}).",
+            platform = PLATFORM_NAME,
+            x = args.x.round(),
+            y = args.y.round()
         );
         Ok(GuiToolOutput {
             body: vec![FunctionCallOutputContentItem::InputText {
@@ -1740,7 +1826,7 @@ impl GuiHandler {
             if let Some(previous_state) = self.get_observe_state(invocation).await {
                 app = previous_state.app_name.clone();
                 capture_mode = Some(previous_state.capture.capture_mode.to_string());
-                if previous_state.capture.capture_mode == "window" {
+                if previous_state.capture.capture_mode == CaptureMode::Window {
                     window_selection =
                         previous_state
                             .capture
@@ -1755,7 +1841,7 @@ impl GuiHandler {
             }
         }
 
-        sleep(Duration::from_millis(default_settle_ms as u64)).await;
+        sleep(Duration::from_millis(default_settle_ms.max(0) as u64)).await;
 
         // Do not re-activate the app when capturing post-action evidence.
         // The action (click/drag/type/etc.) already targeted the active app,
@@ -1767,7 +1853,8 @@ impl GuiHandler {
             capture_mode.as_deref(),
             window_selection.as_ref(),
             app.as_deref().is_some(),
-        )?;
+        )
+        .await?;
         let image_bytes = if attach_image {
             Some(observation.image_bytes.clone())
         } else {
@@ -1775,13 +1862,11 @@ impl GuiHandler {
         };
         let image_url = image_bytes.as_deref().map(data_url_png);
         let state = observation.state;
-        self.observe_state
-            .lock()
-            .await
-            .insert(
-                invocation.session.conversation_id.to_string(),
-                state.clone(),
-            );
+        self.set_observe_state(
+            &invocation.session.conversation_id.to_string(),
+            state.clone(),
+        )
+        .await;
 
         Ok(ActionEvidence { image_url, state })
     }
@@ -1815,8 +1900,8 @@ impl GuiHandler {
             "height": state.capture.height,
             "image_width": state.capture.image_width,
             "image_height": state.capture.image_height,
-            "capture_scale_x": state.capture.scale_x,
-            "capture_scale_y": state.capture.scale_y,
+            "capture_scale_x": state.capture.scale_x(),
+            "capture_scale_y": state.capture.scale_y(),
             "app": state.app_name,
             "window_title": state.capture.window_title,
             "window_count": state.capture.window_count,
@@ -1854,7 +1939,8 @@ impl GuiHandler {
             request.capture_mode,
             request.window_selection,
             request.app.is_some(),
-        )?;
+        )
+        .await?;
         let capture_state = observation.state;
         let target = self
             .ground_target(
@@ -1886,7 +1972,8 @@ impl GuiHandler {
             request.capture_mode,
             request.window_selection,
             request.app.is_some(),
-        )?;
+        )
+        .await?;
         let capture_state = observation.state;
         let Some(remaining) = remaining_wait_budget_duration(deadline) else {
             return Ok(TargetProbe {
@@ -1949,7 +2036,7 @@ impl GuiHandler {
 
         let should_retry_with_display = request.capture_mode.is_none()
             && request.app.is_some()
-            && initial_probe.capture_state.capture.capture_mode == "window";
+            && initial_probe.capture_state.capture.capture_mode == CaptureMode::Window;
         if !should_retry_with_display {
             return Ok(None);
         }
@@ -1992,7 +2079,8 @@ impl GuiHandler {
                 &bounds,
                 capture_state.capture.image_width,
                 capture_state.capture.image_height,
-            )?
+            )
+            .await?
         } else {
             image_bytes.to_vec()
         };
@@ -2028,7 +2116,7 @@ impl GuiHandler {
         interval_ms: i64,
     ) -> Result<GuiTargetProbeResult, FunctionCallError> {
         let attach_image = supports_image_input(invocation);
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(0) as u64);
         let mut attempts = 0;
         let initial_probe = self
             .probe_semantic_target_before_deadline(
@@ -2059,8 +2147,8 @@ impl GuiHandler {
             let Some(remaining_ms) = remaining_wait_budget_ms(deadline) else {
                 break;
             };
-            let sleep_ms = remaining_ms.min(interval_ms);
-            sleep(Duration::from_millis(sleep_ms as u64)).await;
+            let sleep_ms = remaining_ms.min(interval_ms as u64);
+            sleep(Duration::from_millis(sleep_ms)).await;
             let Some(_) = remaining_wait_budget_ms(deadline) else {
                 break;
             };
@@ -2101,16 +2189,14 @@ impl GuiHandler {
             matched = consecutive_satisfied >= WAIT_CONFIRMATION_COUNT;
         }
 
-        self.observe_state
-            .lock()
-            .await
-            .insert(
-                invocation.session.conversation_id.to_string(),
-                current_state.clone(),
-            );
+        self.set_observe_state(
+            &invocation.session.conversation_id.to_string(),
+            current_state.clone(),
+        )
+        .await;
 
         let image_url = if attach_image {
-            Some(capture_image_url_for_state(&current_state)?)
+            Some(capture_image_url_for_state(&current_state).await?)
         } else {
             None
         };
@@ -2145,12 +2231,12 @@ fn supports_image_input(invocation: &ToolInvocation) -> bool {
         .contains(&InputModality::Image)
 }
 
-fn prepare_gui_observe_request(
+async fn prepare_gui_observe_request(
     invocation: &ToolInvocation,
     targeted: bool,
     return_image: Option<bool>,
 ) -> Result<bool, FunctionCallError> {
-    enforce_gui_tool_capability(invocation, "gui_observe", targeted)?;
+    enforce_gui_tool_capability(invocation, "gui_observe", targeted).await?;
     Ok(return_image.unwrap_or(true) && supports_image_input(invocation))
 }
 
@@ -2182,8 +2268,8 @@ fn normalize_grounding_mode(
     }
 }
 
-fn remaining_wait_budget_ms(deadline: Instant) -> Option<i64> {
-    remaining_wait_budget_duration(deadline).map(|duration| duration.as_millis() as i64)
+fn remaining_wait_budget_ms(deadline: Instant) -> Option<u64> {
+    remaining_wait_budget_duration(deadline).map(|duration| duration.as_millis() as u64)
 }
 
 fn remaining_wait_budget_duration(deadline: Instant) -> Option<Duration> {
@@ -2454,8 +2540,8 @@ fn build_capture_details_from_state(state: &ObserveState) -> JsonValue {
         "height": state.capture.height,
         "image_width": state.capture.image_width,
         "image_height": state.capture.image_height,
-        "capture_scale_x": state.capture.scale_x,
-        "capture_scale_y": state.capture.scale_y,
+        "capture_scale_x": state.capture.scale_x(),
+        "capture_scale_y": state.capture.scale_y(),
         "app": state.app_name,
         "window_title": state.capture.window_title,
         "window_count": state.capture.window_count,
@@ -2490,8 +2576,8 @@ fn local_point_within_state(state: &ObserveState, point: &HelperPoint) -> Option
     let local_y = point.y - state.capture.origin_y;
     if local_x >= 0.0
         && local_y >= 0.0
-        && local_x <= state.capture.width as f64
-        && local_y <= state.capture.height as f64
+        && local_x < state.capture.width as f64
+        && local_y < state.capture.height as f64
     {
         Some(HelperPoint {
             x: local_x,
@@ -2505,8 +2591,8 @@ fn local_point_within_state(state: &ObserveState, point: &HelperPoint) -> Option
 fn image_point_within_capture(state: &ObserveState, point: &HelperPoint) -> Option<HelperPoint> {
     if point.x >= 0.0
         && point.y >= 0.0
-        && point.x <= state.capture.image_width as f64
-        && point.y <= state.capture.image_height as f64
+        && point.x < state.capture.image_width as f64
+        && point.y < state.capture.image_height as f64
     {
         Some(point.clone())
     } else {
@@ -2535,8 +2621,8 @@ fn local_rect_within_state(state: &ObserveState, rect: &HelperRect) -> Option<He
     }
 }
 
-fn capture_image_url_for_state(state: &ObserveState) -> Result<String, FunctionCallError> {
-    let window_selection = if state.capture.capture_mode == "window" {
+async fn capture_image_url_for_state(state: &ObserveState) -> Result<String, FunctionCallError> {
+    let window_selection = if state.capture.capture_mode == CaptureMode::Window {
         state
             .capture
             .window_title
@@ -2552,10 +2638,11 @@ fn capture_image_url_for_state(state: &ObserveState) -> Result<String, FunctionC
     let observation = observe_platform(
         state.app_name.as_deref(),
         false,
-        Some(state.capture.capture_mode),
+        Some(state.capture.capture_mode.as_str()),
         window_selection.as_ref(),
         false,
-    )?;
+    )
+    .await?;
     Ok(data_url_png(&observation.image_bytes))
 }
 
@@ -2571,7 +2658,7 @@ fn rounded_dimension(value: f64, label: &str) -> Result<u32, FunctionCallError> 
 
 #[derive(Clone, Debug)]
 struct CaptureTarget {
-    mode: &'static str,
+    mode: CaptureMode,
     bounds: HelperRect,
     width: u32,
     height: u32,
@@ -2654,14 +2741,14 @@ fn normalize_window_selection(
 
 fn normalize_capture_mode(
     capture_mode: Option<&str>,
-) -> Result<Option<&'static str>, FunctionCallError> {
+) -> Result<Option<CaptureMode>, FunctionCallError> {
     match capture_mode
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
         None => Ok(None),
-        Some("display") => Ok(Some("display")),
-        Some("window") => Ok(Some("window")),
+        Some("display") => Ok(Some(CaptureMode::Display)),
+        Some("window") => Ok(Some(CaptureMode::Window)),
         Some(other) => Err(FunctionCallError::RespondToModel(format!(
             "gui capture_mode only supports `display` or `window`, got `{other}`"
         ))),
@@ -2692,7 +2779,7 @@ fn resolve_capture_target(
     let requested_mode = normalize_capture_mode(capture_mode)?;
     if window_selection_requested && context.window_bounds.is_none() {
         return Err(FunctionCallError::RespondToModel(
-            "requested macOS window could not be found; check `window_title`/`window_selector` or switch to `capture_mode: \"display\"`"
+            "requested window could not be found; check `window_title`/`window_selector` or switch to `capture_mode: \"display\"`"
                 .to_string(),
         ));
     }
@@ -2705,14 +2792,13 @@ fn resolve_capture_target(
         && context.window_bounds.is_some();
 
     let use_window = match requested_mode {
-        Some("window") => context.window_bounds.is_some(),
-        Some("display") => false,
+        Some(CaptureMode::Window) => context.window_bounds.is_some(),
+        Some(CaptureMode::Display) => false,
         None => {
             window_selection_requested
                 || host_self_exclude_adjusted
                 || (prefer_window_when_available && context.window_bounds.is_some())
         }
-        Some(_) => false,
     };
 
     let (mode, bounds) = if use_window {
@@ -2721,9 +2807,9 @@ fn resolve_capture_target(
                 "window capture requested but no matching window bounds were available".to_string(),
             ));
         };
-        ("window", bounds)
+        (CaptureMode::Window, bounds)
     } else {
-        ("display", context.display.bounds.clone())
+        (CaptureMode::Display, context.display.bounds.clone())
     };
     let width = rounded_dimension(bounds.width, "capture width")?;
     let height = rounded_dimension(bounds.height, "capture height")?;
@@ -2734,17 +2820,17 @@ fn resolve_capture_target(
         width,
         height,
         host_self_exclude_adjusted,
-        window_title: if mode == "window" {
+        window_title: if mode == CaptureMode::Window {
             context.window_title.clone()
         } else {
             None
         },
-        window_count: if mode == "window" {
+        window_count: if mode == CaptureMode::Window {
             context.window_count
         } else {
             None
         },
-        window_capture_strategy: if mode == "window" {
+        window_capture_strategy: if mode == CaptureMode::Window {
             context.window_capture_strategy.clone()
         } else {
             None
@@ -2752,24 +2838,52 @@ fn resolve_capture_target(
     })
 }
 
-fn capture_context(
+async fn capture_context(
     app: Option<&str>,
     activate_app: bool,
     window_selection: Option<&WindowSelector>,
 ) -> Result<HelperCaptureContext, FunctionCallError> {
-    default_gui_platform().capture_context(app, activate_app, window_selection)
+    let app = app.map(String::from);
+    let window_selection = window_selection.cloned();
+    tokio::task::spawn_blocking(move || {
+        default_gui_platform().capture_context(
+            app.as_deref(),
+            activate_app,
+            window_selection.as_ref(),
+        )
+    })
+    .await
+    .map_err(|e| FunctionCallError::RespondToModel(format!("gui platform task panicked: {e}")))?
 }
 
-fn run_gui_event(
+async fn run_gui_event(
     event_mode: &str,
     app: Option<&str>,
     float_env: &[(&str, f64)],
     string_env: &[(&str, String)],
 ) -> Result<(), FunctionCallError> {
-    default_gui_platform().run_event(event_mode, app, float_env, string_env)
+    let event_mode = event_mode.to_string();
+    let app = app.map(String::from);
+    let float_env: Vec<(String, f64)> =
+        float_env.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+    let string_env: Vec<(String, String)> = string_env
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect();
+    tokio::task::spawn_blocking(move || {
+        let float_refs: Vec<(&str, f64)> =
+            float_env.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        let string_refs: Vec<(&str, String)> = string_env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.clone()))
+            .collect();
+        default_gui_platform().run_event(&event_mode, app.as_deref(), &float_refs, &string_refs)
+    })
+    .await
+    .map_err(|e| FunctionCallError::RespondToModel(format!("gui platform task panicked: {e}")))?
 }
 
-fn prepare_targeted_gui_action(
+async fn prepare_targeted_gui_action(
     app: Option<&str>,
     capture_mode: Option<&str>,
     window_selection: Option<&WindowSelector>,
@@ -2778,7 +2892,7 @@ fn prepare_targeted_gui_action(
         return Ok(());
     }
 
-    let context = capture_context(app, true, window_selection)?;
+    let context = capture_context(app, true, window_selection).await?;
     if capture_mode.is_some() || window_selection.is_some() {
         let _ = resolve_capture_target(
             &context,
@@ -2791,7 +2905,7 @@ fn prepare_targeted_gui_action(
 }
 
 fn describe_capture_subject(state: &ObserveState) -> String {
-    if state.capture.capture_mode == "window" {
+    if state.capture.capture_mode == CaptureMode::Window {
         state
             .capture
             .window_title
@@ -2813,28 +2927,40 @@ fn describe_click_action(button: &str, clicks: i64, hold: bool) -> String {
     }
 }
 
-fn capture_region(
+async fn capture_region(
     bounds: &HelperRect,
     target_width: u32,
     target_height: u32,
 ) -> Result<Vec<u8>, FunctionCallError> {
-    default_gui_platform().capture_region(bounds, target_width, target_height)
+    let bounds = bounds.clone();
+    tokio::task::spawn_blocking(move || {
+        default_gui_platform().capture_region(&bounds, target_width, target_height)
+    })
+    .await
+    .map_err(|e| FunctionCallError::RespondToModel(format!("gui platform task panicked: {e}")))?
 }
 
-fn observe_platform(
+async fn observe_platform(
     app: Option<&str>,
     activate_app: bool,
     capture_mode: Option<&str>,
     window_selection: Option<&WindowSelector>,
     prefer_window_when_available: bool,
 ) -> Result<PlatformObservation, FunctionCallError> {
-    default_gui_platform().observe(
-        app,
-        activate_app,
-        capture_mode,
-        window_selection,
-        prefer_window_when_available,
-    )
+    let app = app.map(String::from);
+    let capture_mode = capture_mode.map(String::from);
+    let window_selection = window_selection.cloned();
+    tokio::task::spawn_blocking(move || {
+        default_gui_platform().observe(
+            app.as_deref(),
+            activate_app,
+            capture_mode.as_deref(),
+            window_selection.as_ref(),
+            prefer_window_when_available,
+        )
+    })
+    .await
+    .map_err(|e| FunctionCallError::RespondToModel(format!("gui platform task panicked: {e}")))?
 }
 
 pub(super) fn data_url(bytes: &[u8], mime_type: &str) -> String {
@@ -2857,9 +2983,15 @@ fn resolve_type_value(args: &TypeArgs) -> Result<String, FunctionCallError> {
     .into_iter()
     .filter(|configured| *configured)
     .count();
-    if configured_source_count != 1 {
+    if configured_source_count == 0 {
         return Err(FunctionCallError::RespondToModel(
-            "gui_type requires exactly one of `value`, `secret_env_var`, or `secret_command_env_var`"
+            "gui_type requires a text source: provide exactly one of `value`, `secret_env_var`, or `secret_command_env_var`"
+                .to_string(),
+        ));
+    }
+    if configured_source_count > 1 {
+        return Err(FunctionCallError::RespondToModel(
+            "gui_type accepts only one text source: provide exactly one of `value`, `secret_env_var`, or `secret_command_env_var`"
                 .to_string(),
         ));
     }
@@ -2909,7 +3041,7 @@ fn resolve_type_value(args: &TypeArgs) -> Result<String, FunctionCallError> {
     Ok(text)
 }
 
-fn run_system_events_type(
+async fn run_system_events_type(
     app: Option<&str>,
     window_selection: Option<&WindowSelector>,
     text: &str,
@@ -2917,14 +3049,22 @@ fn run_system_events_type(
     submit: bool,
     strategy: &str,
 ) -> Result<(), FunctionCallError> {
-    default_gui_platform().run_system_events_type(
-        app,
-        window_selection,
-        text,
-        replace,
-        submit,
-        strategy,
-    )
+    let app = app.map(String::from);
+    let window_selection = window_selection.cloned();
+    let text = text.to_string();
+    let strategy = strategy.to_string();
+    tokio::task::spawn_blocking(move || {
+        default_gui_platform().run_system_events_type(
+            app.as_deref(),
+            window_selection.as_ref(),
+            &text,
+            replace,
+            submit,
+            &strategy,
+        )
+    })
+    .await
+    .map_err(|e| FunctionCallError::RespondToModel(format!("gui platform task panicked: {e}")))?
 }
 
 #[cfg(test)]

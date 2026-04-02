@@ -1630,7 +1630,7 @@ impl BuiltinToolCallCell {
 
     pub(crate) fn complete(&mut self, success: Option<bool>, output: Option<&serde_json::Value>) {
         self.success = Some(!matches!(success, Some(false)));
-        self.output = output.and_then(builtin_tool_output_summary);
+        self.output = output.and_then(codex_protocol::items::builtin_tool_output_summary);
     }
 
     pub(crate) fn mark_failed(&mut self) {
@@ -2904,22 +2904,6 @@ fn format_builtin_tool_invocation<'a>(tool: &str, arguments: &serde_json::Value)
         ")".into(),
     ]
     .into()
-}
-
-fn builtin_tool_output_summary(output: &serde_json::Value) -> Option<String> {
-    match output {
-        serde_json::Value::String(text) if !text.trim().is_empty() => Some(text.clone()),
-        serde_json::Value::Array(items)
-            if items.iter().any(|item| {
-                item.get("type")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|kind| kind == "input_image" || kind == "inputImage")
-            }) =>
-        {
-            Some("<image output>".to_string())
-        }
-        _ => None,
-    }
 }
 
 #[cfg(test)]

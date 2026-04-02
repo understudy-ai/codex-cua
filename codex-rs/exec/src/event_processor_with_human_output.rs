@@ -228,10 +228,12 @@ impl EventProcessorWithHumanOutput {
                     tool.style(self.cyan),
                     format!("({status_text})").style(self.dimmed)
                 );
-                if let Some(output) = output.and_then(render_builtin_tool_output)
-                    && !output.trim().is_empty()
+                if let Some(summary) = output
+                    .as_ref()
+                    .and_then(codex_protocol::items::builtin_tool_output_summary)
+                    && !summary.trim().is_empty()
                 {
-                    eprintln!("{}", output.style(self.dimmed));
+                    eprintln!("{}", summary.style(self.dimmed));
                 }
             }
             ThreadItem::WebSearch { query, .. } => {
@@ -450,22 +452,6 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 message
             );
         }
-    }
-}
-
-fn render_builtin_tool_output(output: serde_json::Value) -> Option<String> {
-    match output {
-        serde_json::Value::String(text) if !text.trim().is_empty() => Some(text),
-        serde_json::Value::Array(items)
-            if items.iter().any(|item| {
-                item.get("type")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|kind| kind == "input_image" || kind == "inputImage")
-            }) =>
-        {
-            Some("<image output>".to_string())
-        }
-        _ => None,
     }
 }
 

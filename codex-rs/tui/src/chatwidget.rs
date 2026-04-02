@@ -3390,8 +3390,16 @@ impl ChatWidget {
                         "codex to access {target}"
                     ))
                 }
-                GuardianAssessmentAction::Command { .. } => unreachable!(),
-                GuardianAssessmentAction::Execve { .. } => unreachable!(),
+                GuardianAssessmentAction::Command { command, .. } => {
+                    history_cell::new_guardian_denied_action_request(format!(
+                        "codex to run `{command}`"
+                    ))
+                }
+                GuardianAssessmentAction::Execve { program, .. } => {
+                    history_cell::new_guardian_denied_action_request(format!(
+                        "codex to execute `{program}`"
+                    ))
+                }
             }
         };
 

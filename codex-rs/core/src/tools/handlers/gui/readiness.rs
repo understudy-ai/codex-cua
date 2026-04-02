@@ -10,8 +10,9 @@ use super::platform::default_gui_platform;
 use super::platform::resolve_gui_platform_tool_capabilities;
 use super::supports_image_input;
 
-static READINESS_CACHE: std::sync::LazyLock<StdMutex<Option<(GuiEnvironmentReadinessSnapshot, Instant)>>> =
-    std::sync::LazyLock::new(|| StdMutex::new(None));
+static READINESS_CACHE: std::sync::LazyLock<
+    StdMutex<Option<(GuiEnvironmentReadinessSnapshot, Instant)>>,
+> = std::sync::LazyLock::new(|| StdMutex::new(None));
 const READINESS_CACHE_TTL_SECS: u64 = 30;
 
 const GUI_ACCESSIBILITY_REQUIRED_REASON: &str = "Accessibility permission is not granted, so GUI input actions (click, type, scroll, drag, etc.) are unavailable. GUI observation tools (gui_observe) may still work. Grant Accessibility permission in System Settings > Privacy & Security > Accessibility.";
@@ -41,18 +42,20 @@ pub(super) enum GuiReadinessStatus {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(super) struct GuiEnvironmentReadinessCheck {
     pub(super) id: &'static str,
+    #[allow(dead_code)]
     pub(super) label: &'static str,
     pub(super) status: GuiReadinessStatus,
+    #[allow(dead_code)]
     pub(super) summary: String,
+    #[allow(dead_code)]
     pub(super) detail: Option<String>,
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(super) struct GuiEnvironmentReadinessSnapshot {
+    #[allow(dead_code)]
     pub(super) status: &'static str,
     pub(super) checks: Vec<GuiEnvironmentReadinessCheck>,
 }
@@ -65,14 +68,20 @@ pub(super) struct GuiToolCapability {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(super) struct GuiRuntimeCapabilitySnapshot {
+    #[allow(dead_code)]
     pub(super) platform_supported: bool,
+    #[allow(dead_code)]
     pub(super) grounding_available: bool,
+    #[allow(dead_code)]
     pub(super) native_helper_available: bool,
+    #[allow(dead_code)]
     pub(super) screen_capture_available: bool,
+    #[allow(dead_code)]
     pub(super) input_available: bool,
+    #[allow(dead_code)]
     pub(super) enabled_tool_names: Vec<&'static str>,
+    #[allow(dead_code)]
     pub(super) disabled_tool_names: Vec<&'static str>,
     pub(super) tool_availability: HashMap<&'static str, GuiToolCapability>,
 }
@@ -80,12 +89,16 @@ pub(super) struct GuiRuntimeCapabilitySnapshot {
 pub(super) fn resolve_gui_readiness_snapshot() -> GuiEnvironmentReadinessSnapshot {
     let mut cache = READINESS_CACHE.lock().expect("readiness cache poisoned");
     if let Some((snapshot, created_at)) = cache.as_ref() {
-        if created_at.elapsed().as_secs() < READINESS_CACHE_TTL_SECS {
+        if snapshot.status == "ready" && created_at.elapsed().as_secs() < READINESS_CACHE_TTL_SECS {
             return snapshot.clone();
         }
     }
     let snapshot = default_gui_platform().readiness_snapshot();
-    *cache = Some((snapshot.clone(), Instant::now()));
+    if snapshot.status == "ready" {
+        *cache = Some((snapshot.clone(), Instant::now()));
+    } else {
+        *cache = None;
+    }
     snapshot
 }
 
@@ -220,18 +233,25 @@ pub(super) fn resolve_gui_runtime_capabilities(
     }
 }
 
-pub(super) fn enforce_gui_tool_capability(
+pub(super) async fn enforce_gui_tool_capability(
     invocation: &ToolInvocation,
     tool_name: &'static str,
     targeted: bool,
 ) -> Result<(), FunctionCallError> {
-    let readiness = resolve_gui_readiness_snapshot();
-    let platform_tool_availability = resolve_gui_platform_tool_capabilities();
-    let capabilities = resolve_gui_runtime_capabilities(
-        supports_image_input(invocation),
-        &readiness,
-        Some(&platform_tool_availability),
-    );
+    let has_image_input = supports_image_input(invocation);
+    let capabilities = tokio::task::spawn_blocking(move || {
+        let readiness = resolve_gui_readiness_snapshot();
+        let platform_tool_availability = resolve_gui_platform_tool_capabilities();
+        resolve_gui_runtime_capabilities(
+            has_image_input,
+            &readiness,
+            Some(&platform_tool_availability),
+        )
+    })
+    .await
+    .map_err(|error| {
+        FunctionCallError::RespondToModel(format!("GUI readiness check failed: {error}"))
+    })?;
     let Some(capability) = capabilities.tool_availability.get(tool_name) else {
         return Ok(());
     };

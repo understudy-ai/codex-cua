@@ -329,10 +329,9 @@ func firstVisibleOwnerName(excluding exclusions: WindowExclusions) -> String? {
             continue
         }
         let boundsDict = rawBounds as! CFDictionary
-        guard
-            let bounds = CGRect(dictionaryRepresentation: boundsDict),
-            bounds.width >= 80,
-            bounds.height >= 80
+        guard let bounds = CGRect(dictionaryRepresentation: boundsDict),
+              bounds.width >= 80,
+              bounds.height >= 80
         else {
             continue
         }

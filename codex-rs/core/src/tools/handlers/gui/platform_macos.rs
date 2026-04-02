@@ -312,7 +312,9 @@ print(CGPreflightScreenCaptureAccess() ? "1" : "0")"#,
 
     fn resolve_helper_binary(&self) -> Result<PathBuf, FunctionCallError> {
         static CACHED_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-        if let Some(path) = CACHED_PATH.get() {
+        if let Some(path) = CACHED_PATH.get()
+            && path.exists()
+        {
             return Ok(path.clone());
         }
 
@@ -570,20 +572,10 @@ print(CGPreflightScreenCaptureAccess() ? "1" : "0")"#,
                 height: observed.capture_height,
                 image_width,
                 image_height,
-                scale_x: if observed.capture_width > 0 {
-                    image_width as f64 / observed.capture_width as f64
-                } else {
-                    1.0
-                },
-                scale_y: if observed.capture_height > 0 {
-                    image_height as f64 / observed.capture_height as f64
-                } else {
-                    1.0
-                },
                 display_index: observed.display.index,
                 capture_mode: match observed.capture_mode.as_str() {
-                    "window" => "window",
-                    _ => "display",
+                    "window" => super::super::CaptureMode::Window,
+                    _ => super::super::CaptureMode::Display,
                 },
                 window_title: observed.window_title.clone(),
                 window_count: observed.window_count,
