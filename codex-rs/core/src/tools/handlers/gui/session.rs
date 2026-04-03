@@ -15,6 +15,9 @@ pub(super) struct GuiActionSession {
     process_id: u32,
     lock: Option<FileGuiPhysicalResourceLock>,
     emergency_stop_monitor: Option<GuiEmergencyStopMonitor>,
+    /// PIDs of applications hidden at the start of the action via
+    /// [`hide_other_apps`].  Restored in [`Drop`].
+    hidden_pids: Vec<i32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -137,6 +140,16 @@ impl GuiActionSession {
         }
         Ok(())
     }
+
+    /// Hide all visible applications except the target app and the host
+    /// terminal so that the GUI action operates on a clean screen.  Hidden
+    /// PIDs are recorded and automatically restored when this session is
+    /// dropped.
+    pub(super) fn hide_other_apps(&mut self, app: Option<&str>) {
+        if let Ok(pids) = default_gui_platform().hide_other_apps(app) {
+            self.hidden_pids = pids;
+        }
+    }
 }
 
 impl Drop for GuiActionSession {
@@ -145,6 +158,9 @@ impl Drop for GuiActionSession {
             monitor.stop();
         }
         let _ = default_gui_platform().cleanup_input_state();
+        if !self.hidden_pids.is_empty() {
+            let _ = default_gui_platform().unhide_apps(&self.hidden_pids);
+        }
         if let Some(lock) = &self.lock {
             lock.release(&self.conversation_id, self.process_id);
         }
@@ -186,6 +202,7 @@ pub(super) fn begin_gui_action_session(
         process_id,
         lock,
         emergency_stop_monitor,
+        hidden_pids: Vec::new(),
     })
 }
 

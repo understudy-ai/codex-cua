@@ -771,8 +771,10 @@ impl GuiHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<GuiToolOutput, FunctionCallError> {
-        let action_session = session::begin_gui_action_session(&invocation, "gui_click", true)?;
+        let mut action_session =
+            session::begin_gui_action_session(&invocation, "gui_click", true)?;
         let args = parse_function_args::<ClickArgs>(&invocation.payload)?;
+        action_session.hide_other_apps(args.app.as_deref());
         let window_selection = normalize_window_selection(
             args.window_title.as_deref(),
             args.window_selector.as_ref(),
@@ -963,8 +965,10 @@ impl GuiHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<GuiToolOutput, FunctionCallError> {
-        let action_session = session::begin_gui_action_session(&invocation, "gui_drag", true)?;
+        let mut action_session =
+            session::begin_gui_action_session(&invocation, "gui_drag", true)?;
         let args = parse_function_args::<DragArgs>(&invocation.payload)?;
+        action_session.hide_other_apps(args.app.as_deref());
         let window_selection = normalize_window_selection(
             args.window_title.as_deref(),
             args.window_selector.as_ref(),
@@ -1235,8 +1239,10 @@ impl GuiHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<GuiToolOutput, FunctionCallError> {
-        let action_session = session::begin_gui_action_session(&invocation, "gui_scroll", true)?;
+        let mut action_session =
+            session::begin_gui_action_session(&invocation, "gui_scroll", true)?;
         let args = parse_function_args::<ScrollArgs>(&invocation.payload)?;
+        action_session.hide_other_apps(args.app.as_deref());
         let window_selection = normalize_window_selection(
             args.window_title.as_deref(),
             args.window_selector.as_ref(),
@@ -1453,8 +1459,10 @@ impl GuiHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<GuiToolOutput, FunctionCallError> {
-        let action_session = session::begin_gui_action_session(&invocation, "gui_type", true)?;
+        let mut action_session =
+            session::begin_gui_action_session(&invocation, "gui_type", true)?;
         let args = parse_function_args::<TypeArgs>(&invocation.payload)?;
+        action_session.hide_other_apps(args.app.as_deref());
         let window_selection = normalize_window_selection(
             args.window_title.as_deref(),
             args.window_selector.as_ref(),
@@ -1689,8 +1697,10 @@ impl GuiHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<GuiToolOutput, FunctionCallError> {
-        let action_session = session::begin_gui_action_session(&invocation, "gui_key", true)?;
+        let mut action_session =
+            session::begin_gui_action_session(&invocation, "gui_key", true)?;
         let args = parse_function_args::<KeyArgs>(&invocation.payload)?;
+        action_session.hide_other_apps(args.app.as_deref());
         let window_selection = normalize_window_selection(
             args.window_title.as_deref(),
             args.window_selector.as_ref(),
@@ -1763,8 +1773,10 @@ impl GuiHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<GuiToolOutput, FunctionCallError> {
-        let action_session = session::begin_gui_action_session(&invocation, "gui_move", true)?;
+        let mut action_session =
+            session::begin_gui_action_session(&invocation, "gui_move", true)?;
         let args = parse_function_args::<MoveArgs>(&invocation.payload)?;
+        action_session.hide_other_apps(args.app.as_deref());
         enforce_gui_tool_capability(&invocation, "gui_move", false).await?;
         action_session.throw_if_emergency_stopped()?;
         run_gui_event(

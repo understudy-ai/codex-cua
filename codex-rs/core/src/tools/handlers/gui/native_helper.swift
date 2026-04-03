@@ -1209,6 +1209,59 @@ func monitorEscape() throws {
     CFRunLoopRun()
 }
 
+// MARK: - Hide / Unhide other applications
+
+struct HideOtherAppsResult: Codable {
+    let hiddenPids: [Int32]
+}
+
+struct UnhideAppsResult: Codable {
+    let unhiddenCount: Int
+}
+
+func handleHideOtherApps() throws {
+    let targetApp = trimmedEnv("CODEX_GUI_APP")
+    let apps = NSWorkspace.shared.runningApplications
+    let frontmost = NSWorkspace.shared.frontmostApplication
+    var hiddenPids: [Int32] = []
+
+    for app in apps {
+        if app.isHidden || app.isTerminated { continue }
+        if app.activationPolicy != .regular { continue }
+        // Keep the frontmost app visible (the terminal running codex).
+        if app.processIdentifier == frontmost?.processIdentifier { continue }
+        // Keep the target app visible.
+        if let targetApp, matchesAppName(app, requestedName: targetApp) { continue }
+
+        app.hide()
+        hiddenPids.append(app.processIdentifier)
+    }
+
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    let data = try encoder.encode(HideOtherAppsResult(hiddenPids: hiddenPids))
+    FileHandle.standardOutput.write(data)
+}
+
+func handleUnhideApps() throws {
+    let pidsStr = env("CODEX_GUI_HIDDEN_PIDS")
+    let pids = pidsStr.split(separator: ",").compactMap {
+        Int32($0.trimmingCharacters(in: .whitespaces))
+    }
+    var count = 0
+    for pid in pids {
+        if let app = NSRunningApplication(processIdentifier: pid), app.isHidden {
+            app.unhide()
+            count += 1
+        }
+    }
+    let encoder = JSONEncoder()
+    let data = try encoder.encode(UnhideAppsResult(unhiddenCount: count))
+    FileHandle.standardOutput.write(data)
+}
+
+// MARK: - Main
+
 do {
     let command = CommandLine.arguments.dropFirst().first ?? ""
     switch command {
@@ -1224,6 +1277,10 @@ do {
         try handleRedactHostWindows()
     case "monitor-escape":
         try monitorEscape()
+    case "hide-other-apps":
+        try handleHideOtherApps()
+    case "unhide-apps":
+        try handleUnhideApps()
     default:
         throw HelperError.invalidCommand(command)
     }

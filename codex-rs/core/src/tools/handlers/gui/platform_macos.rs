@@ -394,6 +394,42 @@ print(CGPreflightScreenCaptureAccess() ? "1" : "0")"#,
         .map(|_| ())
     }
 
+    fn hide_other_apps(&self, app: Option<&str>) -> Result<Vec<i32>, FunctionCallError> {
+        let mut env = vec![];
+        if let Some(app) = app.filter(|a| !a.trim().is_empty()) {
+            env.push(("CODEX_GUI_APP", app.to_string()));
+        }
+        let output = run_helper(self, "hide-other-apps", &env)?;
+        #[derive(serde::Deserialize)]
+        struct HideResult {
+            #[serde(rename = "hiddenPids")]
+            hidden_pids: Vec<i32>,
+        }
+        let result: HideResult = parse_json(&output).map_err(|e| {
+            FunctionCallError::RespondToModel(format!(
+                "failed to parse hide-other-apps result: {e}"
+            ))
+        })?;
+        Ok(result.hidden_pids)
+    }
+
+    fn unhide_apps(&self, pids: &[i32]) -> Result<(), FunctionCallError> {
+        if pids.is_empty() {
+            return Ok(());
+        }
+        let pids_str = pids
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        run_helper(
+            self,
+            "unhide-apps",
+            &[("CODEX_GUI_HIDDEN_PIDS", pids_str)],
+        )
+        .map(|_| ())
+    }
+
     fn start_emergency_stop_monitor(
         &self,
     ) -> Result<Option<GuiEmergencyStopMonitor>, FunctionCallError> {

@@ -55,6 +55,18 @@ pub(super) trait GuiPlatform: Send + Sync {
         Ok(())
     }
 
+    /// Hide all regular applications except the target app and the host
+    /// terminal.  Returns the PIDs that were hidden so they can be restored
+    /// later via [`unhide_apps`].
+    fn hide_other_apps(&self, _app: Option<&str>) -> Result<Vec<i32>, FunctionCallError> {
+        Ok(vec![])
+    }
+
+    /// Restore applications that were previously hidden by [`hide_other_apps`].
+    fn unhide_apps(&self, _pids: &[i32]) -> Result<(), FunctionCallError> {
+        Ok(())
+    }
+
     fn start_emergency_stop_monitor(
         &self,
     ) -> Result<Option<GuiEmergencyStopMonitor>, FunctionCallError> {
