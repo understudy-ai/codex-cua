@@ -277,8 +277,12 @@ func activateApplication(named name: String?) throws {
     guard let app = findRunningApplication(named: name) else {
         throw HelperError.applicationNotFound(name)
     }
-    if !app.activate(options: [.activateIgnoringOtherApps]) {
-        throw HelperError.activationFailed(name)
+    if #available(macOS 14.0, *) {
+        app.activate()
+    } else {
+        if !app.activate(options: [.activateIgnoringOtherApps]) {
+            throw HelperError.activationFailed(name)
+        }
     }
     usleep(100_000)
 }
@@ -1028,8 +1032,12 @@ func releaseAllModifiers() throws {
 
 func releaseMouseButtons() {
     let point = CGEvent(source: nil)?.location ?? .zero
-    try? leftUp(at: point)
-    try? rightUp(at: point)
+    if CGEventSource.buttonState(.combinedSessionState, button: .left) {
+        try? leftUp(at: point)
+    }
+    if CGEventSource.buttonState(.combinedSessionState, button: .right) {
+        try? rightUp(at: point)
+    }
 }
 
 func parseModifierFlags(_ raw: String?) -> CGEventFlags {
