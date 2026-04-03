@@ -972,6 +972,7 @@ impl TurnContext {
         .with_unified_exec_shell_mode(self.tools_config.unified_exec_shell_mode.clone())
         .with_web_search_config(self.tools_config.web_search_config.clone())
         .with_gui_coordinate_targeting(config.gui_coordinate_targeting)
+        .with_gui_batch_grounding_strategy(config.gui_batch_grounding_strategy.clone())
         .with_allow_login_shell(self.tools_config.allow_login_shell)
         .with_agent_type_description(crate::agent::role::spawn_tool_spec::build(
             &config.agent_roles,
@@ -5669,6 +5670,7 @@ async fn spawn_review_thread(
     )
     .with_web_search_config(/*web_search_config*/ None)
     .with_gui_coordinate_targeting(config.gui_coordinate_targeting)
+        .with_gui_batch_grounding_strategy(config.gui_batch_grounding_strategy.clone())
     .with_allow_login_shell(config.permissions.allow_login_shell)
     .with_agent_type_description(crate::agent::role::spawn_tool_spec::build(
         &config.agent_roles,

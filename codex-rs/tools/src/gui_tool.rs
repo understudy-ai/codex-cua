@@ -730,6 +730,299 @@ pub fn create_gui_key_tool() -> ToolSpec {
     })
 }
 
+pub fn create_gui_batch_tool() -> ToolSpec {
+    let step_properties = BTreeMap::from([
+        (
+            "action".to_string(),
+            JsonSchema::String {
+                description: Some(string_enum_description(
+                    &["click", "type", "key", "scroll", "drag"],
+                    "The GUI action to perform in this step.",
+                )),
+            },
+        ),
+        // Semantic targeting (click, type, scroll)
+        (
+            "target".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Semantic GUI target for this step. Required for `click`. Optional for `type` (to focus a field first) and `scroll` (to target a scrollable region). Describe the control using visible screenshot evidence."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "location_hint".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Optional coarse position hint such as `top right` or `left sidebar`."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "scope".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Optional semantic region that narrows the search area, such as `toolbar` or `dialog`."
+                        .to_string(),
+                ),
+            },
+        ),
+        // Click-specific
+        (
+            "button".to_string(),
+            JsonSchema::String {
+                description: Some(string_enum_description(
+                    &["left", "right", "none"],
+                    "For `click` action. Defaults to `left`.",
+                )),
+            },
+        ),
+        (
+            "clicks".to_string(),
+            JsonSchema::Number {
+                description: Some(
+                    "For `click` action. Number of clicks. Defaults to 1. Use 2 for double-click."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "hold_ms".to_string(),
+            JsonSchema::Number {
+                description: Some(
+                    "For `click` action. Press-and-hold duration in milliseconds.".to_string(),
+                ),
+            },
+        ),
+        (
+            "settle_ms".to_string(),
+            JsonSchema::Number {
+                description: Some(
+                    "For `click` action with `button: none`. Hover settle time in ms. Defaults to 200."
+                        .to_string(),
+                ),
+            },
+        ),
+        // Type-specific
+        (
+            "value".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "For `type` action. The text to type into the focused control.".to_string(),
+                ),
+            },
+        ),
+        (
+            "replace".to_string(),
+            JsonSchema::Boolean {
+                description: Some(
+                    "For `type` action. If true (default), selects all existing text before typing."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "submit".to_string(),
+            JsonSchema::Boolean {
+                description: Some(
+                    "For `type` action. If true, presses Enter after typing. Defaults to false."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "type_strategy".to_string(),
+            JsonSchema::String {
+                description: Some(string_enum_description(
+                    &[
+                        "clipboard_paste",
+                        "physical_keys",
+                        "system_events_paste",
+                        "system_events_keystroke",
+                        "system_events_keystroke_chars",
+                    ],
+                    "For `type` action. Defaults to `clipboard_paste`.",
+                )),
+            },
+        ),
+        // Key-specific
+        (
+            "key".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "For `key` action. Key name such as `Enter`, `Escape`, or a single character."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "modifiers".to_string(),
+            JsonSchema::Array {
+                items: Box::new(JsonSchema::String {
+                    description: None,
+                }),
+                description: Some(
+                    "For `key` action. Modifier keys such as `command`, `shift`, `option`, `control`."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "repeat".to_string(),
+            JsonSchema::Number {
+                description: Some(
+                    "For `key` action. Number of times to press the key. Defaults to 1.".to_string(),
+                ),
+            },
+        ),
+        // Scroll-specific
+        (
+            "direction".to_string(),
+            JsonSchema::String {
+                description: Some(string_enum_description(
+                    &["up", "down", "left", "right"],
+                    "For `scroll` action. Defaults to `down`.",
+                )),
+            },
+        ),
+        (
+            "distance".to_string(),
+            JsonSchema::String {
+                description: Some(string_enum_description(
+                    &["small", "medium", "page"],
+                    "For `scroll` action. Semantic scroll distance.",
+                )),
+            },
+        ),
+        (
+            "amount".to_string(),
+            JsonSchema::Number {
+                description: Some(
+                    "For `scroll` action. Explicit line-count override for `distance`.".to_string(),
+                ),
+            },
+        ),
+        // Drag-specific
+        (
+            "from_target".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "For `drag` action. Semantic drag source to resolve. Describe the draggable surface using visible screenshot evidence."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "from_location_hint".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "For `drag` action. Coarse position hint for the drag source."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "from_scope".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "For `drag` action. Semantic region for the drag source."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "to_target".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "For `drag` action. Semantic drag destination to resolve. Describe the drop surface using visible screenshot evidence."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "to_location_hint".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "For `drag` action. Coarse position hint for the drag destination."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "to_scope".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "For `drag` action. Semantic region for the drag destination."
+                        .to_string(),
+                ),
+            },
+        ),
+        (
+            "duration_ms".to_string(),
+            JsonSchema::Number {
+                description: Some(
+                    "For `drag` action. Drag duration in milliseconds. Defaults to 450."
+                        .to_string(),
+                ),
+            },
+        ),
+    ]);
+
+    let step_schema = JsonSchema::Object {
+        properties: step_properties,
+        required: Some(vec!["action".to_string()]),
+        additional_properties: Some(false.into()),
+    };
+
+    let mut properties = with_capture_selection_properties(
+        BTreeMap::from([(
+            "app".to_string(),
+            JsonSchema::String {
+                description: Some(
+                    "Optional application name to activate before executing the batch."
+                        .to_string(),
+                ),
+            },
+        )]),
+        true,
+    );
+    properties.insert(
+        "steps".to_string(),
+        JsonSchema::Array {
+            items: Box::new(step_schema),
+            description: Some(
+                "Array of independent GUI actions to execute in order. All steps share a single screenshot for grounding and are executed sequentially without re-observing between them. Only include steps that do NOT depend on the visual effects of earlier steps."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "grounding_strategy".to_string(),
+        JsonSchema::String {
+            description: Some(string_enum_description(
+                &["parallel", "unified"],
+                "Grounding strategy. `parallel` (default) runs N independent grounding calls in parallel — proven accuracy, best for ≤3 targets. `unified` sends all targets in a single multi-target call with validation rounds — faster for 4+ targets.",
+            )),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "gui_batch".to_string(),
+        description: "Execute a batch of independent GUI actions in a single call for faster task completion. Takes one screenshot, resolves all semantic targets at once, and executes each step sequentially. Use this when consecutive actions do not depend on each other's visual effects. For dependent actions, use individual gui_* tools with gui_wait or gui_observe between them."
+            .to_string(),
+        strict: false,
+        defer_loading: None,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["steps".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+        output_schema: None,
+    })
+}
+
 pub fn create_gui_move_tool() -> ToolSpec {
     let properties = BTreeMap::from([
         (

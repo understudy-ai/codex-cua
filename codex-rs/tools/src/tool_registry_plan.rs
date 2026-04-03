@@ -27,6 +27,7 @@ use crate::create_exec_command_tool;
 use crate::create_gui_click_tool_with_options;
 use crate::create_gui_drag_tool_with_options;
 use crate::create_gui_key_tool;
+use crate::create_gui_batch_tool;
 use crate::create_gui_move_tool;
 use crate::create_gui_observe_tool_with_options;
 use crate::create_gui_scroll_tool;
@@ -393,6 +394,11 @@ pub fn build_tool_registry_plan(
             /*supports_parallel_tool_calls*/ false,
             config.code_mode_enabled,
         );
+        plan.push_spec(
+            create_gui_batch_tool(),
+            /*supports_parallel_tool_calls*/ false,
+            config.code_mode_enabled,
+        );
         plan.register_handler("gui_observe", ToolHandlerKind::Gui);
         plan.register_handler("gui_wait", ToolHandlerKind::Gui);
         plan.register_handler("gui_click", ToolHandlerKind::Gui);
@@ -401,6 +407,7 @@ pub fn build_tool_registry_plan(
         plan.register_handler("gui_type", ToolHandlerKind::Gui);
         plan.register_handler("gui_key", ToolHandlerKind::Gui);
         plan.register_handler("gui_move", ToolHandlerKind::Gui);
+        plan.register_handler("gui_batch", ToolHandlerKind::Gui);
     }
 
     if config.collab_tools {

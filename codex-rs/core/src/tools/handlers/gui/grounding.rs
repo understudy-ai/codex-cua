@@ -2122,3 +2122,689 @@ pub(super) async fn resolve_grounded_target(
         capture_state: capture_state.clone(),
     }))
 }
+
+// ---------------------------------------------------------------------------
+// Batch grounding: resolve multiple targets in parallel individual calls
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) enum BatchGroundingRole {
+    /// Primary target (click, type, scroll, or drag source).
+    Primary,
+    /// Secondary target for drag destination.
+    DragDestination,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct BatchGroundingTarget {
+    pub(super) step_index: usize,
+    pub(super) role: BatchGroundingRole,
+    pub(super) target: String,
+    pub(super) action: String,
+    pub(super) location_hint: Option<String>,
+    pub(super) scope: Option<String>,
+}
+
+/// Resolve multiple semantic targets using parallel individual grounding calls.
+///
+/// Each target is grounded independently using the proven single-target
+/// `resolve_grounded_target()` function, run concurrently via `join_all`.
+/// All calls share the same screenshot, so the wall-clock time is roughly
+/// `max(individual call durations)` rather than their sum.
+///
+/// Returns a `Vec` indexed by position in `targets`.  Each entry is `Some`
+/// when the target was resolved, or `None` when it was not found.
+pub(super) async fn resolve_batch_grounded_targets(
+    invocation: &ToolInvocation,
+    targets: &[BatchGroundingTarget],
+    capture_state: &ObserveState,
+    image_bytes: &[u8],
+) -> Result<Vec<Option<ResolvedTarget>>, FunctionCallError> {
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Launch one grounding call per target, all in parallel.
+    // GuiTargetRequest derives Copy, so it can be shared across futures.
+    let futures: Vec<_> = targets
+        .iter()
+        .map(|target| {
+            let action: &'static str = match target.action.as_str() {
+                "click" => "click",
+                "type" => "type",
+                "scroll" => "scroll",
+                _ => "click",
+            };
+            let request = super::GuiTargetRequest {
+                app: capture_state.app_name.as_deref(),
+                capture_mode: None,
+                window_selection: None,
+                target: &target.target,
+                location_hint: target.location_hint.as_deref(),
+                scope: target.scope.as_deref(),
+                grounding_mode: None,
+                action,
+                related_target: None,
+                related_scope: None,
+                related_location_hint: None,
+                related_point: None,
+            };
+            resolve_grounded_target(invocation, request, capture_state, image_bytes)
+        })
+        .collect();
+
+    let results = futures::future::join_all(futures).await;
+    results
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+}
+
+// ---------------------------------------------------------------------------
+// Unified batch grounding: multi-target predictor + validator rounds
+// ---------------------------------------------------------------------------
+
+const GUI_BATCH_GROUNDING_SYSTEM_PROMPT: &str = concat!(
+    "You are grounding multiple GUI targets inside a single screenshot. ",
+    "Return JSON only, following the provided schema exactly. ",
+    "Resolve each requested target independently. ",
+    "If any target is not confidently visible, return `status` = `not_found`, `found` = false, ",
+    "and null coordinates for that specific target only."
+);
+
+const GUI_BATCH_VALIDATION_SYSTEM_PROMPT: &str = concat!(
+    "You are validating multiple GUI grounding predictions inside a screenshot. ",
+    "Each prediction is highlighted with a colored crosshair marker. ",
+    "Return JSON only, following the provided schema exactly. ",
+    "Approve each prediction only when the highlighted point is a correct interaction point for the corresponding target."
+);
+
+const MARKER_COLOR_NAMES: [&str; 10] = [
+    "RED", "BLUE", "GREEN", "ORANGE", "PURPLE",
+    "CYAN", "YELLOW", "PINK", "BROWN", "GRAY",
+];
+
+const MARKER_COLORS: [Rgba<u8>; 10] = [
+    Rgba([255, 48, 48, 255]),
+    Rgba([48, 128, 255, 255]),
+    Rgba([48, 200, 48, 255]),
+    Rgba([255, 165, 0, 255]),
+    Rgba([200, 48, 200, 255]),
+    Rgba([0, 200, 200, 255]),
+    Rgba([255, 220, 0, 255]),
+    Rgba([255, 105, 180, 255]),
+    Rgba([139, 90, 43, 255]),
+    Rgba([128, 128, 128, 255]),
+];
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct BatchGroundingModelResponse {
+    targets: Vec<BatchGroundingTargetResponse>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct BatchGroundingTargetResponse {
+    index: usize,
+    status: String,
+    found: bool,
+    confidence: Option<f64>,
+    reason: Option<String>,
+    coordinate_space: Option<String>,
+    click_point: Option<HelperPoint>,
+    bbox: Option<GroundingBoundingBox>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct BatchValidationResponse {
+    targets: Vec<BatchValidationTargetResponse>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+struct BatchValidationTargetResponse {
+    index: usize,
+    status: String,
+    approved: bool,
+    confidence: Option<f64>,
+    reason: Option<String>,
+    failure_kind: Option<String>,
+    retry_hint: Option<String>,
+}
+
+fn gui_batch_grounding_output_schema() -> JsonValue {
+    let target_schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "index": { "type": "number" },
+            "status": { "type": "string" },
+            "found": { "type": "boolean" },
+            "confidence": { "type": ["number", "null"] },
+            "reason": { "type": ["string", "null"] },
+            "coordinate_space": { "type": ["string", "null"] },
+            "click_point": {
+                "type": ["object", "null"],
+                "properties": { "x": { "type": "number" }, "y": { "type": "number" } },
+                "required": ["x", "y"],
+                "additionalProperties": false
+            },
+            "bbox": {
+                "type": ["object", "null"],
+                "properties": {
+                    "x1": { "type": "number" }, "y1": { "type": "number" },
+                    "x2": { "type": "number" }, "y2": { "type": "number" }
+                },
+                "required": ["x1", "y1", "x2", "y2"],
+                "additionalProperties": false
+            }
+        },
+        "required": ["index", "status", "found", "confidence", "reason", "coordinate_space", "click_point", "bbox"],
+        "additionalProperties": false
+    });
+    serde_json::json!({
+        "type": "object",
+        "properties": { "targets": { "type": "array", "items": target_schema } },
+        "required": ["targets"],
+        "additionalProperties": false
+    })
+}
+
+fn gui_batch_validation_output_schema() -> JsonValue {
+    let target_schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "index": { "type": "number" },
+            "status": { "type": "string" },
+            "approved": { "type": "boolean" },
+            "confidence": { "type": ["number", "null"] },
+            "reason": { "type": ["string", "null"] },
+            "failure_kind": { "type": ["string", "null"] },
+            "retry_hint": { "type": ["string", "null"] }
+        },
+        "required": ["index", "status", "approved", "confidence", "reason", "failure_kind", "retry_hint"],
+        "additionalProperties": false
+    });
+    serde_json::json!({
+        "type": "object",
+        "properties": { "targets": { "type": "array", "items": target_schema } },
+        "required": ["targets"],
+        "additionalProperties": false
+    })
+}
+
+fn build_batch_gui_grounding_prompt(
+    targets: &[(usize, &BatchGroundingTarget)],
+    capture_state: &ObserveState,
+    retry_notes_per_target: &std::collections::HashMap<usize, Vec<String>>,
+    has_guide_image: bool,
+) -> String {
+    let mut lines = vec![
+        format!("capture_mode: {}", capture_state.capture.capture_mode),
+        format!(
+            "capture_size: {}x{}",
+            capture_state.capture.image_width, capture_state.capture.image_height
+        ),
+    ];
+    if let Some(app) = capture_state.app_name.as_deref() {
+        lines.push(format!("app: {app}"));
+    }
+    if let Some(window_title) = capture_state.capture.window_title.as_deref() {
+        lines.push(format!("window_title: {window_title}"));
+    }
+    lines.push(String::new());
+    lines.push(format!(
+        "Resolve the following {} GUI targets in this screenshot.",
+        targets.len()
+    ));
+    lines.push(String::new());
+    for &(idx, target) in targets {
+        lines.push(format!("[Target {}]", idx));
+        lines.push(format!("action: {}", target.action));
+        lines.push(format!(
+            "action_intent: {}",
+            format_grounding_action_intent(&target.action)
+        ));
+        lines.push(format!("target: {}", target.target));
+        if let Some(scope) = &target.scope {
+            lines.push(format!("scope: {scope}"));
+        }
+        if let Some(location_hint) = &target.location_hint {
+            lines.push(format!("location_hint: {location_hint}"));
+        }
+        if let Some(notes) = retry_notes_per_target.get(&idx) {
+            if !notes.is_empty() {
+                lines.push("Retry context:".to_string());
+                lines.extend(notes.iter().map(|n| format!("- {n}")));
+            }
+        }
+        lines.push(String::new());
+    }
+    if has_guide_image {
+        lines.push(
+            "An additional guide image is attached with RED overlays marking previously rejected candidates. Do not repeat those marked positions."
+                .to_string(),
+        );
+    }
+    lines.push(
+        "Ground each target independently. Use only visible screenshot evidence."
+            .to_string(),
+    );
+    lines.push(
+        "Choose the smallest obvious actionable or editable surface, and keep the click point on the visible hit target."
+            .to_string(),
+    );
+    lines.push(
+        "Use `coordinate_space: \"image_pixels\"`. Return one entry per target in the `targets` array."
+            .to_string(),
+    );
+    lines.push("Respond with JSON only.".to_string());
+    lines.join("\n")
+}
+
+fn build_batch_gui_grounding_validation_prompt(
+    candidates: &[(usize, &BatchGroundingTarget, &HelperPoint, Option<&GroundingBoundingBox>)],
+    capture_state: &ObserveState,
+) -> String {
+    let mut lines = vec![
+        format!("capture_mode: {}", capture_state.capture.capture_mode),
+        format!(
+            "capture_size: {}x{}",
+            capture_state.capture.image_width, capture_state.capture.image_height
+        ),
+    ];
+    if let Some(app) = capture_state.app_name.as_deref() {
+        lines.push(format!("app: {app}"));
+    }
+    if let Some(window_title) = capture_state.capture.window_title.as_deref() {
+        lines.push(format!("window_title: {window_title}"));
+    }
+    lines.push(String::new());
+    lines.push(format!(
+        "Validate the following {} grounding predictions. Each is highlighted with a colored crosshair.",
+        candidates.len()
+    ));
+    lines.push(String::new());
+    for (i, &(idx, target, point, bbox)) in candidates.iter().enumerate() {
+        let color_name = MARKER_COLOR_NAMES[i % MARKER_COLOR_NAMES.len()];
+        lines.push(format!(
+            "[Target {} — {color_name} marker]",
+            idx
+        ));
+        lines.push(format!("action: {}", target.action));
+        lines.push(format!("target: {}", target.target));
+        if let Some(scope) = &target.scope {
+            lines.push(format!("scope: {scope}"));
+        }
+        lines.push(format!(
+            "predicted_click_point_image_pixels: ({}, {})",
+            point.x.round(),
+            point.y.round()
+        ));
+        if let Some(bbox) = bbox {
+            lines.push(format!(
+                "predicted_bbox_image_pixels: ({}, {}, {}, {})",
+                bbox.x1.round(), bbox.y1.round(), bbox.x2.round(), bbox.y2.round()
+            ));
+        }
+        lines.push(String::new());
+    }
+    lines.push(
+        "Approve each prediction only when the highlighted point is a correct interaction point for the corresponding target."
+            .to_string(),
+    );
+    lines.push(
+        "Reject if the highlight lands on whitespace, padding, decoration, or the wrong control."
+            .to_string(),
+    );
+    lines.push(
+        "Use `failure_kind`: `wrong_region`, `scope_mismatch`, `wrong_control`, `wrong_point`, `state_mismatch`, `partial_visibility`, or `other`."
+            .to_string(),
+    );
+    lines.push(
+        "Return one entry per target in the `targets` array."
+            .to_string(),
+    );
+    lines.push("Respond with JSON only.".to_string());
+    lines.join("\n")
+}
+
+fn render_batch_validation_overlay(
+    image_bytes: &[u8],
+    markers: &[(usize, &HelperPoint, Option<&GroundingBoundingBox>)],
+) -> Result<Vec<u8>, FunctionCallError> {
+    let mut image = image::load_from_memory(image_bytes)
+        .map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "failed to decode image for batch validation overlay: {error}"
+            ))
+        })?
+        .into_rgba8();
+    for (i, &(_, point, bbox)) in markers.iter().enumerate() {
+        let color = MARKER_COLORS[i % MARKER_COLORS.len()];
+        if let Some(rect) = bbox.and_then(grounding_bbox_to_rect) {
+            draw_rect_outline(&mut image, &rect, color);
+        }
+        draw_crosshair(&mut image, point, color);
+    }
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut encoded, ImageFormat::Png)
+        .map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "failed to encode batch validation overlay: {error}"
+            ))
+        })?;
+    Ok(encoded.into_inner())
+}
+
+fn render_batch_guide_overlay(
+    image_bytes: &[u8],
+    rejected_points: &[(&HelperPoint, Option<&GroundingBoundingBox>)],
+) -> Result<Vec<u8>, FunctionCallError> {
+    let mut image = image::load_from_memory(image_bytes)
+        .map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "failed to decode image for batch guide overlay: {error}"
+            ))
+        })?
+        .into_rgba8();
+    let accent = Rgba([255, 48, 48, 255]);
+    for &(point, bbox) in rejected_points {
+        if let Some(rect) = bbox.and_then(grounding_bbox_to_rect) {
+            draw_rect_outline(&mut image, &rect, accent);
+        }
+        draw_crosshair(&mut image, point, accent);
+    }
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image)
+        .write_to(&mut encoded, ImageFormat::Png)
+        .map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "failed to encode batch guide overlay: {error}"
+            ))
+        })?;
+    Ok(encoded.into_inner())
+}
+
+/// Resolve multiple semantic targets using unified multi-target grounding
+/// with multi-round predictor + validator flow (complex mode).
+///
+/// Each round makes 2 model calls (predictor + validator) for ALL pending
+/// targets. Approved targets are finalized; rejected targets enter the next
+/// round with retry hints and guide overlays.
+///
+/// Total model calls: 2–6 (2 per round × max 3 rounds), regardless of N.
+pub(super) async fn resolve_batch_grounded_targets_unified(
+    invocation: &ToolInvocation,
+    targets: &[BatchGroundingTarget],
+    capture_state: &ObserveState,
+    image_bytes: &[u8],
+) -> Result<Vec<Option<ResolvedTarget>>, FunctionCallError> {
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let max_rounds = 3;
+    let prepared = prepare_grounding_model_image(
+        image_bytes,
+        GroundingModelImageConfig {
+            logical_width: Some(capture_state.capture.width),
+            logical_height: Some(capture_state.capture.height),
+            scale_x: Some(capture_state.capture.scale_x()),
+            scale_y: Some(capture_state.capture.scale_y()),
+            allow_logical_normalization: true,
+        },
+        "unified batch grounding image",
+    )?;
+    let mut model_capture_state = capture_state.clone();
+    model_capture_state.capture.image_width = prepared.model_width;
+    model_capture_state.capture.image_height = prepared.model_height;
+
+    let provider = gui_grounding_provider_name(invocation);
+
+    // Per-target state.
+    let mut results: Vec<Option<ResolvedTarget>> = vec![None; targets.len()];
+    let mut pending: Vec<usize> = (0..targets.len()).collect(); // indices into `targets`
+    let mut retry_notes: std::collections::HashMap<usize, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut guide_image: Option<Vec<u8>> = None;
+
+    for round in 1..=max_rounds {
+        if pending.is_empty() {
+            break;
+        }
+
+        // ── PREDICTOR: one call for all pending targets ────────────────
+        let pending_targets: Vec<(usize, &BatchGroundingTarget)> =
+            pending.iter().map(|&i| (i, &targets[i])).collect();
+
+        let mut grounding_images = vec![ModelInputImage {
+            bytes: &prepared.bytes,
+            mime_type: prepared.mime_type,
+        }];
+        if let Some(guide_bytes) = guide_image.as_deref() {
+            grounding_images.push(ModelInputImage {
+                bytes: guide_bytes,
+                mime_type: "image/png",
+            });
+        }
+
+        let prompt = build_batch_gui_grounding_prompt(
+            &pending_targets,
+            &model_capture_state,
+            &retry_notes,
+            guide_image.is_some(),
+        );
+        let (pred_response, _, _) =
+            request_model_json_with_images::<BatchGroundingModelResponse>(
+                invocation,
+                prompt,
+                &grounding_images,
+                GUI_BATCH_GROUNDING_SYSTEM_PROMPT,
+                gui_batch_grounding_output_schema(),
+                &format!("unified batch grounding round {round}"),
+            )
+            .await?;
+
+        // Parse predictor results into a map.
+        let mut pred_map: std::collections::HashMap<usize, BatchGroundingTargetResponse> =
+            std::collections::HashMap::new();
+        for resp in pred_response.targets {
+            pred_map.insert(resp.index, resp);
+        }
+
+        // Collect resolved candidates for validation.
+        struct Candidate {
+            target_idx: usize,
+            image_point: HelperPoint,
+            bbox: Option<GroundingBoundingBox>,
+            confidence: f64,
+            reason: Option<String>,
+        }
+        let mut candidates: Vec<Candidate> = Vec::new();
+        let mut not_found_this_round: Vec<usize> = Vec::new();
+
+        for &i in &pending {
+            match pred_map.remove(&i) {
+                Some(resp)
+                    if resp.status == "resolved"
+                        && resp.found
+                        && resp.click_point.is_some() =>
+                {
+                    let model_point = resp.click_point.unwrap();
+                    let image_point =
+                        translate_model_point_to_original(&prepared, &model_point);
+                    let bbox = resp
+                        .bbox
+                        .as_ref()
+                        .map(|b| translate_model_bbox_to_original(&prepared, b));
+                    candidates.push(Candidate {
+                        target_idx: i,
+                        image_point,
+                        bbox,
+                        confidence: resp.confidence.unwrap_or(0.0),
+                        reason: resp.reason,
+                    });
+                }
+                Some(resp) => {
+                    // Not found — add retry notes.
+                    if let Some(reason) = resp.reason.as_deref() {
+                        retry_notes
+                            .entry(i)
+                            .or_default()
+                            .push(format!("Round {round} predictor: {reason}"));
+                    }
+                    not_found_this_round.push(i);
+                }
+                None => {
+                    not_found_this_round.push(i);
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            // All pending targets not found this round.
+            if round == max_rounds {
+                break; // remaining pending → None
+            }
+            guide_image = None;
+            // Update pending to exclude those we won't retry.
+            pending.retain(|i| not_found_this_round.contains(i));
+            continue;
+        }
+
+        // ── VALIDATOR: one call to approve/reject all candidates ───────
+        let validation_markers: Vec<(usize, &HelperPoint, Option<&GroundingBoundingBox>)> =
+            candidates
+                .iter()
+                .enumerate()
+                .map(|(visual_idx, c)| {
+                    (visual_idx, &c.image_point, c.bbox.as_ref())
+                })
+                .collect();
+
+        let validation_image =
+            render_batch_validation_overlay(&prepared.bytes, &validation_markers)?;
+
+        let val_candidates: Vec<(usize, &BatchGroundingTarget, &HelperPoint, Option<&GroundingBoundingBox>)> =
+            candidates
+                .iter()
+                .map(|c| {
+                    (c.target_idx, &targets[c.target_idx], &c.image_point, c.bbox.as_ref())
+                })
+                .collect();
+
+        let val_prompt = build_batch_gui_grounding_validation_prompt(
+            &val_candidates,
+            &model_capture_state,
+        );
+        let (val_response, _, _) =
+            request_model_json_with_images::<BatchValidationResponse>(
+                invocation,
+                val_prompt,
+                &[ModelInputImage {
+                    bytes: &validation_image,
+                    mime_type: "image/png",
+                }],
+                GUI_BATCH_VALIDATION_SYSTEM_PROMPT,
+                gui_batch_validation_output_schema(),
+                &format!("unified batch validation round {round}"),
+            )
+            .await?;
+
+        // Parse validation results.
+        let mut val_map: std::collections::HashMap<usize, BatchValidationTargetResponse> =
+            std::collections::HashMap::new();
+        for vr in val_response.targets {
+            val_map.insert(vr.index, vr);
+        }
+
+        // Process each candidate.
+        let mut rejected_points: Vec<(&HelperPoint, Option<&GroundingBoundingBox>)> = Vec::new();
+        let mut newly_resolved: Vec<usize> = Vec::new();
+
+        for candidate in &candidates {
+            let i = candidate.target_idx;
+            let approved = val_map
+                .get(&i)
+                .map(|v| v.status == "approved" && v.approved)
+                .unwrap_or(false);
+
+            if approved {
+                // Finalize this target.
+                let local_point =
+                    image_point_within_capture(capture_state, &candidate.image_point);
+                if let Some(local_point) = local_point {
+                    let local_bounds = candidate
+                        .bbox
+                        .as_ref()
+                        .and_then(grounding_bbox_to_rect)
+                        .and_then(|rect| local_rect_within_state(capture_state, &rect))
+                        .unwrap_or_else(|| HelperRect {
+                            x: local_point.x.max(0.0),
+                            y: local_point.y.max(0.0),
+                            width: 1.0,
+                            height: 1.0,
+                        });
+                    let display_point = image_point_to_display(capture_state, &local_point);
+                    let display_bounds = image_rect_to_display(capture_state, &local_bounds);
+                    results[i] = Some(ResolvedTarget {
+                        window_title: capture_state.capture.window_title.clone(),
+                        provider: provider.clone(),
+                        confidence: candidate.confidence.clamp(0.0, 1.0),
+                        reason: candidate.reason.clone(),
+                        grounding_mode_requested: "unified".to_string(),
+                        grounding_mode_effective: "unified".to_string(),
+                        scope: targets[i].scope.clone(),
+                        point: display_point,
+                        bounds: display_bounds,
+                        local_point: Some(local_point),
+                        local_bounds: Some(local_bounds),
+                        raw: None,
+                        capture_state: capture_state.clone(),
+                    });
+                }
+                newly_resolved.push(i);
+            } else {
+                // Rejected — collect retry notes.
+                if let Some(vr) = val_map.get(&i) {
+                    let notes = retry_notes.entry(i).or_default();
+                    if let Some(reason) = vr.reason.as_deref() {
+                        notes.push(format!("Round {round} validator rejected: {reason}"));
+                    }
+                    if let Some(fk) = vr.failure_kind.as_deref() {
+                        notes.push(format!("Round {round} failure kind: {fk}"));
+                        if let Some(guidance) = failure_kind_retry_guidance(fk) {
+                            notes.push(guidance.to_string());
+                        }
+                    }
+                    if let Some(hint) = vr.retry_hint.as_deref() {
+                        notes.push(format!("Round {round} retry hint: {hint}"));
+                    }
+                    notes.push(format!(
+                        "Round {round} rejected_point: ({}, {})",
+                        candidate.image_point.x.round(),
+                        candidate.image_point.y.round()
+                    ));
+                }
+                rejected_points.push((&candidate.image_point, candidate.bbox.as_ref()));
+            }
+        }
+
+        // Update pending: remove resolved, keep rejected + not_found.
+        pending.retain(|i| !newly_resolved.contains(i));
+
+        // Generate guide overlay for next round if there are rejected points.
+        guide_image = if !rejected_points.is_empty() && round < max_rounds {
+            Some(render_batch_guide_overlay(
+                &prepared.bytes,
+                &rejected_points,
+            )?)
+        } else {
+            None
+        };
+    }
+
+    Ok(results)
+}

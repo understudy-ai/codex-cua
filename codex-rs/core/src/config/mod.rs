@@ -233,6 +233,9 @@ pub struct Config {
     /// separate grounding call.
     pub gui_coordinate_targeting: bool,
 
+    /// Default grounding strategy for `gui_batch`: `"parallel"` or `"unified"`.
+    pub gui_batch_grounding_strategy: String,
+
     /// Model used specifically for review sessions.
     pub review_model: Option<String>,
 
@@ -1538,6 +1541,11 @@ pub struct GuiToolsToml {
     /// delegating target resolution to the internal grounding round-trip.
     #[serde(default)]
     pub coordinate_targeting: Option<bool>,
+    /// Grounding strategy for `gui_batch`: `"parallel"` (default) runs N
+    /// independent grounding calls in parallel; `"unified"` sends all targets
+    /// in a single multi-target call with validation rounds.
+    #[serde(default)]
+    pub batch_grounding_strategy: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1989,6 +1997,15 @@ fn resolve_gui_coordinate_targeting(config_toml: &ConfigToml) -> bool {
         .unwrap_or(false)
 }
 
+fn resolve_gui_batch_grounding_strategy(config_toml: &ConfigToml) -> String {
+    config_toml
+        .tools
+        .as_ref()
+        .and_then(|tools| tools.gui.as_ref())
+        .and_then(|gui| gui.batch_grounding_strategy.clone())
+        .unwrap_or_else(|| "parallel".to_string())
+}
+
 pub(crate) fn resolve_web_search_mode_for_turn(
     web_search_mode: &Constrained<WebSearchMode>,
     sandbox_policy: &SandboxPolicy,
@@ -2305,6 +2322,7 @@ impl Config {
             .unwrap_or(WebSearchMode::Cached);
         let web_search_config = resolve_web_search_config(&cfg, &config_profile);
         let gui_coordinate_targeting = resolve_gui_coordinate_targeting(&cfg);
+        let gui_batch_grounding_strategy = resolve_gui_batch_grounding_strategy(&cfg);
 
         let agent_roles =
             agent_roles::load_agent_roles(&cfg, &config_layer_stack, &mut startup_warnings)?;
@@ -2616,6 +2634,7 @@ impl Config {
             model,
             service_tier,
             gui_coordinate_targeting,
+            gui_batch_grounding_strategy,
             review_model,
             model_context_window: cfg.model_context_window,
             model_auto_compact_token_limit: cfg.model_auto_compact_token_limit,

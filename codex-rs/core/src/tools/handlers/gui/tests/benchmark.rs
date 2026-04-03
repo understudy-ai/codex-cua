@@ -315,7 +315,7 @@ fn load_live_codex_auth() -> codex_login::CodexAuth {
 }
 
 #[cfg(target_os = "macos")]
-async fn live_grounding_benchmark_session()
+pub(super) async fn live_grounding_benchmark_session()
 -> (Arc<crate::codex::Session>, Arc<crate::codex::TurnContext>) {
     let codex_home = tempfile::tempdir().expect("codex home tempdir");
     let codex_home_path = codex_home.keep();

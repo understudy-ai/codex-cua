@@ -29,7 +29,8 @@ Use them as a tight observe-act-verify loop:
 - Reuse `capture_mode`, `window_title`, or `window_selector` across related GUI steps to keep the tool focused on the same surface.
 - Use `gui_type.secret_env_var` or `gui_type.secret_command_env_var` for sensitive values.
 - Prefer `capture_mode: \"window\"` for in-app work and `capture_mode: \"display\"` for desktop-wide UI such as the Dock, menu bar, permission prompts, or cross-window drags.
-- Remember that GUI actions now run with native safety guards: avoid overlapping risky actions, and stop to re-observe when the UI looks different than expected.{coordinate_guidance}"
+- Remember that GUI actions now run with native safety guards: avoid overlapping risky actions, and stop to re-observe when the UI looks different than expected.
+- Use `gui_batch` to execute multiple independent GUI actions (click, type, key, scroll, drag) in a single tool call for faster task completion. All steps share one screenshot and one grounding call. Only include steps that do NOT depend on the visual effects of earlier steps in the same batch. For dependent actions, use individual gui_* tools with `gui_wait` or `gui_observe` between them. Prefer `gui_batch` when you have 2 or more consecutive independent actions. Use `grounding_strategy: \"unified\"` for batches with 4 or more grounded targets for maximum speed.{coordinate_guidance}"
     ))
 }
 

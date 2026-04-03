@@ -291,6 +291,55 @@ struct MoveArgs {
     app: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct BatchArgs {
+    steps: Vec<BatchStep>,
+    app: Option<String>,
+    capture_mode: Option<String>,
+    window_title: Option<String>,
+    window_selector: Option<WindowSelector>,
+    grounding_strategy: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchStep {
+    action: String,
+    // Semantic targeting (click, type, scroll)
+    target: Option<String>,
+    location_hint: Option<String>,
+    scope: Option<String>,
+    // Click-specific
+    button: Option<String>,
+    clicks: Option<i64>,
+    hold_ms: Option<i64>,
+    settle_ms: Option<i64>,
+    // Type-specific
+    value: Option<String>,
+    secret_env_var: Option<String>,
+    secret_command_env_var: Option<String>,
+    replace: Option<bool>,
+    submit: Option<bool>,
+    type_strategy: Option<String>,
+    // Key-specific
+    key: Option<String>,
+    modifiers: Option<Vec<String>>,
+    repeat: Option<i64>,
+    // Scroll-specific
+    direction: Option<String>,
+    distance: Option<String>,
+    amount: Option<i64>,
+    // Drag-specific
+    from_target: Option<String>,
+    from_location_hint: Option<String>,
+    from_scope: Option<String>,
+    to_target: Option<String>,
+    to_location_hint: Option<String>,
+    to_scope: Option<String>,
+    duration_ms: Option<i64>,
+}
+
+const MAX_BATCH_STEPS: usize = 10;
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HelperCaptureContext {
@@ -498,6 +547,7 @@ impl ToolHandler for GuiHandler {
             "gui_type" => self.handle_type(invocation).await,
             "gui_key" => self.handle_key(invocation).await,
             "gui_move" => self.handle_move(invocation).await,
+            "gui_batch" => self.handle_batch(invocation).await,
             name => Err(FunctionCallError::RespondToModel(format!(
                 "unsupported gui tool `{name}`"
             ))),
@@ -1030,131 +1080,118 @@ impl GuiHandler {
             to_location_hint.as_deref(),
             to_scope.as_deref(),
         )?;
-        let (
-            from_global_x,
-            from_global_y,
-            state,
-            from_summary,
-            source_target_details,
-            source_point,
-        ) = match source_endpoint {
+        // Ground both drag endpoints in parallel for ~2x speed.
+        let source_req = match &source_endpoint {
             DragEndpoint::Target {
                 target,
                 location_hint,
                 scope,
-            } => {
-                let grounded = self
-                    .resolve_gui_target(
-                        &invocation,
-                        GuiTargetRequest {
-                            app: args.app.as_deref(),
-                            capture_mode: args.capture_mode.as_deref(),
-                            window_selection: window_selection.as_ref(),
-                            target,
-                            location_hint,
-                            scope,
-                            grounding_mode: args.grounding_mode.as_deref(),
-                            action: "drag_source",
-                            related_target: to_target.as_deref(),
-                            related_scope: to_scope.as_deref(),
-                            related_location_hint: to_location_hint.as_deref(),
-                            related_point: None,
-                        },
-                    )
-                    .await?;
-                let grounded = grounded.ok_or_else(|| {
-                    FunctionCallError::RespondToModel(format!(
-                        "Could not resolve semantic GUI drag source `{target}`."
-                    ))
-                })?;
-                let target_details = build_target_resolution_details(target, &grounded);
-                let resolved = grounded.resolved;
-                let summary = resolved
-                    .local_point
-                    .as_ref()
-                    .map(|point| {
-                        format!(
-                            "target `{target}` at image coordinate ({}, {})",
-                            point.x.round(),
-                            point.y.round()
-                        )
-                    })
-                    .unwrap_or_else(|| {
-                        format!(
-                            "target `{target}` at global coordinate ({}, {})",
-                            resolved.point.x.round(),
-                            resolved.point.y.round()
-                        )
-                    });
-                let point = resolved.point.clone();
-                (
-                    point.x,
-                    point.y,
-                    resolved.capture_state,
-                    summary,
-                    Some(target_details),
-                    point,
-                )
-            }
+            } => GuiTargetRequest {
+                app: args.app.as_deref(),
+                capture_mode: args.capture_mode.as_deref(),
+                window_selection: window_selection.as_ref(),
+                target,
+                location_hint: *location_hint,
+                scope: *scope,
+                grounding_mode: args.grounding_mode.as_deref(),
+                action: "drag_source",
+                related_target: to_target.as_deref(),
+                related_scope: to_scope.as_deref(),
+                related_location_hint: to_location_hint.as_deref(),
+                related_point: None,
+            },
         };
-        let (to_global_x, to_global_y, to_summary, destination_target_details) =
-            match destination_endpoint {
-                DragEndpoint::Target {
-                    target,
-                    location_hint,
-                    scope,
-                } => {
-                    let grounded = self
-                        .resolve_gui_target(
-                            &invocation,
-                            GuiTargetRequest {
-                                app: args.app.as_deref(),
-                                capture_mode: args.capture_mode.as_deref(),
-                                window_selection: window_selection.as_ref(),
-                                target,
-                                location_hint,
-                                scope,
-                                grounding_mode: args.grounding_mode.as_deref(),
-                                action: "drag_destination",
-                                related_target: from_target.as_deref(),
-                                related_scope: from_scope.as_deref(),
-                                related_location_hint: from_location_hint.as_deref(),
-                                related_point: Some(&source_point),
-                            },
-                        )
-                        .await?;
-                    let grounded = grounded.ok_or_else(|| {
-                        FunctionCallError::RespondToModel(format!(
-                            "Could not resolve semantic GUI drag destination `{target}`."
-                        ))
-                    })?;
-                    let target_details = build_target_resolution_details(target, &grounded);
-                    let resolved = grounded.resolved;
-                    let summary = resolved
-                        .local_point
-                        .as_ref()
-                        .map(|point| {
-                            format!(
-                                "target `{target}` at image coordinate ({}, {})",
-                                point.x.round(),
-                                point.y.round()
-                            )
-                        })
-                        .unwrap_or_else(|| {
-                            format!(
-                                "target `{target}` at global coordinate ({}, {})",
-                                resolved.point.x.round(),
-                                resolved.point.y.round()
-                            )
-                        });
-                    (
-                        resolved.point.x,
-                        resolved.point.y,
-                        summary,
-                        Some(target_details),
+        let dest_req = match &destination_endpoint {
+            DragEndpoint::Target {
+                target,
+                location_hint,
+                scope,
+            } => GuiTargetRequest {
+                app: args.app.as_deref(),
+                capture_mode: args.capture_mode.as_deref(),
+                window_selection: window_selection.as_ref(),
+                target,
+                location_hint: *location_hint,
+                scope: *scope,
+                grounding_mode: args.grounding_mode.as_deref(),
+                action: "drag_destination",
+                related_target: from_target.as_deref(),
+                related_scope: from_scope.as_deref(),
+                related_location_hint: from_location_hint.as_deref(),
+                related_point: None,
+            },
+        };
+        let (source_result, dest_result) = tokio::join!(
+            self.resolve_gui_target(&invocation, source_req),
+            self.resolve_gui_target(&invocation, dest_req),
+        );
+        let (from_global_x, from_global_y, state, from_summary, source_target_details) = {
+            let DragEndpoint::Target { target, .. } = source_endpoint;
+            let grounded = source_result?.ok_or_else(|| {
+                FunctionCallError::RespondToModel(format!(
+                    "Could not resolve semantic GUI drag source `{target}`."
+                ))
+            })?;
+            let target_details = build_target_resolution_details(target, &grounded);
+            let resolved = grounded.resolved;
+            let summary = resolved
+                .local_point
+                .as_ref()
+                .map(|point| {
+                    format!(
+                        "target `{target}` at image coordinate ({}, {})",
+                        point.x.round(),
+                        point.y.round()
                     )
-                }
-            };
+                })
+                .unwrap_or_else(|| {
+                    format!(
+                        "target `{target}` at global coordinate ({}, {})",
+                        resolved.point.x.round(),
+                        resolved.point.y.round()
+                    )
+                });
+            (
+                resolved.point.x,
+                resolved.point.y,
+                resolved.capture_state,
+                summary,
+                Some(target_details),
+            )
+        };
+        let (to_global_x, to_global_y, to_summary, destination_target_details) = {
+            let DragEndpoint::Target { target, .. } = destination_endpoint;
+            let grounded = dest_result?.ok_or_else(|| {
+                FunctionCallError::RespondToModel(format!(
+                    "Could not resolve semantic GUI drag destination `{target}`."
+                ))
+            })?;
+            let target_details = build_target_resolution_details(target, &grounded);
+            let resolved = grounded.resolved;
+            let summary = resolved
+                .local_point
+                .as_ref()
+                .map(|point| {
+                    format!(
+                        "target `{target}` at image coordinate ({}, {})",
+                        point.x.round(),
+                        point.y.round()
+                    )
+                })
+                .unwrap_or_else(|| {
+                    format!(
+                        "target `{target}` at global coordinate ({}, {})",
+                        resolved.point.x.round(),
+                        resolved.point.y.round()
+                    )
+                });
+            (
+                resolved.point.x,
+                resolved.point.y,
+                summary,
+                Some(target_details),
+            )
+        };
         let duration_ms = args.duration_ms.unwrap_or(DEFAULT_DRAG_DURATION_MS).max(1);
         let steps = DEFAULT_DRAG_STEPS;
         action_session.throw_if_emergency_stopped()?;
@@ -1811,6 +1848,543 @@ impl GuiHandler {
             }),
             success: true,
         })
+    }
+
+    async fn handle_batch(
+        &self,
+        invocation: ToolInvocation,
+    ) -> Result<GuiToolOutput, FunctionCallError> {
+        let mut action_session =
+            session::begin_gui_action_session(&invocation, "gui_batch", true)?;
+        let args = parse_function_args::<BatchArgs>(&invocation.payload)?;
+        if args.steps.is_empty() {
+            return Err(FunctionCallError::RespondToModel(
+                "gui_batch requires at least one step.".to_string(),
+            ));
+        }
+        if args.steps.len() > MAX_BATCH_STEPS {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "gui_batch supports at most {MAX_BATCH_STEPS} steps, got {}.",
+                args.steps.len()
+            )));
+        }
+        for (i, step) in args.steps.iter().enumerate() {
+            if !matches!(
+                step.action.as_str(),
+                "click" | "type" | "key" | "scroll" | "drag"
+            ) {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "gui_batch step {i}: unsupported action `{}`. Supported: click, type, key, scroll, drag.",
+                    step.action
+                )));
+            }
+        }
+
+        action_session.hide_other_apps(args.app.as_deref());
+        let window_selection = normalize_window_selection(
+            args.window_title.as_deref(),
+            args.window_selector.as_ref(),
+        )?;
+        enforce_gui_tool_capability(&invocation, "gui_batch", true).await?;
+
+        // ── Step 1: Collect grounding targets ──────────────────────────
+        let mut grounding_targets: Vec<grounding::BatchGroundingTarget> = Vec::new();
+        for (i, step) in args.steps.iter().enumerate() {
+            if step.action == "drag" {
+                // Drag produces two grounding targets: source + destination.
+                if let Some(from) = normalize_optional_string(step.from_target.as_deref()) {
+                    grounding_targets.push(grounding::BatchGroundingTarget {
+                        step_index: i,
+                        role: grounding::BatchGroundingRole::Primary,
+                        target: from,
+                        action: "drag_source".to_string(),
+                        location_hint: normalize_optional_string(step.from_location_hint.as_deref()),
+                        scope: normalize_optional_string(step.from_scope.as_deref()),
+                    });
+                }
+                if let Some(to) = normalize_optional_string(step.to_target.as_deref()) {
+                    grounding_targets.push(grounding::BatchGroundingTarget {
+                        step_index: i,
+                        role: grounding::BatchGroundingRole::DragDestination,
+                        target: to,
+                        action: "drag_destination".to_string(),
+                        location_hint: normalize_optional_string(step.to_location_hint.as_deref()),
+                        scope: normalize_optional_string(step.to_scope.as_deref()),
+                    });
+                }
+            } else {
+                let semantic_target = normalize_optional_string(step.target.as_deref());
+                if let Some(target) = semantic_target {
+                    grounding_targets.push(grounding::BatchGroundingTarget {
+                        step_index: i,
+                        role: grounding::BatchGroundingRole::Primary,
+                        target,
+                        action: step.action.clone(),
+                        location_hint: normalize_optional_string(step.location_hint.as_deref()),
+                        scope: normalize_optional_string(step.scope.as_deref()),
+                    });
+                }
+            }
+        }
+
+        // ── Step 2 & 3: Screenshot + grounding (only if needed) ───────
+        let mut batch_capture_state: Option<ObserveState> = None;
+        let grounded_results = if !grounding_targets.is_empty() {
+            // Take ONE screenshot for all grounding targets.
+            let observation = observe_platform(
+                args.app.as_deref(),
+                /*activate_app*/ true,
+                args.capture_mode.as_deref(),
+                window_selection.as_ref(),
+                args.app.as_deref().is_some(),
+            )
+            .await?;
+            let capture_state = observation.state;
+            self.set_observe_state(
+                &invocation.session.conversation_id.to_string(),
+                capture_state.clone(),
+            )
+            .await;
+
+            let image_bytes = if observation.image_bytes.is_empty() {
+                let bounds = capture_state.capture_bounds();
+                capture_region(
+                    &bounds,
+                    capture_state.capture.image_width,
+                    capture_state.capture.image_height,
+                )
+                .await?
+            } else {
+                observation.image_bytes
+            };
+            // Dispatch grounding based on strategy.
+            let strategy = normalize_optional_string(args.grounding_strategy.as_deref())
+                .unwrap_or_else(|| {
+                    invocation
+                        .turn
+                        .tools_config
+                        .gui_batch_grounding_strategy
+                        .clone()
+                });
+            let results = if strategy == "unified" {
+                grounding::resolve_batch_grounded_targets_unified(
+                    &invocation,
+                    &grounding_targets,
+                    &capture_state,
+                    &image_bytes,
+                )
+                .await?
+            } else {
+                grounding::resolve_batch_grounded_targets(
+                    &invocation,
+                    &grounding_targets,
+                    &capture_state,
+                    &image_bytes,
+                )
+                .await?
+            };
+            batch_capture_state = Some(capture_state);
+            results
+        } else {
+            // No semantic targets — just activate the app without screenshotting.
+            prepare_targeted_gui_action(
+                args.app.as_deref(),
+                args.capture_mode.as_deref(),
+                window_selection.as_ref(),
+            )
+            .await?;
+            Vec::new()
+        };
+
+        // Build a map from (step_index, role) → resolved target.
+        let mut resolved_map: HashMap<
+            (usize, grounding::BatchGroundingRole),
+            ResolvedTarget,
+        > = HashMap::new();
+        for (i, result) in grounded_results.into_iter().enumerate() {
+            if let Some(resolved) = result {
+                let gt = &grounding_targets[i];
+                resolved_map.insert((gt.step_index, gt.role.clone()), resolved);
+            } else {
+                let gt = &grounding_targets[i];
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "gui_batch: could not resolve target `{}` for step {} ({} action).",
+                    gt.target, gt.step_index, gt.action
+                )));
+            }
+        }
+
+        // ── Step 4: Execute each action sequentially ───────────────────
+        let mut step_summaries: Vec<String> = Vec::new();
+        let mut step_details: Vec<JsonValue> = Vec::new();
+
+        for (i, step) in args.steps.iter().enumerate() {
+            action_session.throw_if_emergency_stopped()?;
+
+            match step.action.as_str() {
+                "click" => {
+                    let resolved = resolved_map.get(&(i, grounding::BatchGroundingRole::Primary)).ok_or_else(|| {
+                        FunctionCallError::RespondToModel(format!(
+                            "gui_batch step {i}: click requires a `target`."
+                        ))
+                    })?;
+                    let button = step.button.as_deref().unwrap_or("left");
+                    let clicks = step.clicks.unwrap_or(1);
+                    let hold_ms = step.hold_ms.unwrap_or(DEFAULT_CLICK_AND_HOLD_MS).max(1);
+                    let settle_ms = step.settle_ms.unwrap_or(DEFAULT_HOVER_SETTLE_MS).max(1);
+                    let event_mode = match (button, clicks, step.hold_ms) {
+                        ("none", 1, None) => "move_cursor",
+                        ("left", 1, None) => "click",
+                        ("left", 1, Some(_)) => "click_and_hold",
+                        ("left", 2, None) => "double_click",
+                        ("right", 1, None) => "right_click",
+                        _ => {
+                            return Err(FunctionCallError::RespondToModel(format!(
+                                "gui_batch step {i}: unsupported click variant (button={button}, clicks={clicks})"
+                            )));
+                        }
+                    };
+                    run_gui_event(
+                        event_mode,
+                        args.app.as_deref(),
+                        &[
+                            ("CODEX_GUI_X", resolved.point.x),
+                            ("CODEX_GUI_Y", resolved.point.y),
+                        ],
+                        &[
+                            ("CODEX_GUI_HOLD_MS", hold_ms.to_string()),
+                            ("CODEX_GUI_SETTLE_MS", settle_ms.to_string()),
+                        ],
+                    )
+                    .await?;
+                    let target_label = step.target.as_deref().unwrap_or("unknown");
+                    step_summaries.push(format!(
+                        "step {i}: {action} `{target_label}` at ({x}, {y})",
+                        action = describe_click_action(button, clicks, step.hold_ms.is_some()),
+                        x = resolved.point.x.round(),
+                        y = resolved.point.y.round(),
+                    ));
+                    step_details.push(serde_json::json!({
+                        "step": i,
+                        "action": "click",
+                        "event_mode": event_mode,
+                        "target": target_label,
+                        "point": { "x": resolved.point.x.round(), "y": resolved.point.y.round() },
+                        "confidence": resolved.confidence,
+                    }));
+                }
+                "type" => {
+                    // Resolve text value
+                    let text = if let Some(value) = &step.value {
+                        value.clone()
+                    } else if let Some(env_var) = &step.secret_env_var {
+                        std::env::var(env_var).map_err(|_| {
+                            FunctionCallError::RespondToModel(format!(
+                                "gui_batch step {i}: secret_env_var `{env_var}` is not set."
+                            ))
+                        })?
+                    } else if let Some(cmd_var) = &step.secret_command_env_var {
+                        std::env::var(cmd_var).map_err(|_| {
+                            FunctionCallError::RespondToModel(format!(
+                                "gui_batch step {i}: secret_command_env_var `{cmd_var}` is not set."
+                            ))
+                        })?
+                    } else {
+                        return Err(FunctionCallError::RespondToModel(format!(
+                            "gui_batch step {i}: type action requires `value`, `secret_env_var`, or `secret_command_env_var`."
+                        )));
+                    };
+
+                    // If target was specified, click to focus first
+                    if let Some(resolved) = resolved_map.get(&(i, grounding::BatchGroundingRole::Primary)) {
+                        let focus_point = targeted_type_focus_point(resolved);
+                        run_gui_event(
+                            "click",
+                            args.app.as_deref(),
+                            &[
+                                ("CODEX_GUI_X", focus_point.x),
+                                ("CODEX_GUI_Y", focus_point.y),
+                            ],
+                            &[],
+                        )
+                        .await?;
+                        sleep(Duration::from_millis(DEFAULT_TYPE_FOCUS_SETTLE_MS as u64)).await;
+                    }
+
+                    let replace = step.replace.unwrap_or(true);
+                    let submit = step.submit.unwrap_or(false);
+                    let strategy = normalize_optional_string(step.type_strategy.as_deref());
+
+                    if matches!(
+                        strategy.as_deref(),
+                        Some("system_events_paste")
+                            | Some("system_events_keystroke")
+                            | Some("system_events_keystroke_chars")
+                    ) {
+                        run_system_events_type(
+                            args.app.as_deref(),
+                            window_selection.as_ref(),
+                            &text,
+                            replace,
+                            submit,
+                            strategy.as_deref().unwrap(),
+                        )
+                        .await?;
+                    } else if let Some(native_strategy) = strategy.as_deref() {
+                        run_gui_event(
+                            "type_text",
+                            args.app.as_deref(),
+                            &[],
+                            &[
+                                ("CODEX_GUI_TEXT", text.clone()),
+                                ("CODEX_GUI_REPLACE", if replace { "1" } else { "0" }.to_string()),
+                                ("CODEX_GUI_SUBMIT", if submit { "1" } else { "0" }.to_string()),
+                                ("CODEX_GUI_TYPE_STRATEGY", native_strategy.to_string()),
+                            ],
+                        )
+                        .await?;
+                    } else {
+                        // Default: try system_events_paste, fallback to unicode
+                        if run_system_events_type(
+                            args.app.as_deref(),
+                            window_selection.as_ref(),
+                            &text,
+                            replace,
+                            submit,
+                            "system_events_paste",
+                        )
+                        .await
+                        .is_err()
+                        {
+                            run_gui_event(
+                                "type_text",
+                                args.app.as_deref(),
+                                &[],
+                                &[
+                                    ("CODEX_GUI_TEXT", text.clone()),
+                                    ("CODEX_GUI_REPLACE", if replace { "1" } else { "0" }.to_string()),
+                                    ("CODEX_GUI_SUBMIT", if submit { "1" } else { "0" }.to_string()),
+                                    ("CODEX_GUI_TYPE_STRATEGY", "unicode".to_string()),
+                                ],
+                            )
+                            .await?;
+                        }
+                    }
+
+                    let target_label = step.target.as_deref().unwrap_or("focused field");
+                    step_summaries.push(format!(
+                        "step {i}: typed {} chars into `{target_label}`",
+                        text.chars().count(),
+                    ));
+                    step_details.push(serde_json::json!({
+                        "step": i,
+                        "action": "type",
+                        "chars_typed": text.chars().count(),
+                        "target": target_label,
+                    }));
+                }
+                "key" => {
+                    let key = step.key.as_deref().ok_or_else(|| {
+                        FunctionCallError::RespondToModel(format!(
+                            "gui_batch step {i}: key action requires `key`."
+                        ))
+                    })?;
+                    let mut modifiers = step.modifiers.clone().unwrap_or_default();
+                    let key_code = resolve_key_code(key, &mut modifiers)?;
+                    let repeat = step.repeat.unwrap_or(1).max(1);
+                    let modifiers_env = modifiers.join(",");
+
+                    run_gui_event(
+                        "key_press",
+                        args.app.as_deref(),
+                        &[],
+                        &[
+                            ("CODEX_GUI_KEY_CODE", key_code.to_string()),
+                            ("CODEX_GUI_REPEAT", repeat.to_string()),
+                            ("CODEX_GUI_MODIFIERS", modifiers_env.clone()),
+                        ],
+                    )
+                    .await?;
+
+                    step_summaries.push(format!(
+                        "step {i}: pressed key `{key}`{}",
+                        if modifiers_env.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" with [{modifiers_env}]")
+                        },
+                    ));
+                    step_details.push(serde_json::json!({
+                        "step": i,
+                        "action": "key",
+                        "key": key,
+                        "repeat": repeat,
+                    }));
+                }
+                "scroll" => {
+                    let direction = normalize_scroll_direction(step.direction.as_deref())?;
+                    let distance = normalize_scroll_distance(step.distance.as_deref())?;
+
+                    let mut float_env: Vec<(&str, f64)> = Vec::new();
+                    let mut target_bounds = None;
+                    if let Some(resolved) = resolved_map.get(&(i, grounding::BatchGroundingRole::Primary)) {
+                        float_env.push(("CODEX_GUI_X", resolved.point.x));
+                        float_env.push(("CODEX_GUI_Y", resolved.point.y));
+                        target_bounds = Some(resolved.bounds.clone());
+                    }
+
+                    let capture_bounds =
+                        batch_capture_state.as_ref().map(ObserveState::capture_bounds);
+                    let scroll_plan = resolve_scroll_plan(
+                        step.amount,
+                        distance,
+                        resolved_map.contains_key(&(i, grounding::BatchGroundingRole::Primary)),
+                        direction,
+                        target_bounds.as_ref(),
+                        capture_bounds.as_ref(),
+                    );
+                    let (delta_x, delta_y) = scroll_delta_components(direction, scroll_plan.amount);
+
+                    run_gui_event(
+                        "scroll",
+                        args.app.as_deref(),
+                        &float_env,
+                        &[
+                            ("CODEX_GUI_SCROLL_X", delta_x.to_string()),
+                            ("CODEX_GUI_SCROLL_Y", delta_y.to_string()),
+                            ("CODEX_GUI_SCROLL_UNIT", scroll_plan.unit.to_string()),
+                        ],
+                    )
+                    .await?;
+
+                    let target_label = step.target.as_deref().unwrap_or("current surface");
+                    step_summaries.push(format!(
+                        "step {i}: scrolled {dir} on `{target_label}`",
+                        dir = scroll_direction_label(direction),
+                    ));
+                    step_details.push(serde_json::json!({
+                        "step": i,
+                        "action": "scroll",
+                        "direction": scroll_direction_label(direction),
+                        "target": target_label,
+                    }));
+                }
+                "drag" => {
+                    let from_target_str = step.from_target.as_deref().ok_or_else(|| {
+                        FunctionCallError::RespondToModel(format!(
+                            "gui_batch step {i}: drag requires `from_target`."
+                        ))
+                    })?;
+                    let to_target_str = step.to_target.as_deref().ok_or_else(|| {
+                        FunctionCallError::RespondToModel(format!(
+                            "gui_batch step {i}: drag requires `to_target`."
+                        ))
+                    })?;
+                    let from_resolved = resolved_map
+                        .get(&(i, grounding::BatchGroundingRole::Primary))
+                        .ok_or_else(|| {
+                            FunctionCallError::RespondToModel(format!(
+                                "gui_batch step {i}: could not resolve drag source `{from_target_str}`."
+                            ))
+                        })?;
+                    let to_resolved = resolved_map
+                        .get(&(i, grounding::BatchGroundingRole::DragDestination))
+                        .ok_or_else(|| {
+                            FunctionCallError::RespondToModel(format!(
+                                "gui_batch step {i}: could not resolve drag destination `{to_target_str}`."
+                            ))
+                        })?;
+
+                    let duration_ms = step.duration_ms.unwrap_or(DEFAULT_DRAG_DURATION_MS).max(1);
+                    run_gui_event(
+                        "drag",
+                        args.app.as_deref(),
+                        &[
+                            ("CODEX_GUI_FROM_X", from_resolved.point.x),
+                            ("CODEX_GUI_FROM_Y", from_resolved.point.y),
+                            ("CODEX_GUI_TO_X", to_resolved.point.x),
+                            ("CODEX_GUI_TO_Y", to_resolved.point.y),
+                        ],
+                        &[
+                            ("CODEX_GUI_DURATION_MS", duration_ms.to_string()),
+                            ("CODEX_GUI_STEPS", DEFAULT_DRAG_STEPS.to_string()),
+                        ],
+                    )
+                    .await?;
+
+                    step_summaries.push(format!(
+                        "step {i}: dragged `{from_target_str}` → `{to_target_str}`",
+                    ));
+                    step_details.push(serde_json::json!({
+                        "step": i,
+                        "action": "drag",
+                        "from_target": from_target_str,
+                        "to_target": to_target_str,
+                        "from_point": { "x": from_resolved.point.x.round(), "y": from_resolved.point.y.round() },
+                        "to_point": { "x": to_resolved.point.x.round(), "y": to_resolved.point.y.round() },
+                    }));
+                }
+                _ => unreachable!("action validated above"),
+            }
+        }
+
+        action_session.throw_if_emergency_stopped()?;
+
+        // ── Step 5: ONE evidence screenshot ────────────────────────────
+        // Use shorter settle for batches that only contain typing and key
+        // presses; use the full settle for click/scroll actions that may
+        // trigger larger UI changes.
+        let has_click_or_scroll = args
+            .steps
+            .iter()
+            .any(|s| s.action == "click" || s.action == "scroll" || s.action == "drag");
+        let settle_ms = if has_click_or_scroll {
+            DEFAULT_POST_ACTION_SETTLE_MS
+        } else {
+            DEFAULT_POST_TYPE_SETTLE_MS
+        };
+        let evidence = self
+            .capture_evidence_image(
+                &invocation,
+                args.app.as_deref(),
+                args.capture_mode.as_deref(),
+                window_selection.as_ref(),
+                settle_ms,
+            )
+            .await?;
+
+        // ── Step 6: Build combined result ──────────────────────────────
+        let summary = format!(
+            "Executed {} GUI actions in batch on {platform}:\n{steps}{evidence_note}\nUse gui_wait or gui_observe to verify the resulting UI state.",
+            args.steps.len(),
+            platform = PLATFORM_NAME,
+            steps = step_summaries
+                .iter()
+                .map(|s| format!("  - {s}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            evidence_note = if evidence.image_url.is_some() {
+                "\nAttached a refreshed GUI evidence screenshot."
+            } else {
+                ""
+            }
+        );
+
+        let extra_details = serde_json::json!({
+            "action_kind": "batch",
+            "steps_count": args.steps.len(),
+            "grounding_targets_count": grounding_targets.len(),
+            "grounding_method": "batch_grounding",
+            "steps": step_details,
+        });
+
+        Ok(self.build_gui_output(
+            summary,
+            evidence.state,
+            evidence.image_url,
+            true,
+            Some(extra_details),
+        ))
     }
 
     async fn get_observe_state(&self, invocation: &ToolInvocation) -> Option<ObserveState> {

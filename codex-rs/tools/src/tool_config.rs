@@ -111,6 +111,7 @@ pub struct ToolsConfig {
     pub agent_type_description: String,
     pub gui_tools: bool,
     pub gui_coordinate_targeting: bool,
+    pub gui_batch_grounding_strategy: String,
 }
 
 pub struct ToolsConfigParams<'a> {
@@ -228,6 +229,7 @@ impl ToolsConfig {
             agent_type_description: String::new(),
             gui_tools: include_gui_tools,
             gui_coordinate_targeting: false,
+            gui_batch_grounding_strategy: "parallel".to_string(),
         }
     }
 
@@ -271,6 +273,11 @@ impl ToolsConfig {
 
     pub fn with_gui_coordinate_targeting(mut self, gui_coordinate_targeting: bool) -> Self {
         self.gui_coordinate_targeting = gui_coordinate_targeting;
+        self
+    }
+
+    pub fn with_gui_batch_grounding_strategy(mut self, strategy: String) -> Self {
+        self.gui_batch_grounding_strategy = strategy;
         self
     }
 
