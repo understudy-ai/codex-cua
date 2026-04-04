@@ -23,6 +23,7 @@ use crate::compact_remote::run_inline_remote_auto_compact_task;
 use crate::config::ManagedFeatures;
 use crate::connectors;
 use crate::exec_policy::ExecPolicyManager;
+use crate::gui_instructions::render_gui_tools_section;
 #[cfg(test)]
 use crate::models_manager::collaboration_mode_presets::CollaborationModesConfig;
 use crate::models_manager::manager::ModelsManager;
@@ -44,6 +45,7 @@ use crate::stream_events_utils::handle_output_item_done;
 use crate::stream_events_utils::last_assistant_message_from_item;
 use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::stream_events_utils::record_completed_response_item;
+use crate::stream_events_utils::response_input_to_response_item;
 use crate::turn_metadata::TurnMetadataState;
 use crate::util::error_or_panic;
 use async_channel::Receiver;
@@ -92,12 +94,15 @@ use codex_protocol::config_types::Settings;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
+use codex_protocol::items::BuiltinToolCallItem;
+use codex_protocol::items::BuiltinToolCallStatus;
 use codex_protocol::items::PlanItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
 use codex_protocol::items::build_hook_prompt_message;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::models::BaseInstructions;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::format_allow_prefixes;
 use codex_protocol::openai_models::ModelInfo;
@@ -195,6 +200,25 @@ use codex_config::types::ShellEnvironmentPolicy;
 mod rollout_reconstruction;
 #[cfg(test)]
 mod rollout_reconstruction_tests;
+
+fn is_visible_builtin_tool_call(tool_name: &str) -> bool {
+    tool_name.starts_with("gui_")
+}
+
+fn parse_builtin_tool_call_arguments(arguments: &str) -> Value {
+    serde_json::from_str(arguments).unwrap_or_else(|_| Value::String(arguments.to_string()))
+}
+
+fn parse_builtin_tool_call_payload_arguments(payload: &ToolPayload) -> Option<Value> {
+    match payload {
+        ToolPayload::Function { arguments } => Some(parse_builtin_tool_call_arguments(arguments)),
+        _ => None,
+    }
+}
+
+fn serialize_builtin_tool_output(output: &FunctionCallOutputPayload) -> Value {
+    serde_json::to_value(&output.body).unwrap_or(Value::Null)
+}
 
 #[derive(Debug, PartialEq)]
 pub enum SteerInputError {
@@ -301,12 +325,14 @@ use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::context::ToolPayload;
 use crate::tools::js_repl::JsReplHandle;
 use crate::tools::js_repl::resolve_compatible_node;
 use crate::tools::network_approval::NetworkApprovalService;
 use crate::tools::network_approval::build_blocked_request_observer;
 use crate::tools::network_approval::build_network_policy_decider;
 use crate::tools::parallel::ToolCallRuntime;
+use crate::tools::router::ToolCall;
 use crate::tools::router::ToolRouterParams;
 use crate::tools::sandboxing::ApprovalStore;
 use crate::turn_diff_tracker::TurnDiffTracker;
@@ -945,6 +971,10 @@ impl TurnContext {
         })
         .with_unified_exec_shell_mode(self.tools_config.unified_exec_shell_mode.clone())
         .with_web_search_config(self.tools_config.web_search_config.clone())
+        .with_gui_coordinate_targeting(config.gui_coordinate_targeting)
+        .with_gui_batch_enabled(config.gui_batch_enabled)
+        .with_gui_batch_grounding_strategy(config.gui_batch_grounding_strategy.clone())
+        .with_gui_batch_action_delay_ms(config.gui_batch_action_delay_ms)
         .with_allow_login_shell(self.tools_config.allow_login_shell)
         .with_agent_type_description(crate::agent::role::spawn_tool_spec::build(
             &config.agent_roles,
@@ -1405,6 +1435,7 @@ impl Session {
             main_execve_wrapper_exe,
         )
         .with_web_search_config(per_turn_config.web_search_config.clone())
+        .with_gui_coordinate_targeting(per_turn_config.gui_coordinate_targeting)
         .with_allow_login_shell(per_turn_config.permissions.allow_login_shell)
         .with_agent_type_description(crate::agent::role::spawn_tool_spec::build(
             &per_turn_config.agent_roles,
@@ -3665,6 +3696,13 @@ impl Session {
         {
             developer_sections.push(plugin_section);
         }
+        if let Some(gui_tools_section) = render_gui_tools_section(
+            turn_context.features.enabled(Feature::GuiTools),
+            turn_context.config.gui_coordinate_targeting,
+            turn_context.config.gui_batch_enabled,
+        ) {
+            developer_sections.push(gui_tools_section);
+        }
         if turn_context.features.enabled(Feature::CodexGitCommit)
             && let Some(commit_message_instruction) = commit_message_trailer_instruction(
                 turn_context.config.commit_attribution.as_deref(),
@@ -3895,10 +3933,167 @@ impl Session {
         self.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
             .await;
 
+        if let Some(item) = self
+            .visible_builtin_tool_call_started_item(&response_item)
+            .await
+        {
+            self.emit_turn_item_started(turn_context, &TurnItem::BuiltinToolCall(item))
+                .await;
+            return;
+        }
+
+        if let Some(item) = self
+            .visible_builtin_tool_call_completed_item(&response_item)
+            .await
+        {
+            self.emit_turn_item_completed(turn_context, TurnItem::BuiltinToolCall(item))
+                .await;
+            return;
+        }
+
         // Derive a turn item and emit lifecycle events if applicable.
         if let Some(item) = parse_turn_item(&response_item) {
             self.emit_turn_item_started(turn_context, &item).await;
             self.emit_turn_item_completed(turn_context, item).await;
+        }
+    }
+
+    pub(crate) async fn maybe_emit_visible_builtin_tool_call_started(
+        &self,
+        turn_context: &TurnContext,
+        call: &ToolCall,
+    ) {
+        let Some(item) = self
+            .visible_builtin_tool_call_started_item_from_call(call)
+            .await
+        else {
+            return;
+        };
+
+        self.emit_turn_item_started(turn_context, &TurnItem::BuiltinToolCall(item))
+            .await;
+    }
+
+    pub(crate) async fn maybe_emit_visible_builtin_tool_call_completed(
+        &self,
+        turn_context: &TurnContext,
+        response_item: &ResponseItem,
+    ) {
+        let Some(item) = self
+            .visible_builtin_tool_call_completed_item(response_item)
+            .await
+        else {
+            return;
+        };
+
+        self.emit_turn_item_completed(turn_context, TurnItem::BuiltinToolCall(item))
+            .await;
+    }
+
+    async fn visible_builtin_tool_call_started_item_from_call(
+        &self,
+        call: &ToolCall,
+    ) -> Option<BuiltinToolCallItem> {
+        if !is_visible_builtin_tool_call(&call.tool_name) {
+            return None;
+        }
+
+        let arguments = parse_builtin_tool_call_payload_arguments(&call.payload)?;
+        let item = BuiltinToolCallItem {
+            id: call.call_id.clone(),
+            call_id: call.call_id.clone(),
+            tool: call.tool_name.clone(),
+            namespace: call.tool_namespace.clone(),
+            arguments,
+            output: None,
+            success: None,
+            status: BuiltinToolCallStatus::InProgress,
+        };
+
+        self.state
+            .lock()
+            .await
+            .record_visible_builtin_tool_call(item.clone());
+
+        Some(item)
+    }
+
+    async fn visible_builtin_tool_call_started_item(
+        &self,
+        response_item: &ResponseItem,
+    ) -> Option<BuiltinToolCallItem> {
+        let ResponseItem::FunctionCall {
+            name,
+            namespace,
+            arguments,
+            call_id,
+            ..
+        } = response_item
+        else {
+            return None;
+        };
+
+        if !is_visible_builtin_tool_call(name) {
+            return None;
+        }
+
+        let item = BuiltinToolCallItem {
+            id: call_id.clone(),
+            call_id: call_id.clone(),
+            tool: name.clone(),
+            namespace: namespace.clone(),
+            arguments: parse_builtin_tool_call_arguments(arguments),
+            output: None,
+            success: None,
+            status: BuiltinToolCallStatus::InProgress,
+        };
+
+        self.state
+            .lock()
+            .await
+            .record_visible_builtin_tool_call(item.clone());
+
+        Some(item)
+    }
+
+    async fn visible_builtin_tool_call_completed_item(
+        &self,
+        response_item: &ResponseItem,
+    ) -> Option<BuiltinToolCallItem> {
+        match response_item {
+            ResponseItem::FunctionCallOutput { call_id, output } => {
+                let mut item = self
+                    .state
+                    .lock()
+                    .await
+                    .take_visible_builtin_tool_call(call_id)?;
+                item.output = Some(serialize_builtin_tool_output(output));
+                item.success = output.success;
+                item.status = if output.success == Some(false) {
+                    BuiltinToolCallStatus::Failed
+                } else {
+                    BuiltinToolCallStatus::Completed
+                };
+                Some(item)
+            }
+            ResponseItem::CustomToolCallOutput {
+                call_id, output, ..
+            } => {
+                let mut item = self
+                    .state
+                    .lock()
+                    .await
+                    .take_visible_builtin_tool_call(call_id)?;
+                item.output = Some(serialize_builtin_tool_output(output));
+                item.success = output.success;
+                item.status = if output.success == Some(false) {
+                    BuiltinToolCallStatus::Failed
+                } else {
+                    BuiltinToolCallStatus::Completed
+                };
+                Some(item)
+            }
+            _ => None,
         }
     }
 
@@ -5477,6 +5672,10 @@ async fn spawn_review_thread(
         sess.services.main_execve_wrapper_exe.as_ref(),
     )
     .with_web_search_config(/*web_search_config*/ None)
+    .with_gui_coordinate_targeting(config.gui_coordinate_targeting)
+    .with_gui_batch_enabled(config.gui_batch_enabled)
+    .with_gui_batch_grounding_strategy(config.gui_batch_grounding_strategy.clone())
+    .with_gui_batch_action_delay_ms(config.gui_batch_action_delay_ms)
     .with_allow_login_shell(config.permissions.allow_login_shell)
     .with_agent_type_description(crate::agent::role::spawn_tool_spec::build(
         &config.agent_roles,
@@ -7231,8 +7430,18 @@ async fn drain_in_flight(
     while let Some(res) = in_flight.next().await {
         match res {
             Ok(response_input) => {
-                sess.record_conversation_items(&turn_context, &[response_input.into()])
+                if let Some(response_item) = response_input_to_response_item(&response_input) {
+                    sess.record_conversation_items(
+                        &turn_context,
+                        std::slice::from_ref(&response_item),
+                    )
                     .await;
+                    sess.maybe_emit_visible_builtin_tool_call_completed(
+                        &turn_context,
+                        &response_item,
+                    )
+                    .await;
+                }
             }
             Err(err) => {
                 error_or_panic(format!("in-flight tool future failed during drain: {err}"));

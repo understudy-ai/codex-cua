@@ -1,4 +1,5 @@
 use crate::CommandToolOptions;
+use crate::GuiToolSchemaOptions;
 use crate::REQUEST_USER_INPUT_TOOL_NAME;
 use crate::ShellToolOptions;
 use crate::SpawnAgentToolOptions;
@@ -23,6 +24,15 @@ use crate::create_close_agent_tool_v1;
 use crate::create_close_agent_tool_v2;
 use crate::create_code_mode_tool;
 use crate::create_exec_command_tool;
+use crate::create_gui_click_tool_with_options;
+use crate::create_gui_drag_tool_with_options;
+use crate::create_gui_key_tool;
+use crate::create_gui_batch_tool;
+use crate::create_gui_move_tool;
+use crate::create_gui_observe_tool_with_options;
+use crate::create_gui_scroll_tool;
+use crate::create_gui_type_tool;
+use crate::create_gui_wait_tool;
 use crate::create_image_generation_tool;
 use crate::create_js_repl_reset_tool;
 use crate::create_js_repl_tool;
@@ -339,6 +349,70 @@ pub fn build_tool_registry_plan(
         config.code_mode_enabled,
     );
     plan.register_handler("view_image", ToolHandlerKind::ViewImage);
+
+    if config.gui_tools {
+        let gui_options = GuiToolSchemaOptions {
+            coordinate_targeting: config.gui_coordinate_targeting,
+        };
+        plan.push_spec(
+            create_gui_observe_tool_with_options(gui_options),
+            /*supports_parallel_tool_calls*/ false,
+            config.code_mode_enabled,
+        );
+        plan.push_spec(
+            create_gui_wait_tool(),
+            /*supports_parallel_tool_calls*/ false,
+            config.code_mode_enabled,
+        );
+        plan.push_spec(
+            create_gui_click_tool_with_options(gui_options),
+            /*supports_parallel_tool_calls*/ false,
+            config.code_mode_enabled,
+        );
+        plan.push_spec(
+            create_gui_drag_tool_with_options(gui_options),
+            /*supports_parallel_tool_calls*/ false,
+            config.code_mode_enabled,
+        );
+        plan.push_spec(
+            create_gui_scroll_tool(),
+            /*supports_parallel_tool_calls*/ false,
+            config.code_mode_enabled,
+        );
+        plan.push_spec(
+            create_gui_type_tool(),
+            /*supports_parallel_tool_calls*/ false,
+            config.code_mode_enabled,
+        );
+        plan.push_spec(
+            create_gui_key_tool(),
+            /*supports_parallel_tool_calls*/ false,
+            config.code_mode_enabled,
+        );
+        plan.push_spec(
+            create_gui_move_tool(),
+            /*supports_parallel_tool_calls*/ false,
+            config.code_mode_enabled,
+        );
+        if config.gui_batch_enabled {
+            plan.push_spec(
+                create_gui_batch_tool(),
+                /*supports_parallel_tool_calls*/ false,
+                config.code_mode_enabled,
+            );
+        }
+        plan.register_handler("gui_observe", ToolHandlerKind::Gui);
+        plan.register_handler("gui_wait", ToolHandlerKind::Gui);
+        plan.register_handler("gui_click", ToolHandlerKind::Gui);
+        plan.register_handler("gui_drag", ToolHandlerKind::Gui);
+        plan.register_handler("gui_scroll", ToolHandlerKind::Gui);
+        plan.register_handler("gui_type", ToolHandlerKind::Gui);
+        plan.register_handler("gui_key", ToolHandlerKind::Gui);
+        plan.register_handler("gui_move", ToolHandlerKind::Gui);
+        if config.gui_batch_enabled {
+            plan.register_handler("gui_batch", ToolHandlerKind::Gui);
+        }
+    }
 
     if config.collab_tools {
         if config.multi_agent_v2 {

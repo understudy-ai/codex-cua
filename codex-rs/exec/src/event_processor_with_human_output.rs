@@ -82,6 +82,14 @@ impl EventProcessorWithHumanOutput {
                     "started".style(self.dimmed)
                 );
             }
+            ThreadItem::BuiltinToolCall { tool, .. } => {
+                eprintln!(
+                    "{} {} {}",
+                    "tool:".style(self.bold),
+                    tool.style(self.cyan),
+                    "started".style(self.dimmed)
+                );
+            }
             ThreadItem::WebSearch { query, .. } => {
                 eprintln!("{} {}", "web search:".style(self.bold), query);
             }
@@ -197,6 +205,37 @@ impl EventProcessorWithHumanOutput {
                     eprintln!("{}", error.message.style(self.red));
                 }
             }
+            ThreadItem::BuiltinToolCall {
+                tool,
+                status,
+                output,
+                ..
+            } => {
+                let status_text = match status {
+                    codex_app_server_protocol::BuiltinToolCallStatus::Completed => {
+                        "completed".style(self.green)
+                    }
+                    codex_app_server_protocol::BuiltinToolCallStatus::Failed => {
+                        "failed".style(self.red)
+                    }
+                    codex_app_server_protocol::BuiltinToolCallStatus::InProgress => {
+                        "in_progress".style(self.dimmed)
+                    }
+                };
+                eprintln!(
+                    "{} {} {}",
+                    "tool:".style(self.bold),
+                    tool.style(self.cyan),
+                    format!("({status_text})").style(self.dimmed)
+                );
+                if let Some(summary) = output
+                    .as_ref()
+                    .and_then(codex_protocol::items::builtin_tool_output_summary)
+                    && !summary.trim().is_empty()
+                {
+                    eprintln!("{}", summary.style(self.dimmed));
+                }
+            }
             ThreadItem::WebSearch { query, .. } => {
                 eprintln!("{} {}", "web search:".style(self.bold), query);
             }
@@ -283,6 +322,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 self.render_item_completed(notification.item);
                 CodexStatus::Running
             }
+            ServerNotification::RawResponseItemCompleted(_) => CodexStatus::Running,
             ServerNotification::ModelRerouted(notification) => {
                 eprintln!(
                     "{} {} -> {}",

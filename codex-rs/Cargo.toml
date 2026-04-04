@@ -408,6 +408,13 @@ strip = "symbols"
 # See https://github.com/openai/codex/issues/1411 for details.
 codegen-units = 1
 
+# Fast local release builds: no LTO + parallel codegen.
+# Use with: cargo build --profile local-release
+[profile.local-release]
+inherits = "release"
+lto = false
+codegen-units = 8
+
 [profile.ci-test]
 debug = 1         # Reduce debug symbol size
 inherits = "test"

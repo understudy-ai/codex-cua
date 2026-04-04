@@ -215,6 +215,9 @@ pub(crate) async fn handle_output_item_done(
 
             record_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
                 .await;
+            ctx.sess
+                .maybe_emit_visible_builtin_tool_call_started(ctx.turn_context.as_ref(), &call)
+                .await;
 
             let cancellation_token = ctx.cancellation_token.child_token();
             let tool_future: InFlightFuture<'static> = Box::pin(
@@ -461,7 +464,13 @@ pub(crate) fn response_input_to_response_item(input: &ResponseInputItem) -> Opti
             execution: execution.clone(),
             tools: tools.clone(),
         }),
-        _ => None,
+        other => {
+            tracing::debug!(
+                "response_input_to_response_item: unhandled variant {:?}",
+                std::mem::discriminant(other)
+            );
+            None
+        }
     }
 }
 

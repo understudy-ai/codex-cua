@@ -1,8 +1,10 @@
 use crate::memory_citation::MemoryCitation;
 use crate::models::ContentItem;
+use crate::models::FunctionCallOutputContentItem;
 use crate::models::MessagePhase;
 use crate::models::ResponseItem;
 use crate::models::WebSearchAction;
+use crate::models::function_call_output_content_items_to_text;
 use crate::protocol::AgentMessageEvent;
 use crate::protocol::AgentReasoningEvent;
 use crate::protocol::AgentReasoningRawContentEvent;
@@ -19,6 +21,7 @@ use quick_xml::se::to_string as to_xml_string;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::Value as JsonValue;
 use ts_rs::TS;
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema)]
@@ -30,6 +33,7 @@ pub enum TurnItem {
     AgentMessage(AgentMessageItem),
     Plan(PlanItem),
     Reasoning(ReasoningItem),
+    BuiltinToolCall(BuiltinToolCallItem),
     WebSearch(WebSearchItem),
     ImageGeneration(ImageGenerationItem),
     ContextCompaction(ContextCompactionItem),
@@ -104,6 +108,63 @@ pub struct ReasoningItem {
     pub summary_text: Vec<String>,
     #[serde(default)]
     pub raw_content: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "items/")]
+pub enum BuiltinToolCallStatus {
+    InProgress,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BuiltinToolCallItem {
+    pub id: String,
+    pub call_id: String,
+    pub tool: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub namespace: Option<String>,
+    #[serde(default)]
+    pub arguments: JsonValue,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub output: Option<JsonValue>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub success: Option<bool>,
+    pub status: BuiltinToolCallStatus,
+}
+
+impl BuiltinToolCallItem {
+    /// Return a short human-readable summary of the tool output, if available.
+    pub fn output_summary(&self) -> Option<String> {
+        builtin_tool_output_summary(self.output.as_ref()?)
+    }
+}
+
+/// Summarize a builtin tool output value for display.
+pub fn builtin_tool_output_summary(output: &JsonValue) -> Option<String> {
+    match output {
+        JsonValue::String(text) if !text.trim().is_empty() => Some(text.clone()),
+        JsonValue::Array(items) => {
+            if items.iter().any(|item| {
+                item.get("type")
+                    .and_then(JsonValue::as_str)
+                    .is_some_and(|kind| kind == "input_image" || kind == "inputImage")
+            }) {
+                return Some("<image output>".to_string());
+            }
+
+            serde_json::from_value::<Vec<FunctionCallOutputContentItem>>(output.clone())
+                .ok()
+                .and_then(|items| function_call_output_content_items_to_text(&items))
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq)]
@@ -389,6 +450,7 @@ impl TurnItem {
             TurnItem::AgentMessage(item) => item.id.clone(),
             TurnItem::Plan(item) => item.id.clone(),
             TurnItem::Reasoning(item) => item.id.clone(),
+            TurnItem::BuiltinToolCall(item) => item.id.clone(),
             TurnItem::WebSearch(item) => item.id.clone(),
             TurnItem::ImageGeneration(item) => item.id.clone(),
             TurnItem::ContextCompaction(item) => item.id.clone(),
@@ -401,6 +463,7 @@ impl TurnItem {
             TurnItem::HookPrompt(_) => Vec::new(),
             TurnItem::AgentMessage(item) => item.as_legacy_events(),
             TurnItem::Plan(_) => Vec::new(),
+            TurnItem::BuiltinToolCall(_) => Vec::new(),
             TurnItem::WebSearch(item) => vec![item.as_legacy_event()],
             TurnItem::ImageGeneration(item) => vec![item.as_legacy_event()],
             TurnItem::Reasoning(item) => item.as_legacy_events(show_raw_agent_reasoning),
@@ -443,6 +506,32 @@ mod tests {
                 text: "Retry with tests.".to_string(),
                 hook_run_id: "hook-run-1".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn builtin_tool_output_summary_joins_structured_text_items() {
+        let output = serde_json::json!([
+            {"type": "input_text", "text": "first line"},
+            {"type": "input_text", "text": "second line"}
+        ]);
+
+        assert_eq!(
+            builtin_tool_output_summary(&output),
+            Some("first line\nsecond line".to_string())
+        );
+    }
+
+    #[test]
+    fn builtin_tool_output_summary_prefers_image_marker_for_image_items() {
+        let output = serde_json::json!([
+            {"type": "input_text", "text": "captured"},
+            {"type": "input_image", "image_url": "data:image/png;base64,abc"}
+        ]);
+
+        assert_eq!(
+            builtin_tool_output_summary(&output),
+            Some("<image output>".to_string())
         );
     }
 }

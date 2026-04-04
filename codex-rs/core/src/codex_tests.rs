@@ -46,6 +46,7 @@ use crate::tools::context::ToolPayload;
 use crate::tools::handlers::ShellHandler;
 use crate::tools::handlers::UnifiedExecHandler;
 use crate::tools::registry::ToolHandler;
+use crate::tools::router::ToolCall;
 use crate::tools::router::ToolCallSource;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_app_server_protocol::AppInfo;
@@ -3963,6 +3964,25 @@ async fn build_initial_context_omits_default_image_save_location_without_image_h
 }
 
 #[tokio::test]
+async fn build_initial_context_includes_gui_workflow_instructions_when_feature_enabled() {
+    let (session, mut turn_context) = make_session_and_context().await;
+    turn_context
+        .features
+        .enable(Feature::GuiTools)
+        .expect("enable gui tools");
+
+    let initial_context = session.build_initial_context(&turn_context).await;
+    let developer_texts = developer_input_texts(&initial_context);
+
+    assert!(
+        developer_texts
+            .iter()
+            .any(|text| text.contains("## Native GUI Tools") && text.contains("`gui_wait`")),
+        "expected initial context to include gui workflow instructions, got {developer_texts:?}"
+    );
+}
+
+#[tokio::test]
 async fn handle_output_item_done_records_image_save_history_message() {
     let (session, turn_context) = make_session_and_context().await;
     let session = Arc::new(session);
@@ -4576,6 +4596,71 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
             turn_id,
             last_agent_message: None,
         }) if turn_id == tc.sub_id
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn visible_gui_builtin_tool_calls_emit_turn_item_lifecycle_events() {
+    let (sess, tc, rx) = make_session_and_context_with_rx().await;
+    let call = ToolCall {
+        tool_name: "gui_observe".to_string(),
+        tool_namespace: None,
+        call_id: "call_gui_visible".to_string(),
+        payload: ToolPayload::Function {
+            arguments: "{\"return_image\":false}".to_string(),
+        },
+    };
+
+    sess.maybe_emit_visible_builtin_tool_call_started(tc.as_ref(), &call)
+        .await;
+
+    let output_item = ResponseItem::FunctionCallOutput {
+        call_id: call.call_id.clone(),
+        output: FunctionCallOutputPayload::from_text("ok".to_string()),
+    };
+    sess.record_conversation_items(tc.as_ref(), std::slice::from_ref(&output_item))
+        .await;
+    sess.maybe_emit_visible_builtin_tool_call_completed(tc.as_ref(), &output_item)
+        .await;
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("expected builtin item started event")
+        .expect("channel open");
+    assert!(matches!(
+        first.msg,
+        EventMsg::ItemStarted(ItemStartedEvent {
+            item: TurnItem::BuiltinToolCall(codex_protocol::items::BuiltinToolCallItem {
+                call_id,
+                tool,
+                status: codex_protocol::items::BuiltinToolCallStatus::InProgress,
+                ..
+            }),
+            ..
+        }) if call_id == "call_gui_visible" && tool == "gui_observe"
+    ));
+
+    let second = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("expected raw response item event")
+        .expect("channel open");
+    assert!(matches!(second.msg, EventMsg::RawResponseItem(_)));
+
+    let third = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+        .await
+        .expect("expected builtin item completed event")
+        .expect("channel open");
+    assert!(matches!(
+        third.msg,
+        EventMsg::ItemCompleted(ItemCompletedEvent {
+            item: TurnItem::BuiltinToolCall(codex_protocol::items::BuiltinToolCallItem {
+                call_id,
+                tool,
+                status: codex_protocol::items::BuiltinToolCallStatus::Completed,
+                ..
+            }),
+            ..
+        }) if call_id == "call_gui_visible" && tool == "gui_observe"
     ));
 }
 

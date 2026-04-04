@@ -5492,6 +5492,14 @@
           }
         ]
       },
+      "BuiltinToolCallStatus": {
+        "enum": [
+          "inProgress",
+          "completed",
+          "failed"
+        ],
+        "type": "string"
+      },
       "ByteRange": {
         "properties": {
           "end": {
@@ -12835,6 +12843,53 @@
               "type"
             ],
             "title": "McpToolCallThreadItem",
+            "type": "object"
+          },
+          {
+            "properties": {
+              "arguments": true,
+              "callId": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "namespace": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "output": true,
+              "status": {
+                "$ref": "#/definitions/v2/BuiltinToolCallStatus"
+              },
+              "success": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "tool": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "builtinToolCall"
+                ],
+                "title": "BuiltinToolCallThreadItemType",
+                "type": "string"
+              }
+            },
+            "required": [
+              "arguments",
+              "callId",
+              "id",
+              "status",
+              "tool",
+              "type"
+            ],
+            "title": "BuiltinToolCallThreadItem",
             "type": "object"
           },
           {

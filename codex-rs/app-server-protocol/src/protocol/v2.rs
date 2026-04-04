@@ -27,6 +27,7 @@ use codex_protocol::config_types::Verbosity;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::config_types::WebSearchToolConfig;
 use codex_protocol::items::AgentMessageContent as CoreAgentMessageContent;
+use codex_protocol::items::BuiltinToolCallStatus as CoreBuiltinToolCallStatus;
 use codex_protocol::items::TurnItem as CoreTurnItem;
 use codex_protocol::mcp::Resource as McpResource;
 use codex_protocol::mcp::ResourceTemplate as McpResourceTemplate;
@@ -2695,6 +2696,11 @@ pub struct ThreadResumeParams {
     pub developer_instructions: Option<String>,
     #[ts(optional = nullable)]
     pub personality: Option<Personality>,
+    /// If true, opt into emitting raw Responses API items on the event stream
+    /// after resuming this thread.
+    #[experimental("thread/resume.experimentalRawEvents")]
+    #[serde(default)]
+    pub experimental_raw_events: bool,
     /// If true, persist additional rollout EventMsg variants required to
     /// reconstruct a richer thread history on subsequent resume/fork/read.
     #[experimental("thread/resume.persistFullHistory")]
@@ -4311,6 +4317,24 @@ pub enum ThreadItem {
     },
     #[serde(rename_all = "camelCase")]
     #[ts(rename_all = "camelCase")]
+    BuiltinToolCall {
+        id: String,
+        call_id: String,
+        tool: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        namespace: Option<String>,
+        arguments: JsonValue,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        output: Option<JsonValue>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        success: Option<bool>,
+        status: BuiltinToolCallStatus,
+    },
+    #[serde(rename_all = "camelCase")]
+    #[ts(rename_all = "camelCase")]
     DynamicToolCall {
         id: String,
         tool: String,
@@ -4396,6 +4420,7 @@ impl ThreadItem {
             | ThreadItem::CommandExecution { id, .. }
             | ThreadItem::FileChange { id, .. }
             | ThreadItem::McpToolCall { id, .. }
+            | ThreadItem::BuiltinToolCall { id, .. }
             | ThreadItem::DynamicToolCall { id, .. }
             | ThreadItem::CollabAgentToolCall { id, .. }
             | ThreadItem::WebSearch { id, .. }
@@ -4754,6 +4779,16 @@ impl From<CoreTurnItem> for ThreadItem {
                 summary: reasoning.summary_text,
                 content: reasoning.raw_content,
             },
+            CoreTurnItem::BuiltinToolCall(item) => ThreadItem::BuiltinToolCall {
+                id: item.id,
+                call_id: item.call_id,
+                tool: item.tool,
+                namespace: item.namespace,
+                arguments: item.arguments,
+                output: item.output,
+                success: item.success,
+                status: BuiltinToolCallStatus::from(item.status),
+            },
             CoreTurnItem::WebSearch(search) => ThreadItem::WebSearch {
                 id: search.id,
                 query: search.query,
@@ -4882,6 +4917,25 @@ pub enum McpToolCallStatus {
     InProgress,
     Completed,
     Failed,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum BuiltinToolCallStatus {
+    InProgress,
+    Completed,
+    Failed,
+}
+
+impl From<CoreBuiltinToolCallStatus> for BuiltinToolCallStatus {
+    fn from(value: CoreBuiltinToolCallStatus) -> Self {
+        match value {
+            CoreBuiltinToolCallStatus::InProgress => Self::InProgress,
+            CoreBuiltinToolCallStatus::Completed => Self::Completed,
+            CoreBuiltinToolCallStatus::Failed => Self::Failed,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -7969,6 +8023,32 @@ mod tests {
                 id: "reasoning-1".to_string(),
                 summary: vec!["line one".to_string(), "line two".to_string()],
                 content: vec![],
+            }
+        );
+
+        let builtin_tool_call =
+            TurnItem::BuiltinToolCall(codex_protocol::items::BuiltinToolCallItem {
+                id: "builtin-1".to_string(),
+                call_id: "builtin-1".to_string(),
+                tool: "gui_click".to_string(),
+                namespace: Some("builtin".to_string()),
+                arguments: serde_json::json!({"target": "Search"}),
+                output: Some(serde_json::json!("{\"status\":\"clicked\"}")),
+                success: Some(true),
+                status: codex_protocol::items::BuiltinToolCallStatus::Completed,
+            });
+
+        assert_eq!(
+            ThreadItem::from(builtin_tool_call),
+            ThreadItem::BuiltinToolCall {
+                id: "builtin-1".to_string(),
+                call_id: "builtin-1".to_string(),
+                tool: "gui_click".to_string(),
+                namespace: Some("builtin".to_string()),
+                arguments: serde_json::json!({"target": "Search"}),
+                output: Some(serde_json::json!("{\"status\":\"clicked\"}")),
+                success: Some(true),
+                status: BuiltinToolCallStatus::Completed,
             }
         );
 

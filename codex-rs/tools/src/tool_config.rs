@@ -109,6 +109,11 @@ pub struct ToolsConfig {
     pub agent_jobs_tools: bool,
     pub agent_jobs_worker_tools: bool,
     pub agent_type_description: String,
+    pub gui_tools: bool,
+    pub gui_coordinate_targeting: bool,
+    pub gui_batch_enabled: bool,
+    pub gui_batch_grounding_strategy: String,
+    pub gui_batch_action_delay_ms: u64,
 }
 
 pub struct ToolsConfigParams<'a> {
@@ -152,6 +157,7 @@ impl ToolsConfig {
         let include_original_image_detail = can_request_original_image_detail(features, model_info);
         let include_image_gen_tool =
             features.enabled(Feature::ImageGeneration) && supports_image_generation(model_info);
+        let include_gui_tools = features.enabled(Feature::GuiTools);
         let exec_permission_approvals_enabled = features.enabled(Feature::ExecPermissionApprovals);
         let request_permissions_tool_enabled = features.enabled(Feature::RequestPermissionsTool);
         let shell_command_backend =
@@ -223,6 +229,11 @@ impl ToolsConfig {
             agent_jobs_tools: include_agent_jobs,
             agent_jobs_worker_tools,
             agent_type_description: String::new(),
+            gui_tools: include_gui_tools,
+            gui_coordinate_targeting: false,
+            gui_batch_enabled: true,
+            gui_batch_grounding_strategy: "parallel".to_string(),
+            gui_batch_action_delay_ms: 0,
         }
     }
 
@@ -261,6 +272,26 @@ impl ToolsConfig {
 
     pub fn with_web_search_config(mut self, web_search_config: Option<WebSearchConfig>) -> Self {
         self.web_search_config = web_search_config;
+        self
+    }
+
+    pub fn with_gui_coordinate_targeting(mut self, gui_coordinate_targeting: bool) -> Self {
+        self.gui_coordinate_targeting = gui_coordinate_targeting;
+        self
+    }
+
+    pub fn with_gui_batch_enabled(mut self, enabled: bool) -> Self {
+        self.gui_batch_enabled = enabled;
+        self
+    }
+
+    pub fn with_gui_batch_grounding_strategy(mut self, strategy: String) -> Self {
+        self.gui_batch_grounding_strategy = strategy;
+        self
+    }
+
+    pub fn with_gui_batch_action_delay_ms(mut self, delay_ms: u64) -> Self {
+        self.gui_batch_action_delay_ms = delay_ms;
         self
     }
 

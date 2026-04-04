@@ -240,6 +240,107 @@ fn get_memory_requires_feature_flag() {
     );
 }
 
+#[test]
+fn gui_tools_present_when_feature_enabled() {
+    let config = test_config();
+    let model_info = ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+    let mut features = Features::with_defaults();
+    features.enable(Feature::GuiTools);
+    let available_models = Vec::new();
+    let tools_config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &model_info,
+        available_models: &available_models,
+        features: &features,
+        web_search_mode: Some(WebSearchMode::Cached),
+        session_source: SessionSource::Cli,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+    });
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
+
+    assert_contains_tool_names(
+        &tools,
+        &[
+            "gui_observe",
+            "gui_wait",
+            "gui_click",
+            "gui_drag",
+            "gui_scroll",
+            "gui_type",
+            "gui_key",
+            "gui_move",
+        ],
+    );
+}
+
+#[test]
+fn gui_coordinate_targeting_adds_coordinate_fields_to_gui_tools() {
+    let config = test_config();
+    let model_info = ModelsManager::construct_model_info_offline_for_tests("gpt-5-codex", &config);
+    let mut features = Features::with_defaults();
+    features.enable(Feature::GuiTools);
+    let available_models = Vec::new();
+    let tools_config = ToolsConfig::new(&ToolsConfigParams {
+        model_info: &model_info,
+        available_models: &available_models,
+        features: &features,
+        web_search_mode: Some(WebSearchMode::Cached),
+        session_source: SessionSource::Cli,
+        sandbox_policy: &SandboxPolicy::DangerFullAccess,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+    })
+    .with_gui_coordinate_targeting(true);
+    let (tools, _) = build_specs(
+        &tools_config,
+        /*mcp_tools*/ None,
+        /*app_tools*/ None,
+        &[],
+    )
+    .build();
+
+    let click_tool = find_tool(&tools, "gui_click");
+    let drag_tool = find_tool(&tools, "gui_drag");
+
+    let ToolSpec::Function(click_fn) = &click_tool.spec else {
+        panic!("expected gui_click to be a function tool");
+    };
+    let JsonSchema::Object {
+        properties: click_props,
+        required: click_required,
+        ..
+    } = &click_fn.parameters
+    else {
+        panic!("expected gui_click parameters to be an object");
+    };
+    assert!(click_props.contains_key("x"));
+    assert!(click_props.contains_key("y"));
+    assert!(click_props.contains_key("coordinate_space"));
+    assert_eq!(click_required, &None);
+
+    let ToolSpec::Function(drag_fn) = &drag_tool.spec else {
+        panic!("expected gui_drag to be a function tool");
+    };
+    let JsonSchema::Object {
+        properties: drag_props,
+        required: drag_required,
+        ..
+    } = &drag_fn.parameters
+    else {
+        panic!("expected gui_drag parameters to be an object");
+    };
+    assert!(drag_props.contains_key("from_x"));
+    assert!(drag_props.contains_key("from_y"));
+    assert!(drag_props.contains_key("to_x"));
+    assert!(drag_props.contains_key("to_y"));
+    assert!(drag_props.contains_key("coordinate_space"));
+    assert_eq!(drag_required, &None);
+}
 fn assert_model_tools(
     model_slug: &str,
     features: &Features,

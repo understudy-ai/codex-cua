@@ -1,6 +1,14 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "definitions": {
+    "BuiltinToolCallStatus": {
+      "enum": [
+        "inProgress",
+        "completed",
+        "failed"
+      ],
+      "type": "string"
+    },
     "ByteRange": {
       "properties": {
         "end": {
@@ -957,6 +965,53 @@
             "type"
           ],
           "title": "McpToolCallThreadItem",
+          "type": "object"
+        },
+        {
+          "properties": {
+            "arguments": true,
+            "callId": {
+              "type": "string"
+            },
+            "id": {
+              "type": "string"
+            },
+            "namespace": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "output": true,
+            "status": {
+              "$ref": "#/definitions/BuiltinToolCallStatus"
+            },
+            "success": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "tool": {
+              "type": "string"
+            },
+            "type": {
+              "enum": [
+                "builtinToolCall"
+              ],
+              "title": "BuiltinToolCallThreadItemType",
+              "type": "string"
+            }
+          },
+          "required": [
+            "arguments",
+            "callId",
+            "id",
+            "status",
+            "tool",
+            "type"
+          ],
+          "title": "BuiltinToolCallThreadItem",
           "type": "object"
         },
         {
