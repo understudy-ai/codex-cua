@@ -233,8 +233,14 @@ pub struct Config {
     /// separate grounding call.
     pub gui_coordinate_targeting: bool,
 
+    /// Whether the `gui_batch` tool is enabled (registered in the tool plan).
+    pub gui_batch_enabled: bool,
+
     /// Default grounding strategy for `gui_batch`: `"parallel"` or `"unified"`.
     pub gui_batch_grounding_strategy: String,
+
+    /// Delay in milliseconds between batch action steps.  Defaults to 0 (no delay).
+    pub gui_batch_action_delay_ms: u64,
 
     /// Model used specifically for review sessions.
     pub review_model: Option<String>,
@@ -1541,11 +1547,17 @@ pub struct GuiToolsToml {
     /// delegating target resolution to the internal grounding round-trip.
     #[serde(default)]
     pub coordinate_targeting: Option<bool>,
+    /// Whether the `gui_batch` tool is enabled.  Defaults to `true`.
+    #[serde(default)]
+    pub batch: Option<bool>,
     /// Grounding strategy for `gui_batch`: `"parallel"` (default) runs N
     /// independent grounding calls in parallel; `"unified"` sends all targets
     /// in a single multi-target call with validation rounds.
     #[serde(default)]
     pub batch_grounding_strategy: Option<String>,
+    /// Delay in milliseconds between batch action steps.  Defaults to 0 (no delay).
+    #[serde(default)]
+    pub batch_action_delay_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1997,6 +2009,15 @@ fn resolve_gui_coordinate_targeting(config_toml: &ConfigToml) -> bool {
         .unwrap_or(false)
 }
 
+fn resolve_gui_batch_enabled(config_toml: &ConfigToml) -> bool {
+    config_toml
+        .tools
+        .as_ref()
+        .and_then(|tools| tools.gui.as_ref())
+        .and_then(|gui| gui.batch)
+        .unwrap_or(true)
+}
+
 fn resolve_gui_batch_grounding_strategy(config_toml: &ConfigToml) -> String {
     config_toml
         .tools
@@ -2004,6 +2025,15 @@ fn resolve_gui_batch_grounding_strategy(config_toml: &ConfigToml) -> String {
         .and_then(|tools| tools.gui.as_ref())
         .and_then(|gui| gui.batch_grounding_strategy.clone())
         .unwrap_or_else(|| "parallel".to_string())
+}
+
+fn resolve_gui_batch_action_delay_ms(config_toml: &ConfigToml) -> u64 {
+    config_toml
+        .tools
+        .as_ref()
+        .and_then(|tools| tools.gui.as_ref())
+        .and_then(|gui| gui.batch_action_delay_ms)
+        .unwrap_or(0)
 }
 
 pub(crate) fn resolve_web_search_mode_for_turn(
@@ -2322,7 +2352,9 @@ impl Config {
             .unwrap_or(WebSearchMode::Cached);
         let web_search_config = resolve_web_search_config(&cfg, &config_profile);
         let gui_coordinate_targeting = resolve_gui_coordinate_targeting(&cfg);
+        let gui_batch_enabled = resolve_gui_batch_enabled(&cfg);
         let gui_batch_grounding_strategy = resolve_gui_batch_grounding_strategy(&cfg);
+        let gui_batch_action_delay_ms = resolve_gui_batch_action_delay_ms(&cfg);
 
         let agent_roles =
             agent_roles::load_agent_roles(&cfg, &config_layer_stack, &mut startup_warnings)?;
@@ -2634,7 +2666,9 @@ impl Config {
             model,
             service_tier,
             gui_coordinate_targeting,
+            gui_batch_enabled,
             gui_batch_grounding_strategy,
+            gui_batch_action_delay_ms,
             review_model,
             model_context_window: cfg.model_context_window,
             model_auto_compact_token_limit: cfg.model_auto_compact_token_limit,

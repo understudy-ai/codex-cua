@@ -1,11 +1,19 @@
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::from_str as parse_json;
 use sha1::Digest;
 use sha1::Sha1;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::io::BufRead;
+use std::io::BufReader;
+use std::io::Write;
 use std::path::PathBuf;
+use std::process::Child;
 use std::process::Command;
 use std::process::Stdio;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 use tempfile::tempdir;
 
 use crate::function_tool::FunctionCallError;
@@ -30,6 +38,197 @@ const DEFAULT_SYSTEM_EVENTS_PASTE_POST_DELAY_MS: i64 = 650;
 const DEFAULT_SYSTEM_EVENTS_KEYSTROKE_CHAR_DELAY_MS: i64 = 55;
 
 pub(super) struct MacOSPlatform;
+
+// ---------------------------------------------------------------------------
+// Persistent helper subprocess (JSON-line protocol over stdin/stdout)
+// ---------------------------------------------------------------------------
+
+/// JSON-line request sent to the Swift helper in `serve` mode.
+#[derive(Serialize)]
+struct ServeRequest<'a> {
+    command: &'a str,
+    env: Option<HashMap<&'a str, &'a str>>,
+}
+
+/// JSON-line response received from the Swift helper in `serve` mode.
+#[derive(Deserialize)]
+struct ServeResponse {
+    status: String,
+    output: Option<String>,
+    error: Option<String>,
+}
+
+/// A persistent connection to the Swift helper subprocess running in
+/// `serve` mode.  Communication happens over newline-delimited JSON on
+/// stdin/stdout.
+struct HelperConnection {
+    child: Child,
+    reader: BufReader<std::process::ChildStdout>,
+}
+
+impl HelperConnection {
+    /// Spawn a new helper in `serve` mode.
+    fn spawn(helper_path: &PathBuf) -> Result<Self, FunctionCallError> {
+        let mut child = Command::new(helper_path)
+            .arg("serve")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "failed to start persistent GUI helper: {error}"
+                ))
+            })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "persistent GUI helper did not expose stdout".to_string(),
+            )
+        })?;
+        Ok(Self {
+            child,
+            reader: BufReader::new(stdout),
+        })
+    }
+
+    /// Send a command with parameters and return the captured output.
+    fn send(
+        &mut self,
+        command: &str,
+        env: &[(&str, String)],
+    ) -> Result<String, FunctionCallError> {
+        let env_map: HashMap<&str, &str> =
+            env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let request = ServeRequest {
+            command,
+            env: if env_map.is_empty() {
+                None
+            } else {
+                Some(env_map)
+            },
+        };
+        let request_json = serde_json::to_string(&request).map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "failed to encode helper request: {error}"
+            ))
+        })?;
+
+        let stdin = self.child.stdin.as_mut().ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "persistent GUI helper stdin is closed".to_string(),
+            )
+        })?;
+        writeln!(stdin, "{request_json}").map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "failed to write to persistent GUI helper: {error}"
+            ))
+        })?;
+        stdin.flush().map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "failed to flush persistent GUI helper stdin: {error}"
+            ))
+        })?;
+
+        let mut line = String::new();
+        self.reader.read_line(&mut line).map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "failed to read from persistent GUI helper: {error}"
+            ))
+        })?;
+        if line.is_empty() {
+            return Err(FunctionCallError::RespondToModel(
+                "persistent GUI helper closed stdout unexpectedly".to_string(),
+            ));
+        }
+
+        let response: ServeResponse = parse_json(line.trim()).map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "failed to decode helper response: {error} (raw: {line})"
+            ))
+        })?;
+        match response.status.as_str() {
+            "ok" => Ok(response.output.unwrap_or_default()),
+            _ => Err(FunctionCallError::RespondToModel(format!(
+                "native GUI helper failed: {}",
+                response.error.unwrap_or_else(|| "unknown error".to_string())
+            ))),
+        }
+    }
+
+    /// Check whether the child process is still alive.
+    fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+}
+
+impl Drop for HelperConnection {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Global persistent helper connection, lazily initialized on first use.
+static HELPER_CONN: OnceLock<Mutex<Option<HelperConnection>>> = OnceLock::new();
+
+/// Send a command to the persistent helper, spawning it if necessary.
+/// Falls back to one-shot execution if the persistent connection fails.
+fn run_helper_persistent(
+    platform: &MacOSPlatform,
+    command: &str,
+    env: &[(&str, String)],
+) -> Result<String, FunctionCallError> {
+    let helper_path = platform.resolve_helper_binary()?;
+    let mutex = HELPER_CONN.get_or_init(|| Mutex::new(None));
+    let mut guard = mutex.lock().map_err(|_| {
+        FunctionCallError::RespondToModel(
+            "persistent GUI helper lock poisoned".to_string(),
+        )
+    })?;
+
+    // Spawn if needed or if previous connection died.
+    if guard.as_mut().map_or(true, |conn| !conn.is_alive()) {
+        *guard = Some(HelperConnection::spawn(&helper_path)?);
+    }
+
+    let conn = guard.as_mut().unwrap();
+    match conn.send(command, env) {
+        Ok(output) => Ok(output),
+        Err(e) => {
+            // Connection may have broken mid-request.  Drop it so the
+            // next call respawns, and fall back to one-shot execution
+            // for this request.
+            *guard = None;
+            tracing::warn!("persistent GUI helper failed, falling back to one-shot: {e}");
+            run_helper_oneshot(platform, command, env)
+        }
+    }
+}
+
+/// Original one-shot helper execution (spawn → run → exit).
+fn run_helper_oneshot(
+    platform: &MacOSPlatform,
+    command: &str,
+    env: &[(&str, String)],
+) -> Result<String, FunctionCallError> {
+    let helper_path = platform.resolve_helper_binary()?;
+    let mut cmd = Command::new(helper_path);
+    cmd.arg(command);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let output = cmd.output().map_err(|error| {
+        FunctionCallError::RespondToModel(format!("failed to execute native GUI helper: {error}"))
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(FunctionCallError::RespondToModel(format!(
+            "native GUI helper failed: {}",
+            stderr.trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
 
 #[derive(Clone)]
 struct ScriptWindowSelection {
@@ -795,23 +994,7 @@ fn run_helper(
     command: &str,
     env: &[(&str, String)],
 ) -> Result<String, FunctionCallError> {
-    let helper_path = platform.resolve_helper_binary()?;
-    let mut cmd = Command::new(helper_path);
-    cmd.arg(command);
-    for (key, value) in env {
-        cmd.env(key, value);
-    }
-    let output = cmd.output().map_err(|error| {
-        FunctionCallError::RespondToModel(format!("failed to execute native GUI helper: {error}"))
-    })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(FunctionCallError::RespondToModel(format!(
-            "native GUI helper failed: {}",
-            stderr.trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    run_helper_persistent(platform, command, env)
 }
 
 fn redact_host_windows(

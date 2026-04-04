@@ -150,6 +150,15 @@ impl GuiActionSession {
             self.hidden_pids = pids;
         }
     }
+
+    /// Notify the emergency stop monitor that the next Escape keypress is
+    /// an expected programmatic event (e.g. `gui_key("Escape")`), not a
+    /// user abort.  Must be called *before* injecting the Escape key.
+    pub(super) fn expect_escape(&self) {
+        if let Some(monitor) = &self.emergency_stop_monitor {
+            monitor.expect_escape();
+        }
+    }
 }
 
 impl Drop for GuiActionSession {

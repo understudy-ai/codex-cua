@@ -123,6 +123,11 @@ pub(super) struct PlatformObservation {
 pub(super) struct GuiEmergencyStopMonitor {
     child: Arc<Mutex<Child>>,
     triggered: Arc<AtomicBool>,
+    /// When set, the next Escape detection is treated as an expected
+    /// programmatic keypress (e.g. `gui_key("Escape")`) rather than a
+    /// user-initiated emergency stop.  The monitor thread clears this
+    /// flag instead of setting `triggered`.
+    suppress_next: Arc<AtomicBool>,
     output_thread: Option<JoinHandle<()>>,
 }
 
@@ -135,11 +140,21 @@ impl GuiEmergencyStopMonitor {
         })?;
         let child = Arc::new(Mutex::new(child));
         let triggered = Arc::new(AtomicBool::new(false));
+        let suppress_next = Arc::new(AtomicBool::new(false));
         let thread_triggered = Arc::clone(&triggered);
+        let thread_suppress = Arc::clone(&suppress_next);
         let output_thread = std::thread::spawn(move || {
             let reader = BufReader::new(stdout);
             for line in reader.lines().map_while(Result::ok) {
                 if line.trim().eq_ignore_ascii_case("escape") {
+                    // If the caller told us to expect this Escape, consume
+                    // the suppression flag instead of triggering a stop.
+                    if thread_suppress
+                        .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        continue;
+                    }
                     thread_triggered.store(true, Ordering::SeqCst);
                     break;
                 }
@@ -148,12 +163,20 @@ impl GuiEmergencyStopMonitor {
         Ok(Self {
             child,
             triggered,
+            suppress_next,
             output_thread: Some(output_thread),
         })
     }
 
     pub(super) fn triggered(&self) -> bool {
         self.triggered.load(Ordering::SeqCst)
+    }
+
+    /// Tell the monitor to treat the next detected Escape keypress as an
+    /// expected programmatic event rather than a user abort signal.  Must
+    /// be called *before* the Escape key event is injected.
+    pub(super) fn expect_escape(&self) {
+        self.suppress_next.store(true, Ordering::SeqCst);
     }
 
     pub(super) fn stop(&mut self) {

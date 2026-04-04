@@ -115,8 +115,18 @@ struct WindowExclusions {
     }
 }
 
+/// Per-request environment override.  In `serve` mode, each JSON-line
+/// request supplies its own `env` dictionary.  The `env()` helper checks
+/// this thread-local override first, falling back to the real process
+/// environment.  For one-shot commands this stays `nil` so the original
+/// behaviour is preserved.
+var requestEnvOverride: [String: String]? = nil
+
 func env(_ key: String) -> String {
-    ProcessInfo.processInfo.environment[key] ?? ""
+    if let override_ = requestEnvOverride, let value = override_[key] {
+        return value
+    }
+    return ProcessInfo.processInfo.environment[key] ?? ""
 }
 
 func trimmedEnv(_ key: String) -> String? {
@@ -1260,10 +1270,103 @@ func handleUnhideApps() throws {
     FileHandle.standardOutput.write(data)
 }
 
-// MARK: - Main
+// MARK: - Serve mode (persistent subprocess)
 
-do {
-    let command = CommandLine.arguments.dropFirst().first ?? ""
+/// JSON-line request from the Rust host.
+struct ServeRequest: Codable {
+    let command: String
+    let env: [String: String]?
+}
+
+/// JSON-line response back to the Rust host.
+struct ServeResponse: Codable {
+    let status: String       // "ok" or "error"
+    let output: String?      // stdout capture for "ok"
+    let error: String?       // error description for "error"
+}
+
+/// Enter a read-eval-print loop reading JSON-line requests from stdin.
+/// Each request carries its own `env` dictionary which temporarily
+/// overrides `env()` lookups for the duration of that command.
+/// The response is a single JSON line on stdout terminated by a newline.
+///
+/// The loop exits when stdin reaches EOF (parent process closed the pipe).
+func serve() {
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = []   // compact, single-line
+    let decoder = JSONDecoder()
+
+    while let line = readLine() {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { continue }
+
+        var response: ServeResponse
+
+        // Declare outside `do` so the `catch` block can restore stdout.
+        var stdoutPipe: Pipe? = nil
+        var originalStdout: Int32 = -1
+
+        do {
+            guard let data = trimmed.data(using: .utf8) else {
+                throw HelperError.invalidCommand("invalid UTF-8 in serve request")
+            }
+            let request = try decoder.decode(ServeRequest.self, from: data)
+
+            // Install per-request env overlay.
+            requestEnvOverride = request.env
+
+            // Capture stdout by temporarily redirecting FileHandle.standardOutput
+            // to an in-memory pipe so existing handler functions that print to
+            // stdout still work unchanged.
+            let pipe = Pipe()
+            stdoutPipe = pipe
+            originalStdout = dup(STDOUT_FILENO)
+            dup2(pipe.fileHandleForWriting.fileDescriptor, STDOUT_FILENO)
+
+            try dispatchCommand(request.command)
+
+            // Flush and restore stdout.
+            fflush(stdout)
+            pipe.fileHandleForWriting.closeFile()
+            dup2(originalStdout, STDOUT_FILENO)
+            close(originalStdout)
+            originalStdout = -1
+            stdoutPipe = nil
+
+            let captured = pipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: captured, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+            requestEnvOverride = nil
+            response = ServeResponse(status: "ok", output: output.isEmpty ? nil : output, error: nil)
+        } catch {
+            requestEnvOverride = nil
+            // Restore stdout if we crashed after the dup2 redirect.
+            if originalStdout >= 0 {
+                fflush(stdout)
+                stdoutPipe?.fileHandleForWriting.closeFile()
+                dup2(originalStdout, STDOUT_FILENO)
+                close(originalStdout)
+                originalStdout = -1
+                stdoutPipe = nil
+            }
+            response = ServeResponse(status: "error", output: nil, error: "\(error)")
+        }
+
+        // Write response as a single JSON line to stdout.
+        if let responseData = try? encoder.encode(response),
+           let responseString = String(data: responseData, encoding: .utf8) {
+            fputs(responseString + "\n", stdout)
+            fflush(stdout)
+        } else {
+            fputs("{\"status\":\"error\",\"error\":\"failed to encode response\"}\n", stdout)
+            fflush(stdout)
+        }
+    }
+}
+
+/// Dispatch a single command (shared between one-shot and serve modes).
+func dispatchCommand(_ command: String) throws {
     switch command {
     case "capture-context":
         try handleCaptureContext()
@@ -1275,14 +1378,27 @@ do {
         try handleCleanup()
     case "redact-host-windows":
         try handleRedactHostWindows()
-    case "monitor-escape":
-        try monitorEscape()
     case "hide-other-apps":
         try handleHideOtherApps()
     case "unhide-apps":
         try handleUnhideApps()
     default:
         throw HelperError.invalidCommand(command)
+    }
+}
+
+// MARK: - Main
+
+do {
+    let command = CommandLine.arguments.dropFirst().first ?? ""
+    if command == "serve" {
+        serve()
+    } else if command == "monitor-escape" {
+        // monitor-escape is inherently long-lived and must NOT go through
+        // serve mode — it uses its own stdout protocol.
+        try monitorEscape()
+    } else {
+        try dispatchCommand(command)
     }
 } catch {
     fputs("Codex native GUI helper failed: \(error)\n", stderr)

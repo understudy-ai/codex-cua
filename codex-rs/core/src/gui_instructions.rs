@@ -1,6 +1,7 @@
 pub(crate) fn render_gui_tools_section(
     gui_tools_enabled: bool,
     gui_coordinate_targeting: bool,
+    gui_batch_enabled: bool,
 ) -> Option<String> {
     if !gui_tools_enabled {
         return None;
@@ -8,6 +9,12 @@ pub(crate) fn render_gui_tools_section(
 
     let coordinate_guidance = if gui_coordinate_targeting {
         "\n- Coordinate-based `gui_click` and `gui_drag` may appear when `[tools.gui] coordinate_targeting = true`, but that path is currently an experimental placeholder and is disabled by default.\n- Prefer semantic grounding for real work; the direct-coordinate path is reserved for future experiments after its benchmark quality improves."
+    } else {
+        ""
+    };
+
+    let batch_guidance = if gui_batch_enabled {
+        "\n- Use `gui_batch` to execute multiple independent GUI actions (click, type, key, scroll, drag) in a single tool call for faster task completion. All steps share one screenshot and one grounding call. Only include steps that do NOT depend on the visual effects of earlier steps in the same batch. For dependent actions, use individual gui_* tools with `gui_wait` or `gui_observe` between them. Prefer `gui_batch` when you have 2 or more consecutive independent actions."
     } else {
         ""
     };
@@ -29,8 +36,7 @@ Use them as a tight observe-act-verify loop:
 - Reuse `capture_mode`, `window_title`, or `window_selector` across related GUI steps to keep the tool focused on the same surface.
 - Use `gui_type.secret_env_var` or `gui_type.secret_command_env_var` for sensitive values.
 - Prefer `capture_mode: \"window\"` for in-app work and `capture_mode: \"display\"` for desktop-wide UI such as the Dock, menu bar, permission prompts, or cross-window drags.
-- Remember that GUI actions now run with native safety guards: avoid overlapping risky actions, and stop to re-observe when the UI looks different than expected.
-- Use `gui_batch` to execute multiple independent GUI actions (click, type, key, scroll, drag) in a single tool call for faster task completion. All steps share one screenshot and one grounding call. Only include steps that do NOT depend on the visual effects of earlier steps in the same batch. For dependent actions, use individual gui_* tools with `gui_wait` or `gui_observe` between them. Prefer `gui_batch` when you have 2 or more consecutive independent actions. Use `grounding_strategy: \"unified\"` for batches with 4 or more grounded targets for maximum speed.{coordinate_guidance}"
+- Remember that GUI actions now run with native safety guards: avoid overlapping risky actions, and stop to re-observe when the UI looks different than expected.{batch_guidance}{coordinate_guidance}"
     ))
 }
 
@@ -40,12 +46,12 @@ mod tests {
 
     #[test]
     fn omits_gui_tools_section_when_disabled() {
-        assert_eq!(render_gui_tools_section(false, false), None);
+        assert_eq!(render_gui_tools_section(false, false, false), None);
     }
 
     #[test]
     fn renders_gui_tools_section_when_enabled() {
-        let rendered = render_gui_tools_section(true, false).expect("gui instructions");
+        let rendered = render_gui_tools_section(true, false, false).expect("gui instructions");
 
         assert!(rendered.contains("## Native GUI Tools"));
         assert!(rendered.contains("`gui_observe.target`"));
@@ -57,15 +63,25 @@ mod tests {
         assert!(rendered.contains("visible screenshot evidence"));
         assert!(rendered.contains("grounding_mode: \"complex\""));
         assert!(!rendered.contains("Coordinate-based `gui_click`"));
+        assert!(!rendered.contains("`gui_batch`"));
     }
 
     #[test]
     fn renders_coordinate_guidance_when_enabled() {
-        let rendered = render_gui_tools_section(true, true).expect("gui instructions");
+        let rendered = render_gui_tools_section(true, true, false).expect("gui instructions");
 
         assert!(rendered.contains("Coordinate-based `gui_click` and `gui_drag`"));
         assert!(rendered.contains("experimental placeholder"));
         assert!(rendered.contains("disabled by default"));
         assert!(rendered.contains("Prefer semantic grounding"));
+    }
+
+    #[test]
+    fn renders_batch_guidance_when_enabled() {
+        let rendered = render_gui_tools_section(true, false, true).expect("gui instructions");
+
+        assert!(rendered.contains("`gui_batch`"));
+        assert!(rendered.contains("independent GUI actions"));
+        assert!(!rendered.contains("grounding_strategy"));
     }
 }

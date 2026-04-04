@@ -111,7 +111,9 @@ pub struct ToolsConfig {
     pub agent_type_description: String,
     pub gui_tools: bool,
     pub gui_coordinate_targeting: bool,
+    pub gui_batch_enabled: bool,
     pub gui_batch_grounding_strategy: String,
+    pub gui_batch_action_delay_ms: u64,
 }
 
 pub struct ToolsConfigParams<'a> {
@@ -229,7 +231,9 @@ impl ToolsConfig {
             agent_type_description: String::new(),
             gui_tools: include_gui_tools,
             gui_coordinate_targeting: false,
+            gui_batch_enabled: true,
             gui_batch_grounding_strategy: "parallel".to_string(),
+            gui_batch_action_delay_ms: 0,
         }
     }
 
@@ -276,8 +280,18 @@ impl ToolsConfig {
         self
     }
 
+    pub fn with_gui_batch_enabled(mut self, enabled: bool) -> Self {
+        self.gui_batch_enabled = enabled;
+        self
+    }
+
     pub fn with_gui_batch_grounding_strategy(mut self, strategy: String) -> Self {
         self.gui_batch_grounding_strategy = strategy;
+        self
+    }
+
+    pub fn with_gui_batch_action_delay_ms(mut self, delay_ms: u64) -> Self {
+        self.gui_batch_action_delay_ms = delay_ms;
         self
     }
 

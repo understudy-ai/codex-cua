@@ -27,6 +27,8 @@ use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
 
+const SCREENSHOT_JPEG_QUALITY: u8 = 75;
+
 #[path = "gui/grounding.rs"]
 mod grounding;
 #[path = "gui/platform.rs"]
@@ -298,7 +300,6 @@ struct BatchArgs {
     capture_mode: Option<String>,
     window_title: Option<String>,
     window_selector: Option<WindowSelector>,
-    grounding_strategy: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -602,7 +603,7 @@ impl GuiHandler {
             state.clone(),
         )
         .await;
-        let image_output = attach_image.then(|| data_url_png(&observation.image_bytes));
+        let image_output = attach_image.then(|| screenshot_data_url(&observation.image_bytes));
         let app_label = state
             .app_name
             .as_ref()
@@ -1755,6 +1756,12 @@ impl GuiHandler {
         .await?;
         action_session.throw_if_emergency_stopped()?;
 
+        // Escape keycode 53: tell the emergency stop monitor to treat the
+        // upcoming Escape detection as a programmatic event, not a user abort.
+        if key_code == 53 {
+            action_session.expect_escape();
+        }
+
         run_gui_event(
             "key_press",
             args.app.as_deref(),
@@ -1957,15 +1964,8 @@ impl GuiHandler {
             } else {
                 observation.image_bytes
             };
-            // Dispatch grounding based on strategy.
-            let strategy = normalize_optional_string(args.grounding_strategy.as_deref())
-                .unwrap_or_else(|| {
-                    invocation
-                        .turn
-                        .tools_config
-                        .gui_batch_grounding_strategy
-                        .clone()
-                });
+            // Dispatch grounding based on configured strategy.
+            let strategy = &invocation.turn.tools_config.gui_batch_grounding_strategy;
             let results = if strategy == "unified" {
                 grounding::resolve_batch_grounded_targets_unified(
                     &invocation,
@@ -2018,8 +2018,14 @@ impl GuiHandler {
         let mut step_summaries: Vec<String> = Vec::new();
         let mut step_details: Vec<JsonValue> = Vec::new();
 
+        let batch_action_delay_ms = invocation.turn.tools_config.gui_batch_action_delay_ms;
         for (i, step) in args.steps.iter().enumerate() {
             action_session.throw_if_emergency_stopped()?;
+
+            // Delay between steps to let the UI settle.
+            if i > 0 && batch_action_delay_ms > 0 {
+                sleep(Duration::from_millis(batch_action_delay_ms)).await;
+            }
 
             match step.action.as_str() {
                 "click" => {
@@ -2108,7 +2114,9 @@ impl GuiHandler {
                             &[],
                         )
                         .await?;
+                        action_session.throw_if_emergency_stopped()?;
                         sleep(Duration::from_millis(DEFAULT_TYPE_FOCUS_SETTLE_MS as u64)).await;
+                        action_session.throw_if_emergency_stopped()?;
                     }
 
                     let replace = step.replace.unwrap_or(true);
@@ -2193,6 +2201,10 @@ impl GuiHandler {
                     let key_code = resolve_key_code(key, &mut modifiers)?;
                     let repeat = step.repeat.unwrap_or(1).max(1);
                     let modifiers_env = modifiers.join(",");
+
+                    if key_code == 53 {
+                        action_session.expect_escape();
+                    }
 
                     run_gui_event(
                         "key_press",
@@ -2446,7 +2458,7 @@ impl GuiHandler {
         } else {
             None
         };
-        let image_url = image_bytes.as_deref().map(data_url_png);
+        let image_url = image_bytes.as_deref().map(screenshot_data_url);
         let state = observation.state;
         self.set_observe_state(
             &invocation.session.conversation_id.to_string(),
@@ -3229,7 +3241,7 @@ async fn capture_image_url_for_state(state: &ObserveState) -> Result<String, Fun
         false,
     )
     .await?;
-    Ok(data_url_png(&observation.image_bytes))
+    Ok(screenshot_data_url(&observation.image_bytes))
 }
 
 fn rounded_dimension(value: f64, label: &str) -> Result<u32, FunctionCallError> {
@@ -3553,8 +3565,21 @@ pub(super) fn data_url(bytes: &[u8], mime_type: &str) -> String {
     format!("data:{mime_type};base64,{}", BASE64_STANDARD.encode(bytes))
 }
 
-fn data_url_png(bytes: &[u8]) -> String {
-    data_url(bytes, "image/png")
+/// Convert raw PNG screenshot bytes to a JPEG data URL for the model.
+/// JPEG at quality 75 is typically 3-5x smaller than PNG, significantly
+/// reducing payload size and token consumption.  Falls back to PNG if
+/// JPEG encoding fails (e.g. corrupt image data).
+fn screenshot_data_url(png_bytes: &[u8]) -> String {
+    if let Ok(img) = image::load_from_memory(png_bytes) {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let mut encoder =
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, SCREENSHOT_JPEG_QUALITY);
+        if encoder.encode_image(&img).is_ok() {
+            return data_url(buf.get_ref(), "image/jpeg");
+        }
+    }
+    // Fallback: serve the original PNG.
+    data_url(png_bytes, "image/png")
 }
 
 fn resolve_type_value(args: &TypeArgs) -> Result<String, FunctionCallError> {

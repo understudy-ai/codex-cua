@@ -998,16 +998,6 @@ pub fn create_gui_batch_tool() -> ToolSpec {
             ),
         },
     );
-    properties.insert(
-        "grounding_strategy".to_string(),
-        JsonSchema::String {
-            description: Some(string_enum_description(
-                &["parallel", "unified"],
-                "Grounding strategy. `parallel` (default) runs N independent grounding calls in parallel — proven accuracy, best for ≤3 targets. `unified` sends all targets in a single multi-target call with validation rounds — faster for 4+ targets.",
-            )),
-        },
-    );
-
     ToolSpec::Function(ResponsesApiTool {
         name: "gui_batch".to_string(),
         description: "Execute a batch of independent GUI actions in a single call for faster task completion. Takes one screenshot, resolves all semantic targets at once, and executes each step sequentially. Use this when consecutive actions do not depend on each other's visual effects. For dependent actions, use individual gui_* tools with gui_wait or gui_observe between them."
